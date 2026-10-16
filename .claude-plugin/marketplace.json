@@ -1,0 +1,14 @@
+{
+  "name": "daedalus",
+  "owner": {
+    "name": "Ciprian Rosca"
+  },
+  "description": "Daedalus: a build harness for long-running projects in Claude Code and Codex.",
+  "plugins": [
+    {
+      "name": "daedalus",
+      "source": "./",
+      "description": "Build harness: saved state, gates, roles in separate contexts, self-compaction, try-it-yourself checks."
+    }
+  ]
+}

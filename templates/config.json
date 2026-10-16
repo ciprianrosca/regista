@@ -1,0 +1,78 @@
+{
+  "project": "{{PROJECT}}",
+  "plan": ".daedalus/plan.md",
+  "status_file": ".daedalus/status.md",
+  "board_file": ".daedalus/TODO.md",
+  "state_dir": ".daedalus/state",
+  "memory_dir": ".daedalus/memory",
+  "knowledge_file": ".daedalus/knowledge.json",
+  "gates": [
+    {
+      "name": "tests",
+      "run": "echo 'replace with your test command, e.g. uv run pytest -q'",
+      "when": [
+        "commit"
+      ],
+      "timeout": 900
+    }
+  ],
+  "protected": [],
+  "push": "ask",
+  "stop": "block",
+  "auto_snapshot": true,
+  "context": {
+    "warn_pct": 55,
+    "limit_pct": 65,
+    "window": "auto"
+  },
+  "roles": {
+    "source": [
+      "src/**"
+    ],
+    "tests": [
+      "tests/**",
+      "test/**",
+      "**/*_test.*",
+      "**/*.test.*",
+      "**/test_*.*"
+    ],
+    "test_config": [
+      "**/conftest.py",
+      "pytest.ini",
+      "tox.ini",
+      ".coveragerc",
+      "**/jest.config.*",
+      "**/vitest.config.*",
+      "**/playwright.config.*",
+      "**/__snapshots__/**",
+      "**/*.snap"
+    ]
+  },
+  "review": {
+    "required_for": [
+      "src/**"
+    ],
+    "min_changed_lines": 15,
+    "max_rounds": 3,
+    "ignore": [
+      "__pycache__/",
+      "*.pyc",
+      "node_modules/",
+      ".pytest_cache/",
+      ".mypy_cache/",
+      ".ruff_cache/",
+      "*.egg-info/",
+      "dist/",
+      "build/",
+      ".venv/",
+      "coverage/",
+      ".coverage"
+    ]
+  },
+  "milestones": "parallel",
+  "mode": "orchestrated",
+  "requirements": {
+    "enforce_coverage": true,
+    "milestone_needs_e2e": true
+  }
+}
