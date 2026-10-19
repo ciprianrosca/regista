@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python \"${PLUGIN_ROOT}/scripts/dd.py\" hook session-start --host codex",
+            "command": "PY=\"$(command -v python3 || command -v python)\"; \"$PY\" \"${PLUGIN_ROOT}/scripts/dd.py\" hook session-start --host codex",
             "timeout": 60
           }
         ]
@@ -17,7 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python \"${PLUGIN_ROOT}/scripts/dd.py\" hook user-prompt --host codex",
+            "command": "PY=\"$(command -v python3 || command -v python)\"; \"$PY\" \"${PLUGIN_ROOT}/scripts/dd.py\" hook user-prompt --host codex",
             "timeout": 30
           }
         ]
@@ -29,7 +29,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python \"${PLUGIN_ROOT}/scripts/dd.py\" hook pre-tool --host codex",
+            "command": "PY=\"$(command -v python3 || command -v python)\"; \"$PY\" \"${PLUGIN_ROOT}/scripts/dd.py\" hook pre-tool --host codex",
             "timeout": 3600
           }
         ]
@@ -40,7 +40,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python \"${PLUGIN_ROOT}/scripts/dd.py\" hook stop --host codex",
+            "command": "PY=\"$(command -v python3 || command -v python)\"; \"$PY\" \"${PLUGIN_ROOT}/scripts/dd.py\" hook stop --host codex",
             "timeout": 60
           }
         ]
@@ -51,7 +51,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python \"${PLUGIN_ROOT}/scripts/dd.py\" hook subagent-start --host codex",
+            "command": "PY=\"$(command -v python3 || command -v python)\"; \"$PY\" \"${PLUGIN_ROOT}/scripts/dd.py\" hook subagent-start --host codex",
             "timeout": 30
           }
         ]
@@ -62,7 +62,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python \"${PLUGIN_ROOT}/scripts/dd.py\" hook subagent-stop --host codex",
+            "command": "PY=\"$(command -v python3 || command -v python)\"; \"$PY\" \"${PLUGIN_ROOT}/scripts/dd.py\" hook subagent-stop --host codex",
             "timeout": 30
           }
         ]
@@ -73,7 +73,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python \"${PLUGIN_ROOT}/scripts/dd.py\" hook pre-compact --host codex",
+            "command": "PY=\"$(command -v python3 || command -v python)\"; \"$PY\" \"${PLUGIN_ROOT}/scripts/dd.py\" hook pre-compact --host codex",
             "timeout": 60
           }
         ]
@@ -84,7 +84,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python \"${PLUGIN_ROOT}/scripts/dd.py\" hook session-end --host codex",
+            "command": "PY=\"$(command -v python3 || command -v python)\"; \"$PY\" \"${PLUGIN_ROOT}/scripts/dd.py\" hook session-end --host codex",
             "timeout": 3
           }
         ]

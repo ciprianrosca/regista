@@ -5,12 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python",
-            "args": [
-              "${CLAUDE_PLUGIN_ROOT}/scripts/dd.py",
-              "hook",
-              "session-start"
-            ],
+            "command": "PY=\"$(command -v python3 || command -v python)\"; \"$PY\" \"${CLAUDE_PLUGIN_ROOT}/scripts/dd.py\" hook session-start",
             "timeout": 60
           }
         ]
@@ -21,12 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python",
-            "args": [
-              "${CLAUDE_PLUGIN_ROOT}/scripts/dd.py",
-              "hook",
-              "user-prompt"
-            ],
+            "command": "PY=\"$(command -v python3 || command -v python)\"; \"$PY\" \"${CLAUDE_PLUGIN_ROOT}/scripts/dd.py\" hook user-prompt",
             "timeout": 30
           }
         ]
@@ -37,12 +27,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python",
-            "args": [
-              "${CLAUDE_PLUGIN_ROOT}/scripts/dd.py",
-              "hook",
-              "user-prompt-expansion"
-            ],
+            "command": "PY=\"$(command -v python3 || command -v python)\"; \"$PY\" \"${CLAUDE_PLUGIN_ROOT}/scripts/dd.py\" hook user-prompt-expansion",
             "timeout": 30
           }
         ]
@@ -54,12 +39,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python",
-            "args": [
-              "${CLAUDE_PLUGIN_ROOT}/scripts/dd.py",
-              "hook",
-              "pre-tool"
-            ],
+            "command": "PY=\"$(command -v python3 || command -v python)\"; \"$PY\" \"${CLAUDE_PLUGIN_ROOT}/scripts/dd.py\" hook pre-tool",
             "timeout": 3600,
             "onFailure": "block"
           }
@@ -71,12 +51,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python",
-            "args": [
-              "${CLAUDE_PLUGIN_ROOT}/scripts/dd.py",
-              "hook",
-              "stop"
-            ],
+            "command": "PY=\"$(command -v python3 || command -v python)\"; \"$PY\" \"${CLAUDE_PLUGIN_ROOT}/scripts/dd.py\" hook stop",
             "timeout": 60
           }
         ]
@@ -88,12 +63,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python",
-            "args": [
-              "${CLAUDE_PLUGIN_ROOT}/scripts/dd.py",
-              "hook",
-              "subagent-start"
-            ],
+            "command": "PY=\"$(command -v python3 || command -v python)\"; \"$PY\" \"${CLAUDE_PLUGIN_ROOT}/scripts/dd.py\" hook subagent-start",
             "timeout": 30
           }
         ]
@@ -105,12 +75,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python",
-            "args": [
-              "${CLAUDE_PLUGIN_ROOT}/scripts/dd.py",
-              "hook",
-              "subagent-stop"
-            ],
+            "command": "PY=\"$(command -v python3 || command -v python)\"; \"$PY\" \"${CLAUDE_PLUGIN_ROOT}/scripts/dd.py\" hook subagent-stop",
             "timeout": 30
           }
         ]
@@ -121,12 +86,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python",
-            "args": [
-              "${CLAUDE_PLUGIN_ROOT}/scripts/dd.py",
-              "hook",
-              "pre-compact"
-            ],
+            "command": "PY=\"$(command -v python3 || command -v python)\"; \"$PY\" \"${CLAUDE_PLUGIN_ROOT}/scripts/dd.py\" hook pre-compact",
             "timeout": 60
           }
         ]
@@ -137,12 +97,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python",
-            "args": [
-              "${CLAUDE_PLUGIN_ROOT}/scripts/dd.py",
-              "hook",
-              "session-end"
-            ],
+            "command": "PY=\"$(command -v python3 || command -v python)\"; \"$PY\" \"${CLAUDE_PLUGIN_ROOT}/scripts/dd.py\" hook session-end",
             "timeout": 60
           }
         ]
