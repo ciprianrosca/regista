@@ -5,7 +5,8 @@ description: "Set up the Daedalus harness in the current project with as few que
 
 # Init: put a project on the harness
 
-**The Daedalus CLI** is `python "${CLAUDE_PLUGIN_ROOT}/scripts/dd.py"`. (In Codex, if that variable isn't
+**The Daedalus CLI** is `dd.py` in the plugin's `scripts/` folder, run as `"$(command -v python3 || command -v python)" "${CLAUDE_PLUGIN_ROOT}/scripts/dd.py"`
+(whichever of `python3` / `python` is installed; use this form in every command below). (In Codex, if that variable isn't
 filled in: `dd.py` is in the plugin's `scripts/` folder, two levels above this skill's folder.)
 
 The user may not be a programmer. Don't ask them about gates, globs, hooks or policies: detect what
@@ -17,7 +18,7 @@ you can, choose the defaults, and ask only what only they know. Plain words thro
 2. **Git.** If the folder isn't a git repository, say: "Daedalus saves every finished step as a
    checkpoint with git, so you can always go back. OK to turn this folder into a git repository?"
    On yes, run `git init` (and make a first commit of what's there, if anything).
-3. **Detect and create.** Run `python "${CLAUDE_PLUGIN_ROOT}/scripts/dd.py" init --auto --name "<project name>"`.
+3. **Detect and create.** Run `"$(command -v python3 || command -v python)" "${CLAUDE_PLUGIN_ROOT}/scripts/dd.py" init --auto --name "<project name>"`.
    It writes `.daedalus/` with the checks it found (tests, lint, types, end-to-end), the source and test
    folders and protected secret files (`.env`, keys), and sets up the agent hosts: Claude Code's
    compaction (`.claude/settings.json`) and, if Codex is installed, `.codex/` (compaction, the four
@@ -38,9 +39,9 @@ you can, choose the defaults, and ask only what only they know. Plain words thro
      program the way a user would (Playwright for a web app, a script that runs the command on sample
      input for a CLI). Once M0 exists, add its gates to `config.json` (the user confirms the change).
    - If the real spec lives elsewhere (a doc, an issue tracker), link it at the top of `plan.md`.
-7. **Check it works.** Run `python "${CLAUDE_PLUGIN_ROOT}/scripts/dd.py" doctor` and fix what you can.
+7. **Check it works.** Run `"$(command -v python3 || command -v python)" "${CLAUDE_PLUGIN_ROOT}/scripts/dd.py" doctor` and fix what you can.
    Install a missing tool only after the user says yes. If gates exist, run
-   `python "${CLAUDE_PLUGIN_ROOT}/scripts/dd.py" gate --all`; for metric gates, `gate <name> --accept`
+   `"$(command -v python3 || command -v python)" "${CLAUDE_PLUGIN_ROOT}/scripts/dd.py" gate --all`; for metric gates, `gate <name> --accept`
    once to record the starting numbers. If M0 is planned, failing or missing checks are expected: say so.
 8. **Commit** what setup wrote: `.daedalus/`, `.claude/settings.json`, and `.codex/` and `AGENTS.md`
    if they were created (`git add` only the ones that exist), with `git commit -m "chore: set up Daedalus"`.
