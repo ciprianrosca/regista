@@ -781,6 +781,74 @@ TRY_SPEC = {"step": "signup", "milestone": "M1", "title": "Sign-up", "requiremen
     {"id": "UI-3", "text": "The colours SHALL match the brand", "verify": "manual"}]}
 
 
+PLAN = """# Demo: plan
+
+## M1 — Stats
+Steps:
+- [x] mean
+- [ ] median
+
+## M2 — CLI
+Steps:
+- [ ] calc command
+
+## Out of scope
+- [ ] charts
+"""
+
+
+class BuildAll(unittest.TestCase):
+    """`/daedalus:build all`: the run keeps the session going between milestones while it makes progress."""
+
+    def setUp(self):
+        self.p = Project(gates=[{"name": "tests", "run": "echo ok"}])
+        self.p.commit(".daedalus/plan.md", PLAN, "docs: plan")
+
+    def tearDown(self):
+        self.p.cleanup()
+
+    def test_plan_milestones_in_order_with_open_steps(self):
+        ms = dd.plan_milestones(self.p.root, dd.load_config(self.p.root))
+        self.assertEqual([(m["id"], m["title"], m["open_steps"]) for m in ms], [("M1", "Stats", 1), ("M2", "CLI", 1)])
+
+    def test_start_status_end(self):
+        r = self.p.cli("run", "start")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("M1 — Stats: gate open", r.stdout)
+        self.assertIn("active", self.p.cli("run").stdout)
+        self.assertIn("Build-all run", self.p.cli("resume").stdout)
+        self.assertNotEqual(self.p.cli("run", "end").returncode, 0)  # a reason is required
+        r = self.p.cli("run", "end", "--reason", "M2 waits on a decision")
+        self.assertIn("ended (stopped)", r.stdout)
+        out = self.p.hook("stop", {}) or {}
+        self.assertNotIn("build-all", out.get("reason", ""))  # only the usual save reminder is left
+
+    def test_stop_sends_the_session_back_while_commits_keep_coming(self):
+        self.p.cli("run", "start")
+        out = self.p.hook("stop", {})
+        self.assertEqual(out.get("decision"), "block")
+        self.assertIn("build-all run is active", out["reason"])
+        self.assertIn("M2 — CLI", out["reason"])
+        self.p.commit("src/a.py", "x = 1", "feat: median")
+        out = self.p.hook("stop", {"stop_hook_active": True})  # nudges again after an earlier block
+        self.assertEqual(out.get("decision"), "block")
+        self.assertIn("since the last handoff", out["reason"])
+
+    def test_a_run_without_progress_ends_itself(self):
+        self.p.cli("run", "start")
+        self.assertEqual(self.p.hook("stop", {}).get("decision"), "block")
+        out = self.p.hook("stop", {"stop_hook_active": True})
+        self.assertNotIn("decision", out)
+        self.assertIn("stopped", out["systemMessage"])
+        self.assertIn("stalled", self.p.cli("run").stdout)
+        self.assertIsNone(self.p.hook("stop", {"stop_hook_active": True}))
+
+    def test_only_the_orchestrator_starts_or_ends_a_run(self):
+        for cmd in (f'python "{DD}" run start', f'python "{DD}" run end --reason done'):
+            self.assertEqual(decision(self.p.hook("pre-tool", as_agent("builder", "Bash", command=cmd))), "deny")
+            self.assertIsNone(decision(self.p.hook("pre-tool", as_agent(None, "Bash", command=cmd))))
+
+
 class TryItYourself(unittest.TestCase):
     def setUp(self):
         self.p = Project(gates=[{"name": "tests", "run": "echo ok"}])

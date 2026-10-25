@@ -11,6 +11,7 @@ projects. The rules that matter are **enforced by hooks**, not left to the model
 | Protected files (ground truth, labels, secrets) are never written | `PreToolUse` hooks on Edit/Write and shell writes |
 | No push without the user's OK | `PreToolUse` hook asks for permission on `git push` |
 | No turn ends with commits that no handoff covers | `Stop` hook sends Claude back to save |
+| **Build everything**: `build all` goes through every milestone without stopping in between, and stops only for what needs you | `Stop` hook sends the session back to work while the run is active and keeps committing; a run that stalls ends itself |
 | Nothing is lost when a session dies or compacts without a save | `PreCompact` and `SessionEnd` hooks write a mechanical snapshot |
 | **A context window compacts itself at 65%**: at 55% the agent is told to finish the step and checkpoint; at 65% the host compacts the conversation and the work carries on from the saved state, with nothing for you to clear or restart. If compaction doesn't happen, a hard pause at 75% saves the work instead | the hosts' own compaction, set by `dd.py setup`; `PreToolUse`, `PreCompact` and `SessionStart` hooks, measuring the session's real token use from its transcript |
 | **Try it yourself**: what only a person can judge gets click-by-click steps, and only you can record the result | `UserPromptExpansion` (Claude Code) or `UserPromptSubmit` (Codex) records `verify` commands you type; agents are refused |
@@ -63,6 +64,7 @@ In a project's repo root (in Codex, `$daedalus:<name>` instead of `/daedalus:<na
 /daedalus:start         where we are / next / blocked (runs automatically at session start)
 /daedalus:build next    next step: brief → test writer → builder → reviewer → gates → commit
 /daedalus:build M2      keep going until milestone 2's gate passes or a step is blocked
+/daedalus:build all     build every milestone in the plan, one after another; stop only for what needs you
 /daedalus:try           what to try yourself, step by step (you record it with /daedalus:verify)
 /daedalus:verify UI-3 ok    record a check only you can make (or: fail <what happened>)
 /daedalus:gate          run the gates (--all includes manual ones; --accept sets a new baseline)
@@ -150,6 +152,26 @@ impossible tasks, Claude mostly by editing tests despite being told not to; read
 explicit way out cut that sharply. Verification failures and premature "done" are among the most common
 multi-agent failures ([MAST](https://arxiv.org/html/2503.13657v3);
 [Anthropic](https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents)).
+
+### Build everything
+
+Hand Daedalus a full spec (link it at the top of `plan.md`, or give it to `/daedalus:init`) and run
+`/daedalus:build all`. It works through the milestones in plan order and doesn't stop between them:
+
+- a milestone whose gate passes is saved, and the next one starts;
+- a milestone that waits only on your manual checks is left for you, and the build moves on (under
+  `"milestones": "strict"` the run stops there instead);
+- a step that needs your decision goes on the board with options and a recommendation, and the build
+  carries on with the steps that don't depend on it;
+- a step that stays blocked (an impossible spec, review rounds used up) goes on the board the same way.
+
+`dd.py run start` marks the run active in `.daedalus/run.json`. While it is, the `Stop` hook sends the
+session back to work each time it tries to end its turn, as long as it has committed something since
+the hook's last nudge. A run that tries to stop twice without a new commit ends itself, so it can't trap
+the session. The run survives compaction, and after a pause `/daedalus:start continue` picks it up
+again. It ends with `dd.py run end --reason "…"` once every milestone is done or everything left waits
+on you, and the final report lists what you need to do: decisions, checks to try, blocked steps.
+Nothing is pushed. `dd.py run` shows where it stands.
 
 ### Context budget
 

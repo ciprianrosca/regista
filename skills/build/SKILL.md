@@ -1,6 +1,6 @@
 ---
 name: build
-description: "The Daedalus build loop: take the next step of the current milestone (or a whole milestone) and get it built, tested, reviewed, gated and committed, using the builder, test-writer, reviewer and researcher agents in their own contexts. Also 'decide <item>' for open decisions. Use when the user says 'daedalus build', 'build next', 'build M<n>', 'keep building' or 'daedalus decide'."
+description: "The Daedalus build loop: take the next step of the current milestone (or a whole milestone, or every milestone in the plan) and get it built, tested, reviewed, gated and committed, using the builder, test-writer, reviewer and researcher agents in their own contexts. Also 'decide <item>' for open decisions. Use when the user says 'daedalus build', 'build next', 'build M<n>', 'build all', 'build everything', 'keep building' or 'daedalus decide'."
 ---
 
 # Build: orchestrate the step, don't do it yourself
@@ -84,6 +84,46 @@ start hook tells each one the project root, the CLI path and its own rules.
 
 For `build M<n>`, repeat steps 3–9 until the milestone's gate is met or a step is blocked, then save
 and report: steps done, gate numbers, review rounds, and what's blocking, if anything.
+
+## `/daedalus:build all`
+
+Build the whole plan, milestone after milestone, without stopping in between. It's for the user who
+hands over a full spec and wants to come back to the finished product, or to one list of the things
+only they can do.
+
+1. **Resume** (`/daedalus:start`) and read the plan and any spec it links. If the plan doesn't cover
+   the linked spec yet (milestones missing, steps missing), add them first, each milestone with its
+   gate and at least one end-to-end requirement. Show the plan to the user only where it changes or
+   leaves out something the spec asks for.
+2. **Start the run:** `python "${CLAUDE_PLUGIN_ROOT}/scripts/dd.py" run start`. While the run is active, the
+   Stop hook sends you back to work each time you try to end your turn, as long as you've committed
+   something since its last nudge. A run that stops twice without a new commit ends itself, so it can
+   never trap the session. `dd.py run` shows every milestone, done or open, as the harness sees it.
+3. **Loop:** take the first milestone in plan order whose gate is open and run steps 3–9 above for
+   its steps. The user gave the go-ahead for everything the plan and its spec cover, so, unlike
+   `build M<n>`:
+   - **Milestone done** (`dd.py milestone M<n>` exits 0): run `/daedalus:save`, then go straight on to
+     the next milestone.
+   - **Only manual checks left:** note them for the final report and go on to the next milestone
+     (`milestones: "parallel"`, the default). Under `"strict"`, end the run there.
+   - **A step needs a decision that's the user's:** put it on the board the way `decide` does
+     (context, options, your recommendation), then skip that step and every step that depends on it,
+     and carry on with the ones that don't. Never pick the answer yourself.
+   - **A step stays blocked** (the builder says `BLOCKED` and the fix would change what gets built, or
+     the review rounds run out): put it on the board with what you tried, skip it and its dependents,
+     carry on.
+   - **A big step** (over about a day): don't stop to show its spec if it only restates what the user's
+     spec asks. If writing it forced a choice that spec doesn't make, that's a decision: see above.
+   - **Context warning:** finish the step, commit it, run `/daedalus:save`, and carry on. The session
+     compacts itself at the limit and the run survives it.
+   - **Never push.** Pushing stays the user's call (the hook asks anyway).
+4. **End the run** when every milestone's gate is met, when everything left waits on the user, or
+   when the user asks you to stop: `/daedalus:save`, then
+   `python "${CLAUDE_PLUGIN_ROOT}/scripts/dd.py" run end --reason "<all milestones done | what waits on the user>"`.
+5. **Final report**, in plain words: the milestones done (copied from the harness, not from notes),
+   what's built but still has an open gate, and a numbered list of what the user needs to do: each
+   decision with your recommendation, the checks to try (`/daedalus:try`), the steps that stayed
+   blocked and why. Say that nothing was pushed.
 
 ## Prompts to agents
 - Self-contained: the agent has none of this conversation. Name files by path.

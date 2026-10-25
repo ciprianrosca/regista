@@ -22,7 +22,8 @@ path (`python "${CLAUDE_PLUGIN_ROOT}/scripts/dd.py" …`). This skill checks tha
    - **Blocked on:** open decisions or human tasks that stop the next step
 6. **`/daedalus:start continue`** (the resume prompt after a pause): don't wait. If the handoff
    has work "In flight", finish that first; otherwise carry on from the resume point with the build
-   loop (`/daedalus:build`). Stop only if the next step is blocked.
+   loop (`/daedalus:build`). Stop only if the next step is blocked. If a build-all run is active (the
+   state says so; `dd.py run` shows it), carry on with `/daedalus:build all`.
    Without `continue`, wait for the user's command.
 
 ## `/daedalus:status`

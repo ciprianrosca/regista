@@ -21,6 +21,7 @@ CLI (run from anywhere inside the project):
   python dd.py review-record              (reviewer agent only) record .daedalus/reviews/draft.json
   python dd.py requirements               requirements, their coverage and pass/fail (set by the gates)
   python dd.py milestone M1               is M1's gate met? exit 0 = done
+  python dd.py run [start|end --reason T] the build-all run: start it, end it, or show the milestones left
   python dd.py verify-manual ID --note T  (the user only) record a manual check
   python dd.py try [M1|ID] [--ask]        what to try yourself; --ask (the user, in a terminal) records it
   python dd.py detect                     propose gates, roles and protected paths (JSON)
@@ -452,6 +453,11 @@ def resume_text(root, cfg, detailed=False):
     reqs = requirements_summary(root, cfg)
     if reqs:
         parts.append("\n## Requirements and milestones (decided by the gates, not by notes)\n" + reqs)
+    run = load_json(run_path(root), {})
+    if run.get("active"):
+        parts.append(f"\n## Build-all run\nActive since {run.get('started')}. After a compaction or "
+                     f"`{cmd_name('start')} continue`, carry on with `{cmd_name('build')} all` without waiting. In a new "
+                     f"session, wait for the user's command; `python \"{DD}\" run` shows where it stands.")
     if detailed:
         parts.append("\n## Recent commits\n" + git(root, "log", "--oneline", "-8"))
         if dirty:
@@ -769,6 +775,114 @@ def milestone_status(root, cfg, milestone):
         reasons.append(f"no end-to-end requirement of {milestone} passes: a milestone needs behavioural evidence, "
                        "not only unit tests")
     return not reasons, reasons
+
+
+# --- build all: one run through every milestone ---------------------------------------------
+#
+# `/daedalus:build all` builds the plan milestone after milestone. `dd.py run start` marks the run
+# active in .daedalus/run.json (local); while it is, the Stop hook sends the session back to work
+# instead of letting the turn end, as long as each stop comes after new commits. A run that stops
+# twice without committing anything ends itself, so a stuck run can't trap the session.
+# `dd.py run end --reason …` ends it: everything is done, or everything left waits on the user.
+
+def run_path(root):
+    return p(root, ".daedalus/run.json")
+
+
+def plan_milestones(root, cfg):
+    """The plan's milestones in order ('## M1 — name' headings), with their unticked steps."""
+    md = read(p(root, cfg["plan"] or ".daedalus/plan.md"))
+    heads = list(re.finditer(r"^##\s+(M\d+[a-z]?)\b[\s—–:.-]*(.*)$", md, re.M))
+    out = []
+    for i, m in enumerate(heads):
+        body = md[m.end():heads[i + 1].start() if i + 1 < len(heads) else len(md)]
+        body = re.split(r"^##\s", body, maxsplit=1, flags=re.M)[0]
+        out.append({"id": m.group(1), "title": m.group(2).strip(),
+                    "open_steps": len(re.findall(r"^\s*[-*]\s*\[ \]", body, re.M))})
+    return out
+
+
+def run_report(root, cfg):
+    """(all_done, lines): every milestone of the plan, done or open, as the harness sees it."""
+    lines, all_done = [], True
+    ms = plan_milestones(root, cfg)
+    for m in ms:
+        done, why = milestone_status(root, cfg, m["id"])
+        all_done = all_done and done
+        name = f"{m['id']}" + (f" — {m['title']}" if m["title"] else "")
+        if done:
+            lines.append(f"- {name}: DONE (gate met)")
+        else:
+            steps = f"{m['open_steps']} step(s) unticked in the plan, " if m["open_steps"] else ""
+            lines.append(f"- {name}: gate open ({steps}{len(why)} reason(s); `dd.py milestone {m['id']}`)")
+    if not ms:
+        lines.append(f"- no milestones in {cfg['plan'] or '.daedalus/plan.md'} (headings like `## M1 — <name>`)")
+        all_done = False
+    return all_done, lines
+
+
+def run_start(root, cfg):
+    run = load_json(run_path(root), {})
+    if not run.get("active"):
+        run = {"active": True, "started": dt.datetime.now().isoformat(timespec="seconds"),
+               "head_at_start": git(root, "rev-parse", "--short", "HEAD")}
+        save_json(run_path(root), run)
+        lead = "Build-all run started"
+    else:
+        lead = f"Build-all run already active (since {run.get('started')})"
+    _, lines = run_report(root, cfg)
+    return (f"{lead}. Until it ends, the Stop hook sends the session back to work after each commit. End it with "
+            f"`python \"{DD}\" run end --reason \"<why>\"` once every milestone is done or everything left waits "
+            "on the user.\n" + "\n".join(lines))
+
+
+def run_end(root, cfg, reason, outcome=None):
+    run = load_json(run_path(root), {})
+    all_done, lines = run_report(root, cfg)
+    run.update(active=False, ended=dt.datetime.now().isoformat(timespec="seconds"), reason=reason,
+               outcome=outcome or ("complete" if all_done else "stopped"))
+    save_json(run_path(root), run)
+    return run, lines
+
+
+def run_text(root, cfg):
+    run = load_json(run_path(root), {})
+    _, lines = run_report(root, cfg)
+    if run.get("active"):
+        head = f"Build-all run active since {run.get('started')}."
+    elif run.get("ended"):
+        head = f"No build-all run active. The last one ended {run['ended']} ({run.get('outcome')}): {run.get('reason')}"
+    else:
+        head = "No build-all run active."
+    return head + "\n" + "\n".join(lines)
+
+
+def run_nudge(root, cfg, data):
+    """Stop hook, during a build-all run: send the session back to work, or let it stop. Returns the
+    hook's answer or None."""
+    run = load_json(run_path(root), {})
+    if not run.get("active"):
+        return None
+    pct, _ = context_pct(cfg, data)
+    if pct is not None and pct >= pause_at(cfg):
+        return None  # the pause comes first; `start continue` picks the run up again
+    head = git(root, "rev-parse", "HEAD")
+    if run.get("nudged_at") == head:
+        run_end(root, cfg, "the session tried to stop twice without committing anything new", outcome="stalled")
+        return {"systemMessage": "Daedalus: the build-all run stopped because no new step was committed since the "
+                                 f"last nudge. Read the last report; {cmd_name('build')} all picks it up again."}
+    run.update(nudged_at=head, nudges=run.get("nudges", 0) + 1)
+    save_json(run_path(root), run)
+    _, lines = run_report(root, cfg)
+    unsaved = unsaved_commits(root, cfg)
+    save_note = (f" {len(unsaved)} commit(s) since the last handoff: run {cmd_name('save')} when a milestone closes."
+                 if unsaved else "")
+    return {"decision": "block", "reason":
+            f"Daedalus: a build-all run is active (since {run.get('started')}), so don't stop yet. Carry on with the "
+            f"next step that isn't blocked ({cmd_name('build')} all).{save_note}\nMilestones:\n" + "\n".join(lines) +
+            f"\nIf every milestone is done, or everything left waits on the user (a decision, a manual check, a "
+            f"step that stayed blocked), or the user asked you to stop: save, run `python \"{DD}\" run end --reason "
+            f"\"<why>\"`, and give the final report."}
 
 
 # --- try it yourself ------------------------------------------------------------------------
@@ -1271,6 +1385,8 @@ def role_check(root, cfg, data):
         return "Daedalus: subagents don't start other agents. Report back; the orchestrator decides who works next."
     if cmd and (re.search(GIT_SUB.format("commit"), cmd) or re.search(GIT_SUB.format("push"), cmd)):
         return "Daedalus: only the orchestrator commits, after the review. Report back instead."
+    if cmd and "dd.py" in cmd and re.search(r"\brun\s+(start|end)\b", cmd):
+        return "Daedalus: only the orchestrator starts or ends a build-all run. Report back instead."
 
     if role == "builder":
         if tool in EDIT_TOOLS and is_test:
@@ -1646,15 +1762,21 @@ def hook_prompt_expansion(root, cfg, data):
 
 
 def hook_stop(root, cfg, data):
-    if data.get("stop_hook_active") or role_of(data) != "main":
+    if role_of(data) != "main":
         return
-    pct = pause_pending(root, cfg, data)
+    again = data.get("stop_hook_active")  # an earlier Stop hook already sent the session back once
+    pct = None if again else pause_pending(root, cfg, data)
     if pct is not None:
         emit({"decision": "block", "reason":
               f"Daedalus: the context is at {pct}%, over the {pause_at(cfg)}% limit, and the work "
               f"isn't saved yet. Run {cmd_name('pause')}: gates, commit if green, status file, handoff (with the "
               f"resume prompt), board. Then end with: \"{clear_hint().capitalize()}, then: {cmd_name('start')} continue\"."})
-    if cfg["stop"] == "off":
+    # A build-all run nudges even when `again` is set: it loops only while new commits keep coming,
+    # and ends itself on the first stop without one.
+    nudge = run_nudge(root, cfg, data)
+    if nudge:
+        emit(nudge)
+    if again or cfg["stop"] == "off":
         return
     unsaved = unsaved_commits(root, cfg)
     if not unsaved:
@@ -2193,7 +2315,7 @@ def init(name, auto=False):
     gi = os.path.join(target, ".gitignore")
     with open(gi, "w", encoding="utf-8") as f:
         f.write("# Local run state; the gate baseline is committed.\ngates/last.json\ngates/history.jsonl\ncontext.json\n"
-                "compactions.jsonl\nhosts.json\napprovals.json\nhooks.log\nagents/\nreviews/draft.json\n")
+                "compactions.jsonl\nhosts.json\napprovals.json\nhooks.log\nagents/\nreviews/draft.json\nrun.json\n")
     if not auto:
         print(f"Created {target}. Next: fill config.json (gates, protected) and plan.md.")
         return
@@ -2231,6 +2353,9 @@ def main():
     sub.add_parser("requirements", help="every requirement: verify kind, coverage, pass/fail (from the gates)")
     ms = sub.add_parser("milestone", help="is this milestone's gate met? (exit 0 = done)")
     ms.add_argument("name")
+    rn = sub.add_parser("run", help="the build-all run: start it, end it, or show the milestones left")
+    rn.add_argument("action", nargs="?", choices=["status", "start", "end"], default="status")
+    rn.add_argument("--reason", default="", help="(end) why the run ends: all done, or what waits on the user")
     vm = sub.add_parser("verify-manual", help="(the user only) mark a manual requirement as verified")
     vm.add_argument("id")
     vm.add_argument("--note", required=True, help="what you checked, and how")
@@ -2308,6 +2433,16 @@ def main():
         done, why = milestone_status(root, cfg, a.name)
         print(f"{a.name}: DONE, gate met." if done else f"{a.name}: gate open.\n- " + "\n- ".join(why))
         sys.exit(0 if done else 1)
+    elif a.cmd == "run":
+        if a.action == "start":
+            print(run_start(root, cfg))
+        elif a.action == "end":
+            if not a.reason.strip():
+                sys.exit("Say why the run ends: --reason \"all milestones done\" or what waits on the user.")
+            run, lines = run_end(root, cfg, a.reason.strip())
+            print(f"Build-all run ended ({run['outcome']}): {run['reason']}\n" + "\n".join(lines))
+        else:
+            print(run_text(root, cfg))
     elif a.cmd == "verify-manual":
         specs, _ = load_specs(root)
         req = next((r for s in specs for r in s.get("requirements") or [] if r.get("id") == a.id), None)
