@@ -1,0 +1,20 @@
+#!/bin/sh
+# Daedalus launcher: runs dd.py with the first Python 3.10+ it finds (python3, python, then py -3 on
+# Windows), so the hooks work whichever name this machine gives Python. Claude Code runs it through sh
+# on Linux and macOS and through Git Bash on Windows.
+here=$(dirname "$0")
+ok='import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)'
+for py in python3 python; do
+    if command -v "$py" >/dev/null 2>&1 && "$py" -c "$ok" >/dev/null 2>&1; then
+        exec "$py" "$here/dd.py" "$@"
+    fi
+done
+if command -v py >/dev/null 2>&1 && py -3 -c "$ok" >/dev/null 2>&1; then
+    exec py -3 "$here/dd.py" "$@"
+fi
+echo "Daedalus needs Python 3.10 or newer, as python3, python or py; none was found on PATH. Install it (on Debian or Ubuntu: sudo apt install python3), then start the session again." >&2
+# A guard that can't run must block its action (exit 2); every other hook just reports the problem.
+case " $* " in
+    *" pre-tool "*|*" pre-bash "*|*" pre-edit "*) exit 2 ;;
+esac
+exit 1

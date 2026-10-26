@@ -1156,6 +1156,10 @@ class TypedWhileBusy(unittest.TestCase):
         self.assertEqual(self.state()["UI-1"]["by"], "user (sent while the session was busy)")
         self.assertNotIn("UI-3", self.state())
         self.assertIsNone(self.tool())  # once only
+        queued(self.t, "/daedalus:verify UI-3 ok", uid="u9")
+        out = self.p.hook("pre-tool", {**as_agent(None, "Write", file_path=os.path.join(
+            self.p.root, ".daedalus", "gates", "requirements.json")), "transcript_path": self.t})
+        self.assertIn("UI-3 as verified", out["hookSpecificOutput"]["permissionDecisionReason"])  # even when refused
 
     def test_stop_reports_a_queued_check(self):
         queued(self.t, "/daedalus:verify UI-3 fail the logo is cut off", uid="u3")
@@ -1255,6 +1259,90 @@ class RunOutcome(unittest.TestCase):
             self.assertIn("ended (waiting on you)", r.stdout)
         finally:
             p.cleanup()
+
+
+class Deploy(unittest.TestCase):
+    """Two FPL bugs were live while the repository was right: deploys run the live checks."""
+
+    def setUp(self):
+        self.live = tempfile.mktemp(prefix="dd-live-")
+        self.p = Project(gates=[{"name": "tests", "run": "echo ok"},
+                                {"name": "live", "run": f"grep -q fresh {self.live}", "when": ["deploy"]}],
+                         deploy={"run": f"cat version.txt > {self.live}"})
+        self.p.commit("version.txt", "fresh\n", "v1")
+
+    def tearDown(self):
+        self.p.cleanup()
+        if os.path.exists(self.live):
+            os.remove(self.live)
+
+    def test_deploy_then_live_checks(self):
+        r = self.p.cli("deploy")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("live: PASS", r.stdout)
+        self.assertIn("live checks passed; it's the latest code", self.p.cli("run").stdout)
+        self.p.commit("src/a.py", "x = 1\n", "feat")
+        self.assertIn("1 code commit(s) since aren't deployed", self.p.cli("status").stdout)
+        self.p.commit("version.txt", "stale\n", "break the live result")
+        r = self.p.cli("deploy")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("live checks FAILED", self.p.cli("run").stdout)
+
+    def test_deploy_ships_commits_only_and_only_through_the_harness(self):
+        self.p.write("src/a.py", "x = 1\n")
+        r = self.p.cli("deploy")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("Commit first", r.stdout)
+        out = self.p.hook("pre-tool", as_agent(None, "Bash", command=f"cat version.txt > {self.live}"))
+        self.assertEqual(decision(out), "deny")
+        self.assertIn("dd.py", out["hookSpecificOutput"]["permissionDecisionReason"])
+        self.assertEqual(decision(self.p.hook("pre-tool", as_agent("builder", "Bash", command=f'python "{DD}" deploy'))),
+                         "deny")
+        self.assertIsNone(decision(self.p.hook("pre-tool", as_agent(None, "Bash", command=f'python "{DD}" deploy'))))
+
+    def test_plain_gate_runs_skip_live_checks(self):
+        self.assertNotIn("live", self.p.cli("gate").stdout)
+
+
+LAUNCHER = os.path.join(os.path.dirname(DD), "dd")
+
+
+class Launcher(unittest.TestCase):
+    """The FPL server had only `python3`, and every hook failed to start (25 October 2026)."""
+
+    def setUp(self):
+        self.p = Project(gates=[{"name": "tests", "run": "exit 1"}])
+        self.bin = tempfile.mkdtemp(prefix="dd-bin-")
+        for tool in ("sh", "dirname", "git", "bash", "cat"):
+            found = shutil.which(tool)
+            if found:
+                os.symlink(found, os.path.join(self.bin, tool))
+
+    def tearDown(self):
+        self.p.cleanup()
+        shutil.rmtree(self.bin, ignore_errors=True)
+
+    def run_hook(self, event, payload):
+        return subprocess.run(["sh", LAUNCHER, "hook", event], input=json.dumps({"cwd": self.p.root, **payload}),
+                              capture_output=True, text=True, env={"PATH": self.bin, "HOME": os.environ.get("HOME", "")})
+
+    def test_runs_with_only_python3(self):
+        os.symlink(sys.executable, os.path.join(self.bin, "python3"))
+        r = self.run_hook("pre-tool", bash("git commit -m x"))
+        self.assertEqual(decision(json.loads(r.stdout)), "deny", r.stderr)
+
+    def test_without_python_guards_block_and_others_dont(self):
+        r = self.run_hook("pre-tool", bash("ls"))
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("needs Python 3.10", r.stderr)
+        self.assertEqual(self.run_hook("stop", {}).returncode, 1)  # exit 2 would trap the session
+
+    def test_every_claude_hook_uses_the_launcher(self):
+        hooks = dd.load_json(os.path.join(dd.PLUGIN_ROOT, "hooks", "hooks.json"), {})["hooks"]
+        commands = [h["command"] for entries in hooks.values() for e in entries for h in e["hooks"]]
+        self.assertEqual(len(commands), 9)
+        for c in commands:
+            self.assertTrue(c.startswith('sh "${CLAUDE_PLUGIN_ROOT}/scripts/dd" hook '), c)
 
 
 class Detect(unittest.TestCase):

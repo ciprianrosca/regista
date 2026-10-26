@@ -5,7 +5,8 @@ description: "The Daedalus build loop: take the next step of the current milesto
 
 # Build: orchestrate the step, don't do it yourself
 
-The Daedalus CLI: `python "${CLAUDE_PLUGIN_ROOT}/scripts/dd.py"`. Spec: `.daedalus/plan.md` plus any
+The Daedalus CLI: `python "${CLAUDE_PLUGIN_ROOT}/scripts/dd.py"` (`python3` where there's no `python`; the
+session-start context shows the exact command for this machine). Spec: `.daedalus/plan.md` plus any
 spec it links (the linked spec wins where they disagree). Progress: the status file.
 
 In **orchestrated** mode (`config.json → mode`, the default) you are the orchestrator. The hooks

@@ -17,6 +17,9 @@
     }
   ],
   "protected": [],
+  "no_gates_for": [
+    "docs/**"
+  ],
   "push": "ask",
   "stop": "block",
   "auto_snapshot": true,

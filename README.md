@@ -7,19 +7,22 @@ projects. The rules that matter are **enforced by hooks**, not left to the model
 |---|---|
 | A session starts from the saved state: where we are, what's next, what's blocked | `SessionStart` hook loads it into context (again after every compaction) |
 | No commit when tests fail or a metric gets worse | `PreToolUse` hook on `git commit` (Bash and PowerShell) runs the project's gates and denies the commit |
-| No `--no-verify`, no editing the baseline to pass | `PreToolUse` hooks |
+| No `--no-verify`, no editing the baseline to pass, no loosening the config without the user | `PreToolUse` hooks; the commit hook compares the config's checks with the last commit's |
 | Protected files (ground truth, labels, secrets) are never written | `PreToolUse` hooks on Edit/Write and shell writes |
 | No push without the user's OK | `PreToolUse` hook asks for permission on `git push` |
 | No turn ends with commits that no handoff covers | `Stop` hook sends Claude back to save |
 | **Build everything**: `build all` goes through every milestone without stopping in between, and stops only for what needs you | `Stop` hook sends the session back to work while the run is active and keeps committing; a run that stalls ends itself |
 | Nothing is lost when a session dies or compacts without a save | `PreCompact` and `SessionEnd` hooks write a mechanical snapshot |
 | **A context window compacts itself at 65%**: at 55% the agent is told to finish the step and checkpoint; at 65% the host compacts the conversation and the work carries on from the saved state, with nothing for you to clear or restart. If compaction doesn't happen, a hard pause at 75% saves the work instead | the hosts' own compaction, set by `dd.py setup`; `PreToolUse`, `PreCompact` and `SessionStart` hooks, measuring the session's real token use from its transcript |
-| **Try it yourself**: what only a person can judge gets click-by-click steps, and only you can record the result | `UserPromptExpansion` (Claude Code) or `UserPromptSubmit` (Codex) records `verify` commands you type; agents are refused |
+| **Try it yourself**: what only a person can judge gets click-by-click steps, and only you can record the result, even from your phone while the session is busy | `UserPromptExpansion` (Claude Code) or `UserPromptSubmit` (Codex) records `verify` commands you type; messages queued while the session works are read from the transcript; agents are refused |
+| **Change the plan mid-run**: `/daedalus:change <what you want>` is recorded and shown to the session until it's in the plan; "build it last" becomes an ordering rule | the same hooks record it; `SessionStart` and the build-all nudge show open changes |
+| **What's live gets checked where it's served**: a deploy runs live checks, and the status says which commit is live | `dd.py deploy`; `PreToolUse` refuses the deploy command run directly |
 | **Roles in separate contexts**: the main session orchestrates; a builder, a test writer, a reviewer and a researcher each work in their own context, with their own permissions | `PreToolUse` checks the acting agent on every tool call; `SubagentStart` tells each agent its role |
 | **No commit without an independent review** of exactly that change | the commit hook checks an approving verdict whose fingerprint matches the current change set; only the reviewer can record one, and any later edit voids it |
 | **Tests can't be gamed by the builder**: no edits to tests or test config by any route, and a legitimate `BLOCKED` exit when the spec can't be met | `PreToolUse` role rules (editor tools and shell writes); agent instructions |
 | **Requirements pass only through the gates**, and a milestone is done only with end-to-end evidence | the commit hook refuses uncovered requirements and records pass/fail; no agent can write `.daedalus/gates/` or run `verify-manual` |
 | **The guards fail closed**: a crashing hook or a broken config blocks the action; gates run within a time budget so the hook decides before the host's timeout would let the action through | error handling in `dd.py`; `HOOK_GATE_BUDGET`; in Claude Code also `onFailure: "block"`, so a hook that can't even start (no Python) blocks too |
+| **Shell commands are judged by what they do**: what a command writes and reads, not the words in it, so probing in `/tmp`, inline scripts and heredocs don't trip the guards, and writing a guarded file by any route still does | `dd.py` splits each command like a shell (quotes, heredocs, redirects, `cd`, variables) and reads inline code for write calls |
 
 The logic is one standard-library Python script, `scripts/dd.py`, so it behaves the same every time.
 Projects without a `.daedalus/config.json` are left alone: the plugin can stay enabled everywhere.
@@ -53,7 +56,10 @@ editing it, run `/reload-plugins` or start a new session. To try it for one sess
 installing: `claude --plugin-dir <path to the clone>`. Codex copies the plugin into its cache, so run
 `codex plugin add daedalus@daedalus` again after each edit.
 
-Both need `python` (3.10+) and Git (Git Bash runs the gate commands on Windows).
+Both need Python 3.10+ and Git (Git Bash runs the gate commands on Windows). In Claude Code the hooks
+start through `scripts/dd`, a small launcher that finds Python as `python3`, `python` or `py -3`. Codex
+starts them with `python`, so there the command must exist (`sudo apt install python-is-python3` on
+Debian and Ubuntu); `dd.py doctor` checks it.
 
 ## Use
 
@@ -61,18 +67,22 @@ In a project's repo root (in Codex, `$daedalus:<name>` instead of `/daedalus:<na
 
 ```
 /daedalus:init          set up the project: detects the checks, asks three plain questions, writes a plan
+/daedalus:init docs/spec.md   the same, taking the answers from a spec
 /daedalus:start         where we are / next / blocked (runs automatically at session start)
 /daedalus:build next    next step: brief → test writer → builder → reviewer → gates → commit
 /daedalus:build M2      keep going until milestone 2's gate passes or a step is blocked
 /daedalus:build all     build every milestone in the plan, one after another; stop only for what needs you
 /daedalus:try           what to try yourself, step by step (you record it with /daedalus:verify)
-/daedalus:verify UI-3 ok    record a check only you can make (or: fail <what happened>)
+/daedalus:verify UI-3 ok    record a check only you can make (or: fail <what happened>; all ok; M3 ok)
+/daedalus:change <what you want>   change what gets built, at any time, also during a run
 /daedalus:gate          run the gates (--all includes manual ones; --accept sets a new baseline)
 /daedalus:decide <item> options and a recommendation for an open decision
 /daedalus:save          gates, status, commit, handoff, board, learnings
 /daedalus:pause         stop for the day: save everything and hand over
 /daedalus:status · /daedalus:todo · /daedalus:learn
 ```
+
+`dd.py deploy` deploys the last commit and runs the live checks (see Deploys below).
 
 `python <daedalus>/scripts/dd.py doctor` checks that everything works in a project, in plain language,
 with the fix for each problem.
@@ -88,7 +98,9 @@ with the fix for each problem.
   state/          session handoffs (YYYY-MM-DD-slug.md) and automatic snapshots (-auto-)
   memory/         decisions and corrections
   knowledge.json  technical lessons
-  gates/          baseline.json and requirements.json (committed; harness-written), last.json + history.jsonl (local)
+  gates/          baseline.json, requirements.json and deployed.json (committed; harness-written);
+                  last.json, history.jsonl and passed.json (local)
+  changes.json    the user's changes to what gets built, and where each went in the plan
   reviews/        reviewer verdicts by change fingerprint (committed)
   research/       researcher notes
   specs/          one spec per step: requirement IDs and how each is verified
@@ -142,8 +154,10 @@ how each is verified: `test`, `e2e` (the real program, run by a gate with `"evid
 
 - Tests name what they cover: `# covers: STATS-1`. A commit is refused while an active requirement has
   no test naming it.
-- After each gate run the harness records which requirements pass in `.daedalus/gates/requirements.json`.
-  Agents can't write that folder, and the status file can't overrule it.
+- The commit hook records which requirements pass in `.daedalus/gates/requirements.json` when a commit
+  goes through, and so does a gate run on a clean tree: the results describe committed code, never
+  half-finished edits. An entry changes only when its result does. Agents can't write that folder, and
+  the status file can't overrule it.
 - `dd.py milestone M1` says whether M1 is done: every requirement passes and, by default, at least one is
   proven end to end. `dd.py requirements` lists coverage and results.
 
@@ -161,6 +175,9 @@ Hand Daedalus a full spec (link it at the top of `plan.md`, or give it to `/daed
 - a milestone whose gate passes is saved, and the next one starts;
 - a milestone that waits only on your manual checks is left for you, and the build moves on (under
   `"milestones": "strict"` the run stops there instead);
+- a change you send with `/daedalus:change` (also from your phone while the session is busy) is folded
+  into the plan before the next step; "build this last" or "after What-if" becomes an `After: all` or
+  `After: M8` line on the milestone, and `dd.py run` lists the milestones in that order and names the next;
 - a step that needs your decision goes on the board with options and a recommendation, and the build
   carries on with the steps that don't depend on it;
 - a step that stays blocked (an impossible spec, review rounds used up) goes on the board the same way.
@@ -170,7 +187,8 @@ session back to work each time it tries to end its turn, as long as it has commi
 the hook's last nudge. A run that tries to stop twice without a new commit ends itself, so it can't trap
 the session. The run survives compaction, and after a pause `/daedalus:start continue` picks it up
 again. It ends with `dd.py run end --reason "…"` once every milestone is done or everything left waits
-on you, and the final report lists what you need to do: decisions, checks to try, blocked steps.
+on you (the run then ends "waiting on you", not "stopped"), and the final report lists what you need
+to do: decisions, checks to try, blocked steps.
 Nothing is pushed. `dd.py run` shows where it stands.
 
 ### Context budget
@@ -217,7 +235,11 @@ follow:
 
 - in Claude Code, `/daedalus:verify UI-3 ok` or `/daedalus:verify UI-3 fail <what happened>`. The
   `UserPromptExpansion` hook records it: it fires only for a command a person typed, and the model
-  can't invoke that command.
+  can't invoke that command. Sent while the session is busy (from your phone over Remote Control, say),
+  Claude Code folds the message into the running turn without any hook; the hooks then find it in the
+  session's transcript, where Claude Code marks it as typed by a person, and record it once. Nobody may
+  write the transcripts. Several checks fit in one message, one per line, and `all ok` (or `M3 ok`)
+  records every check still waiting.
 - in Codex, `$daedalus:verify UI-3 ok`. The `UserPromptSubmit` hook records it: in Codex it fires only
   for a person's input (subagents talk through tool calls, and a subagent's turn carries its id).
 - in any terminal, `python dd.py try --ask`, which walks you through each check.
@@ -262,6 +284,30 @@ The same `dd.py` runs Codex's hooks with `--host codex` (`hooks/codex-hooks.json
   optional `tolerance`). `dd.py gate <name> --accept` stores a new baseline.
 - `paths`: run the gate only when matching files changed. `when: ["manual"]`: only on `/daedalus:gate --all`.
 - A gate that times out fails. Keep the commit gates' total time well under the hook's 60 minutes.
+- **One run at a time, and never twice for the same files.** Gate runs in a project take turns (two
+  browser suites on one test database collide). A gate that passed on exactly the current files (the
+  harness's own records aside) isn't run again: the builder's or the reviewer's passing run counts for
+  the commit. `dd.py gate --fresh` runs everything anyway; `"reuse_passing_runs": false` turns it off.
+- **Commits with nothing to check skip the gates**: the setup commit, and commits of only the harness's
+  records (status, board, specs, reviews) or of `no_gates_for` paths (`["docs/**"]` in new projects).
+- **Loosening needs you.** A commit whose config removes or changes a gate, unprotects a path, or turns a
+  check off asks for your OK, however the file was changed. Adding checks doesn't.
+
+### Deploys
+
+The gates check the repository. What a deploy serves can still differ (cached assets, data built by the
+old code), so a project that deploys says how, and how to check the result where it's served:
+
+```json
+"deploy": {"run": "bash deploy/deploy.sh", "timeout": 1200},
+"gates": [{"name": "live", "run": "node --test tests/live/", "when": ["deploy"], "evidence": "e2e", "tests": ["tests/live/**"]}]
+```
+
+`dd.py deploy` deploys the last commit (it refuses uncommitted work), then runs the `deploy` gates and
+records which commit is live and whether its checks passed (`.daedalus/gates/deployed.json`). Session
+start, `dd.py run` and the final report say what's live and how many commits aren't. Agents deploy only
+this way: running the deploy command directly is refused, so the live checks always follow a deploy. A
+requirement proven by a live test (`covers: LIVE-1`) passes only through a deploy.
 
 ## Develop
 

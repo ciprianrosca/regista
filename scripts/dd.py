@@ -22,6 +22,8 @@ CLI (run from anywhere inside the project):
   python dd.py requirements               requirements, their coverage and pass/fail (set by the gates)
   python dd.py milestone M1               is M1's gate met? exit 0 = done
   python dd.py run [start|end --reason T] the build-all run: start it, end it, or show the milestones left
+  python dd.py deploy                     deploy HEAD (config deploy.run), then run the live checks
+  python dd.py change [add TEXT|done N]   changes to what gets built (add: the user only)
   python dd.py verify-manual ID --note T  (the user only) record a manual check
   python dd.py try [M1|ID] [--ask]        what to try yourself; --ask (the user, in a terminal) records it
   python dd.py detect                     propose gates, roles and protected paths (JSON)
@@ -50,6 +52,8 @@ if hasattr(sys.stdout, "reconfigure"):
 
 PLUGIN_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 DD = os.path.abspath(__file__)
+# How to run the CLI on this machine, for the commands the harness tells agents and people to run.
+PY = "python" if os.name == "nt" or not shutil.which("python3") else "python3"
 
 DEFAULTS = {
     "project": "",
@@ -307,7 +311,7 @@ def select_gates(cfg, names=None, event=None, include_manual=False, files=None):
         if not names:
             if event and event not in when:
                 continue
-            if not event and "manual" in when and not include_manual and "commit" not in when:
+            if not event and "commit" not in when and not include_manual:  # manual and deploy-only gates
                 continue
         if files is not None and g.get("paths") and not any(matches(f, g["paths"]) for f in files):
             out.append({**g, "_skip": "no changed file matches its paths"})
@@ -580,7 +584,7 @@ def resume_text(root, cfg, detailed=False):
     dirty = changed_files(root)
     parts = [f"# Daedalus: {name}",
              f"Root: {root}",
-             f"Daedalus CLI: python \"{DD}\" <resume|status|gate|snapshot|handoff-name> (run from the project)",
+             f"Daedalus CLI: {PY} \"{DD}\" <resume|status|gate|snapshot|handoff-name> (run from the project)",
              ""]
     parts.append("## Latest handoff" + (f" ({os.path.relpath(h, root)})" if h else ""))
     if hand:
@@ -599,7 +603,7 @@ def resume_text(root, cfg, detailed=False):
     changes = changes_text(root)
     if changes:
         parts.append("\n## Changes from the user, not in the plan yet\nFold each into the plan (milestone, steps, "
-                     f"spec), then `python \"{DD}\" change done <n> --where <milestone>`.\n" + changes)
+                     f"spec), then `{PY} \"{DD}\" change done <n> --where <milestone>`.\n" + changes)
     open_items = [ln for ln in board.splitlines() if re.match(r"\s*[-*]\s*(⬜|🔄|\[ \])", ln)]
     if open_items:
         parts.append("\n## Open on the board\n" + "\n".join(open_items[:12]))
@@ -611,6 +615,9 @@ def resume_text(root, cfg, detailed=False):
         parts.append(f"- {len(unsaved)} commit(s) since the last handoff: " + "; ".join(unsaved[:5]))
     if last:
         parts.append(f"\n## Last gate run ({last.get('date')}, {last.get('commit')})\n" + format_results(last["results"]))
+    live = live_text(root, cfg)
+    if live:
+        parts.append(f"\n## {live}")
     reqs = requirements_summary(root, cfg)
     if reqs:
         parts.append("\n## Requirements and milestones (decided by the gates, not by notes)\n" + reqs)
@@ -618,7 +625,7 @@ def resume_text(root, cfg, detailed=False):
     if run.get("active"):
         parts.append(f"\n## Build-all run\nActive since {run.get('started')}. After a compaction or "
                      f"`{cmd_name('start')} continue`, carry on with `{cmd_name('build')} all` without waiting. In a new "
-                     f"session, wait for the user's command; `python \"{DD}\" run` shows where it stands.")
+                     f"session, wait for the user's command; `{PY} \"{DD}\" run` shows where it stands.")
     if detailed:
         parts.append("\n## Recent commits\n" + git(root, "log", "--oneline", "-8"))
         if dirty:
@@ -946,6 +953,76 @@ def milestone_status(root, cfg, milestone):
     return not reasons, reasons
 
 
+# --- deploy: what's live, checked where it's served ------------------------------------------
+#
+# The gates check the repository; a deploy can still serve something else (cached assets, data built
+# by the old code). With a `deploy` section in the config, `dd.py deploy` ships a commit and then
+# runs the gates marked `"when": ["deploy"]` against the live system, and records which commit is
+# live and whether those checks passed (.daedalus/gates/deployed.json, committed). Agents deploy only
+# through it: the deploy command itself is refused, so the live checks can't be skipped.
+
+def deployed_path(root):
+    return p(root, ".daedalus/gates/deployed.json")
+
+
+def deploy(root, cfg):
+    """Deploy HEAD and check the live result. Returns (ok, lines)."""
+    d = cfg.get("deploy") or {}
+    if not d.get("run"):
+        return False, ["No deploy configured: add \"deploy\": {\"run\": \"<your deploy command>\"} to "
+                       ".daedalus/config.json, and gates with \"when\": [\"deploy\"] that check the live site."]
+    pending = work_changes(root, cfg)
+    if pending:
+        return False, [f"Commit first: a deploy ships a commit, and {len(pending)} file(s) aren't committed "
+                       f"({', '.join(pending[:5])})."]
+    head = git(root, "rev-parse", "--short", "HEAD")
+    t0 = time.time()
+    code, out = run_shell(d["run"], root, d.get("timeout", 1200))
+    rec = {"commit": head, "at": dt.datetime.now().isoformat(timespec="seconds"),
+           "deploy": {"exit": code, "seconds": round(time.time() - t0, 1)}}
+    lines = [f"Deploy of {head}: " + ("done" if code == 0 else f"FAILED (exit {code})") + f" in {rec['deploy']['seconds']} s"]
+    checks = select_gates(cfg, event="deploy")
+    results = []
+    if code != 0:
+        lines.append("\n".join(out.strip().splitlines()[-25:]))
+    elif checks:
+        results = run_gates(root, cfg, checks, reuse=False)
+        record_requirements(root, cfg, results)
+        lines.append("Live checks:\n" + format_results(results))
+        lines += [f"\n[{r['name']}] last lines:\n{r['tail']}" for r in results if r.get("tail")]
+    else:
+        lines.append("No live checks: add gates with \"when\": [\"deploy\"] that look at what's served.")
+    rec["checks"] = [{k: r.get(k) for k in ("name", "status", "seconds")} for r in results]
+    rec["ok"] = code == 0 and all(r["status"] == "pass" for r in results)
+    save_json(deployed_path(root), rec)
+    return rec["ok"], lines
+
+
+def live_text(root, cfg):
+    """One line on what's live, or "" when the project doesn't deploy through the harness."""
+    if not (cfg.get("deploy") or {}).get("run"):
+        return ""
+    rec = load_json(deployed_path(root), {})
+    if not rec:
+        return "Live: nothing deployed through `dd.py deploy` yet."
+    behind = [c for c in git(root, "rev-list", f"{rec['commit']}..HEAD").splitlines()
+              if not all(bookkeeping(cfg, f) for f in git(root, "show", "--name-only", "--format=", c).splitlines())]
+    state = ("live checks passed" if rec.get("ok") else
+             "the deploy FAILED" if rec.get("deploy", {}).get("exit") else "live checks FAILED")
+    return (f"Live: {rec['commit']}, deployed {rec['at'].replace('T', ' ')[:16]}, {state}"
+            + (f"; {len(behind)} code commit(s) since aren't deployed." if behind else "; it's the latest code."))
+
+
+def runs_deploy_command(cfg, eff):
+    """Does the command run the configured deploy command directly (not through `dd.py deploy`)?"""
+    run = (cfg.get("deploy") or {}).get("run")
+    if not run or not eff:
+        return False
+    segs, _ = shell_segments(run)
+    want = [w for w in (segs[0]["words"] if segs else []) if not ASSIGN.match(w)]
+    return bool(want) and any(words[:len(want)] == want for words in eff["runs"])
+
+
 # --- build all: one run through every milestone ---------------------------------------------
 #
 # `/daedalus:build all` builds the plan milestone after milestone. `dd.py run start` marks the run
@@ -1041,6 +1118,11 @@ def run_report(root, cfg, details=None):
     changes = changes_text(root)
     if changes:
         lines.append("Changes from the user not in the plan yet (fold them in before the next step):\n" + changes)
+    live = live_text(root, cfg)
+    if live:
+        lines.append(live)
+        if details is not None and ("aren't deployed" in live or "FAILED" in live or "nothing deployed" in live):
+            details["undeployed"] = True
     return all_done, lines
 
 
@@ -1055,7 +1137,7 @@ def run_start(root, cfg):
         lead = f"Build-all run already active (since {run.get('started')})"
     _, lines = run_report(root, cfg)
     return (f"{lead}. Until it ends, the Stop hook sends the session back to work after each commit. End it with "
-            f"`python \"{DD}\" run end --reason \"<why>\"` once every milestone is done or everything left waits "
+            f"`{PY} \"{DD}\" run end --reason \"<why>\"` once every milestone is done or everything left waits "
             "on the user.\n" + "\n".join(lines))
 
 
@@ -1070,7 +1152,8 @@ def run_end(root, cfg, reason, outcome=None):
     all_done, lines = run_report(root, cfg, details)
     if not outcome:
         outcome = ("complete" if all_done else
-                   "waiting_on_user" if not details.get("open") and not open_changes(root) else "stopped")
+                   "waiting_on_user" if not details.get("open") and not open_changes(root)
+                   and not details.get("undeployed") else "stopped")
     run.update(active=False, ended=dt.datetime.now().isoformat(timespec="seconds"), reason=reason, outcome=outcome)
     save_json(run_path(root), run)
     return run, lines
@@ -1113,7 +1196,7 @@ def run_nudge(root, cfg, data):
             f"Daedalus: a build-all run is active (since {run.get('started')}), so don't stop yet. Carry on with the "
             f"next step that isn't blocked ({cmd_name('build')} all).{save_note}\nMilestones:\n" + "\n".join(lines) +
             f"\nIf every milestone is done, or everything left waits on the user (a decision, a manual check, a "
-            f"step that stayed blocked), or the user asked you to stop: save, run `python \"{DD}\" run end --reason "
+            f"step that stayed blocked), or the user asked you to stop: save, run `{PY} \"{DD}\" run end --reason "
             f"\"<why>\"`, and give the final report."}
 
 
@@ -1210,7 +1293,7 @@ def try_text(root, cfg, which=None):
                   f"  in Claude Code:  /daedalus:verify {waiting[0][1]['id']} ok   or   "
                   f"/daedalus:verify {waiting[0][1]['id']} fail <what happened>",
                   f"  in Codex:        $daedalus:verify {waiting[0][1]['id']} ok   (or fail <what happened>)",
-                  f"  in a terminal:   python \"{DD}\" try --ask   (walks you through each check)"]
+                  f"  in a terminal:   {PY} \"{DD}\" try --ask   (walks you through each check)"]
     return "\n".join(lines)
 
 
@@ -1393,7 +1476,7 @@ def change_from_user(root, text, by):
     save_json(changes_path(root), items)
     return (f"Daedalus recorded change {n} from the user: \"{text}\". Fold it into the plan now (a new milestone "
             "or steps in one, with its spec; an ordering like \"build this last\" becomes an `After:` line on the "
-            f"milestone), then mark it with `python \"{DD}\" change done {n} --where \"<milestone>\"`. If it "
+            f"milestone), then mark it with `{PY} \"{DD}\" change done {n} --where \"<milestone>\"`. If it "
             "contradicts something already built or decided, ask the user one short question first.")
 
 
@@ -1696,8 +1779,8 @@ def integrity_check(root, cfg, data):
     if (eff and (runs_dd(eff, "verify-manual") or runs_dd(eff, "try", "--ask"))) or (
             tool == "Skill" and re.search(r"(^|:)verify$", str(ti.get("skill") or ti.get("name") or ""))):
         return "deny", ("Daedalus: manual checks are the user's call. Show them the steps "
-                        f"(`python <dd.py> try`) and ask them to record what they saw: `{cmd_name('verify')} <ID> ok` "
-                        "or `fail <what happened>`, or `python <dd.py> try --ask` in their own terminal.")
+                        f"(`dd.py try`) and ask them to record what they saw: `{cmd_name('verify')} <ID> ok` "
+                        "or `fail <what happened>`, or `dd.py try --ask` in their own terminal.")
     if (eff and runs_dd(eff, "change", "add")) or (
             tool == "Skill" and re.search(r"(^|:)change$", str(ti.get("skill") or ti.get("name") or ""))):
         return "deny", ("Daedalus: what gets built is the user's call. If you think the plan needs a change, ask them; "
@@ -1833,7 +1916,7 @@ def agent_note(root, cfg, role):
         "researcher": "You may write only notes under .daedalus/research/.",
     }[role]
     return (f"Daedalus project: {cfg['project'] or os.path.basename(root)} at {root}\n"
-            f"Daedalus CLI: python \"{DD}\" (gate, review-record, status)\n"
+            f"Daedalus CLI: {PY} \"{DD}\" (gate, review-record, status)\n"
             f"Your role: {role}. {rules} You can't start other agents. Context limit {cfg['context']['limit_pct']}% "
             "of your own window: past it, report back.")
 
@@ -1885,6 +1968,8 @@ def log_refusal(reason):
 
 def deny(reason):
     log_refusal(reason)
+    if HOOK_CTX.get("notes"):  # what the user sent meanwhile still reaches the session
+        reason += "\n\n" + "\n".join(HOOK_CTX["notes"])
     emit({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
                                  "permissionDecisionReason": reason}})
 
@@ -2531,6 +2616,9 @@ def hook_pre_bash(root, cfg, data):
         if hits:
             deny(f"Daedalus: this command writes to a protected path ({', '.join(hits[:5])}). "
                  "Protected paths are the user's deliverables: never write, move or delete them.")
+    if runs_deploy_command(cfg, effects_of(root, data)):
+        deny(f"Daedalus: deploy with `{PY} \"{DD}\" deploy`: it ships the commit and then runs the live checks, "
+             "so a deploy that serves something else than the repository gets caught.")
     for g in eff["git"]:
         if g["sub"] == "commit":
             if rel_to_root(root, g["cwd"]) is None or find_root(g["cwd"]) not in (None, root):
@@ -2614,6 +2702,8 @@ def hook_pre_tool(root, cfg, data):
         deny("Daedalus: couldn't tell which files this patch changes, so it's blocked. Use the standard "
              "`*** Add File:` / `*** Update File:` / `*** Delete File:` headers.")
     typed = queued_typed(root, cfg, data)
+    if role_of(data) == "main":
+        HOOK_CTX["notes"] = typed
     verdict, msg = context_check(root, cfg, data, items)
     if verdict == "deny":
         deny(msg)
@@ -2788,7 +2878,7 @@ def hook_subagent_stop(root, cfg, data):
                 if os.path.basename(f) != "draft.json" and os.path.getmtime(f) > started]
     if not recorded:
         emit({"decision": "block", "reason": f"Daedalus: record your verdict before finishing: write {REVIEW_DRAFT} "
-                                              f"and run `python \"{DD}\" review-record`."})
+                                              f"and run `{PY} \"{DD}\" review-record`."})
 
 
 def hook(event):
@@ -2897,7 +2987,8 @@ def detect(root):
         pyproject = text("pyproject.toml")
         reqs = " ".join(text(f) for f in has if f.startswith("requirements") and f.endswith(".txt"))
         alldeps = (pyproject + reqs).lower()
-        runner = "uv run " if "uv.lock" in has else "poetry run " if "poetry.lock" in has else "python -m "
+        plain = f"{PY} -m "
+        runner = "uv run " if "uv.lock" in has else "poetry run " if "poetry.lock" in has else plain
         stack.append("Python" + (" (uv)" if runner == "uv run " else " (poetry)" if runner == "poetry run " else ""))
         if any(w in alldeps for w in PY_WEB):
             kind = "web app" if kind == "unknown" else kind
@@ -2905,11 +2996,11 @@ def detect(root):
             kind = "command-line tool" if kind == "unknown" else kind
         py_tests = [f for f in py_files if re.search(r"(^|/)(test_[^/]*|[^/]*_test)\.py$", f)]
         if "pytest" in alldeps or py_tests or "conftest.py" in {f.split("/")[-1] for f in has}:
-            run = (runner + "pytest -q") if runner != "python -m " else "python -m pytest -q"
+            run = runner + "pytest -q"
             if not any(g["name"] == "tests" for g in gates):
                 gates.append({"name": "tests", "run": run, "when": ["commit"], "timeout": 900})
         if "ruff" in alldeps or "ruff.toml" in has or "[tool.ruff" in pyproject:
-            gates.append({"name": "lint", "run": (runner if runner != "python -m " else "") + "ruff check .",
+            gates.append({"name": "lint", "run": (runner if runner != plain else "") + "ruff check .",
                           "when": ["commit"], "timeout": 300})
         pkgs = sorted({f.split("/")[0] for f in py_files if f.count("/") == 1 and f.endswith("/__init__.py")}
                       - {"tests", "test"})
@@ -3148,9 +3239,12 @@ def doctor_codex(root, cfg):
         limit = toml_top_value(text, "model_auto_compact_token_limit")
         (good if limit else bad).append(f"Codex compacts at {int(limit):,} tokens (.codex/config.toml)" if limit else
                                         f"Codex won't compact at {cfg['context']['limit_pct']}% → run "
-                                        f"`python \"{DD}\" setup`")
+                                        f"`{PY} \"{DD}\" setup`")
+    if not shutil.which("python"):
+        bad.append("Codex starts the Daedalus hooks with `python`, which isn't on PATH → on Debian or Ubuntu "
+                   "`sudo apt install python-is-python3`; elsewhere add a `python` command for Python 3.10+")
     missing = [r for r in ROLES if not os.path.exists(os.path.join(root, ".codex", "agents", f"daedalus-{r}.toml"))]
-    (bad if missing else good).append(f"Codex agents missing: {', '.join(missing)} → run `python \"{DD}\" setup`"
+    (bad if missing else good).append(f"Codex agents missing: {', '.join(missing)} → run `{PY} \"{DD}\" setup`"
                                       if missing else "Codex agents: builder, test writer, reviewer, researcher")
     user = read(os.path.join(codex_home(), "config.toml"))
     norm = lambda s: s.replace("\\\\", "\\").replace("/", "\\").lower()  # noqa: E731
@@ -3182,6 +3276,8 @@ def doctor(root, cfg):
     v = sys.version_info
     (good if v >= (3, 10) else bad).append(f"Python {v.major}.{v.minor}" + ("" if v >= (3, 10) else
                                                                            " is too old → install Python 3.10 or newer"))
+    if os.name != "nt" and not shutil.which("sh"):
+        bad.append("no `sh` on PATH: Claude Code starts the Daedalus hooks with it → install a POSIX shell")
     if git(root, "rev-parse", "--is-inside-work-tree") == "true":
         good.append("git repository")
     else:
@@ -3206,6 +3302,8 @@ def doctor(root, cfg):
                 bad.append(f"check '{g['name']}' runs `{word}`, which isn't installed or isn't on PATH")
                 continue
         good.append(f"check '{g['name']}': `{run}`")
+    if (cfg.get("deploy") or {}).get("run") and not select_gates(cfg, event="deploy"):
+        info.append("deploys run no live checks: add a gate with \"when\": [\"deploy\"] that looks at what's served")
     if cfg["requirements"].get("milestone_needs_e2e", True) and not e2e_gates(cfg):
         info.append("no end-to-end check yet: milestones can't be closed until one exists (Milestone 0 adds it)")
     if compacting(cfg):
@@ -3214,7 +3312,7 @@ def doctor(root, cfg):
         if env.get("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE") == want:
             good.append(f"Claude Code compacts at {want}% (.claude/settings.json)")
         else:
-            bad.append(f"Claude Code won't compact at {want}% → run `python \"{DD}\" setup`")
+            bad.append(f"Claude Code won't compact at {want}% → run `{PY} \"{DD}\" setup`")
     g2, b2, i2 = doctor_codex(root, cfg) or ([], [], [])
     good, bad, info = good + g2, bad + b2, info + i2
     log = p(root, ".daedalus/compactions.jsonl")
@@ -3225,7 +3323,7 @@ def doctor(root, cfg):
             info.append(f"last compaction: {d.get('at')} ({d.get('host')}, at {d.get('pct')}%)")
     waiting = [x[1]["id"] for x in try_items(root, cfg) if x[1].get("verify") == "manual" and not x[2].get("passes")]
     if waiting:
-        info.append(f"waiting for you to try: {', '.join(waiting)} (`python \"{DD}\" try`)")
+        info.append(f"waiting for you to try: {', '.join(waiting)} (`{PY} \"{DD}\" try`)")
     lines = [f"✓ {x}" for x in good] + [f"✗ {x}" for x in bad] + [f"· {x}" for x in info]
     lines.append("All good." if not bad else f"{len(bad)} problem(s) to fix.")
     return not bad, lines
@@ -3309,6 +3407,7 @@ def main():
     rn = sub.add_parser("run", help="the build-all run: start it, end it, or show the milestones left")
     rn.add_argument("action", nargs="?", choices=["status", "start", "end"], default="status")
     rn.add_argument("--reason", default="", help="(end) why the run ends: all done, or what waits on the user")
+    sub.add_parser("deploy", help="deploy HEAD with config deploy.run, then run the live checks (gates when: deploy)")
     chg = sub.add_parser("change", help="changes to what gets built: list them, add one (the user), or mark one planned")
     chg.add_argument("action", nargs="?", choices=["list", "add", "done"], default="list")
     chg.add_argument("what", nargs="*", help="(add) the change, in words; (done) its number")
@@ -3412,6 +3511,10 @@ def main():
                   + "\n".join(lines))
         else:
             print(run_text(root, cfg))
+    elif a.cmd == "deploy":
+        ok, lines = deploy(root, cfg)
+        print("\n".join(lines))
+        sys.exit(0 if ok else 1)
     elif a.cmd == "change":
         if a.action == "add":
             print(change_from_user(root, " ".join(a.what), a.by))
