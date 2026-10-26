@@ -596,6 +596,10 @@ def resume_text(root, cfg, detailed=False):
     nxt = section(status, "Next")
     if nxt:
         parts.append(f"\n## Next (from {cfg['status_file']})\n{nxt[:1500]}")
+    changes = changes_text(root)
+    if changes:
+        parts.append("\n## Changes from the user, not in the plan yet\nFold each into the plan (milestone, steps, "
+                     f"spec), then `python \"{DD}\" change done <n> --where <milestone>`.\n" + changes)
     open_items = [ln for ln in board.splitlines() if re.match(r"\s*[-*]\s*(⬜|🔄|\[ \])", ln)]
     if open_items:
         parts.append("\n## Open on the board\n" + "\n".join(open_items[:12]))
@@ -954,35 +958,89 @@ def run_path(root):
     return p(root, ".daedalus/run.json")
 
 
+AFTER = re.compile(r"^\s*(?:[-*]\s*)?\**After\**\s*:\**\s*(.+?)\s*$", re.M | re.I)
+
+
 def plan_milestones(root, cfg):
-    """The plan's milestones in order ('## M1 — name' headings), with their unticked steps."""
+    """The plan's milestones in plan order ('## M1 — name' headings), with their unticked steps and
+    their ordering rule: an `After: M8` line (or `After: all` for the last ones)."""
     md = read(p(root, cfg["plan"] or ".daedalus/plan.md"))
     heads = list(re.finditer(r"^##\s+(M\d+[a-z]?)\b[\s—–:.-]*(.*)$", md, re.M))
     out = []
     for i, m in enumerate(heads):
         body = md[m.end():heads[i + 1].start() if i + 1 < len(heads) else len(md)]
         body = re.split(r"^##\s", body, maxsplit=1, flags=re.M)[0]
+        rule = AFTER.search(body)
+        after = rule.group(1).strip().rstrip(".") if rule else ""
         out.append({"id": m.group(1), "title": m.group(2).strip(),
-                    "open_steps": len(re.findall(r"^\s*[-*]\s*\[ \]", body, re.M))})
+                    "open_steps": len(re.findall(r"^\s*[-*]\s*\[ \]", body, re.M)),
+                    "after": "all" if re.match(r"(all|everything|the rest|last)\b", after, re.I) else
+                    re.findall(r"\bM\d+[a-z]?\b", after)})
     return out
 
 
-def run_report(root, cfg):
-    """(all_done, lines): every milestone of the plan, done or open, as the harness sees it."""
+def build_order(ms):
+    """Plan order, moved only as far as the `After:` rules need. `After: all` waits for every
+    milestone that doesn't say it too. A cycle falls back to plan order."""
+    ids = [m["id"] for m in ms]
+    deps = {m["id"]: ([x["id"] for x in ms if x["after"] != "all"] if m["after"] == "all" else
+                      [x for x in m["after"] if x in ids and x != m["id"]]) for m in ms}
+    order, left = [], list(ms)
+    while left:
+        nxt = next((m for m in left if all(d in [o["id"] for o in order] for d in deps[m["id"]])), left[0])
+        order.append(nxt)
+        left.remove(nxt)
+    return order, deps
+
+
+def waits_on_user(root, cfg, m):
+    """An open milestone whose steps are all ticked and whose only open requirements are manual checks."""
+    if m["open_steps"]:
+        return False
+    specs, problems = load_specs(root)
+    state = load_json(requirements_path(root), {})
+    reqs = [r for s in specs if s.get("milestone") == m["id"] for r in s.get("requirements") or []]
+    if problems or not reqs:
+        return False
+    open_reqs = [r for r in reqs if not state.get(r["id"], {}).get("passes")]
+    e2e_ok = not cfg["requirements"].get("milestone_needs_e2e", True) or any(
+        r.get("verify") == "e2e" and state.get(r["id"], {}).get("passes") for r in reqs)
+    return bool(open_reqs) and e2e_ok and all(r.get("verify") == "manual" for r in open_reqs)
+
+
+def run_report(root, cfg, details=None):
+    """(all_done, lines): every milestone of the plan in build order, done or open, as the harness sees
+    it, and which one is next. `details`, if given, collects which milestones only wait on the user."""
     lines, all_done = [], True
     ms = plan_milestones(root, cfg)
-    for m in ms:
+    order, deps = build_order(ms)
+    built = {m["id"] for m in ms if not m["open_steps"]}
+    nxt = next((m for m in order if m["open_steps"] and all(d in built for d in deps[m["id"]])), None)
+    for m in order:
         done, why = milestone_status(root, cfg, m["id"])
         all_done = all_done and done
         name = f"{m['id']}" + (f" — {m['title']}" if m["title"] else "")
+        rule = (" (after every other milestone)" if m["after"] == "all" else
+                f" (after {', '.join(m['after'])})" if m["after"] else "")
         if done:
-            lines.append(f"- {name}: DONE (gate met)")
+            lines.append(f"- {name}{rule}: DONE (gate met)")
+        elif waits_on_user(root, cfg, m):
+            lines.append(f"- {name}{rule}: built; waits only on the user's checks (`dd.py try {m['id']}`)")
+            if details is not None:
+                details.setdefault("waiting", []).append(m["id"])
         else:
             steps = f"{m['open_steps']} step(s) unticked in the plan, " if m["open_steps"] else ""
-            lines.append(f"- {name}: gate open ({steps}{len(why)} reason(s); `dd.py milestone {m['id']}`)")
+            lines.append(f"- {name}{rule}: gate open ({steps}{len(why)} reason(s); `dd.py milestone {m['id']}`)")
+            if details is not None:
+                details.setdefault("open", []).append(m["id"])
     if not ms:
         lines.append(f"- no milestones in {cfg['plan'] or '.daedalus/plan.md'} (headings like `## M1 — <name>`)")
         all_done = False
+    if nxt:
+        lines.append(f"Next in build order: {nxt['id']}.")
+    changes = changes_text(root)
+    if changes:
+        lines.append("Changes from the user not in the plan yet (fold them in before the next step):\n" + changes)
     return all_done, lines
 
 
@@ -1001,11 +1059,19 @@ def run_start(root, cfg):
             "on the user.\n" + "\n".join(lines))
 
 
+OUTCOMES = {"complete": "complete", "waiting_on_user": "waiting on you", "stopped": "stopped", "stalled": "stalled"}
+
+
 def run_end(root, cfg, reason, outcome=None):
+    """End the run. Its outcome: complete; waiting on the user (everything left is their checks or the
+    board's decisions); stopped (work is left); or stalled (set by the Stop hook)."""
     run = load_json(run_path(root), {})
-    all_done, lines = run_report(root, cfg)
-    run.update(active=False, ended=dt.datetime.now().isoformat(timespec="seconds"), reason=reason,
-               outcome=outcome or ("complete" if all_done else "stopped"))
+    details = {}
+    all_done, lines = run_report(root, cfg, details)
+    if not outcome:
+        outcome = ("complete" if all_done else
+                   "waiting_on_user" if not details.get("open") and not open_changes(root) else "stopped")
+    run.update(active=False, ended=dt.datetime.now().isoformat(timespec="seconds"), reason=reason, outcome=outcome)
     save_json(run_path(root), run)
     return run, lines
 
@@ -1016,7 +1082,8 @@ def run_text(root, cfg):
     if run.get("active"):
         head = f"Build-all run active since {run.get('started')}."
     elif run.get("ended"):
-        head = f"No build-all run active. The last one ended {run['ended']} ({run.get('outcome')}): {run.get('reason')}"
+        head = (f"No build-all run active. The last one ended {run['ended']} "
+                f"({OUTCOMES.get(run.get('outcome'), run.get('outcome'))}): {run.get('reason')}")
     else:
         head = "No build-all run active."
     return head + "\n" + "\n".join(lines)
@@ -1154,6 +1221,19 @@ def verify_from_user(root, cfg, args, by):
     if not rid:
         return f"Daedalus: the user ran {cmd_name('verify')} without an ID. Show them {cmd_name('try')} and the form {usage}."
     s, r = find_requirement(root, rid)
+    group = rid.lower() == "all" or bool(re.fullmatch(r"M\d+[a-z]?", rid, re.I))
+    if not r and group:  # `all ok`, `M3 ok`: every check still waiting (in that milestone)
+        waiting = [x[1]["id"] for x in try_items(root, cfg, None if rid.lower() == "all" else rid)
+                   if x[1].get("verify") == "manual" and not x[2].get("by")]
+        if ok is not True:
+            return (f"Daedalus: nothing recorded: `{rid} fail` doesn't say which check failed. Ask the user which one, "
+                    f"as `{cmd_name('verify')} <ID> fail <what happened>`. Waiting: {', '.join(waiting) or 'none'}.")
+        if not waiting:
+            return f"Daedalus: no checks are waiting for the user{'' if rid.lower() == 'all' else ' in ' + rid}."
+        for x in waiting:
+            record_manual(root, x, True, note or f"verified with `{rid} ok`", by)
+        return (f"Daedalus recorded {', '.join(waiting)} as verified by the user (they typed `{rid} ok`). Tell them, "
+                "in one line, exactly which checks that covered, and carry on.")
     if not r:
         ids = [x[1]["id"] for x in try_items(root, cfg) if x[1].get("verify") == "manual"]
         return (f"Daedalus: there's no requirement {rid}. Checks waiting for the user: {', '.join(ids) or 'none'}. "
@@ -1204,6 +1284,130 @@ def try_ask(root, cfg, which=None):
             print("  Recorded: not working. The agent will see it at the next start.")
 
 
+# --- what the user typed --------------------------------------------------------------------
+#
+# `/daedalus:verify` and `/daedalus:change` are the user's own words: a check only they can make,
+# and a change to what gets built. Claude Code's UserPromptExpansion hook sees them when the
+# session is idle. A message sent while the session is busy is queued and folded into the running
+# turn without any hook, so the hooks also read the transcript for queued messages Claude Code
+# marks as typed by a person, and record each one once. Nobody may write the transcripts.
+
+TYPED = re.compile(r"(?:^|(?<=\s))[/$]daedalus:(verify|change)\b", re.I)
+VERDICT_LINE = re.compile(r"^[A-Za-z][A-Za-z0-9_.]*-\d+[:.,]?\s+\S")
+
+
+def typed_items(text):
+    """[(command, args)] for each /daedalus:verify or /daedalus:change in a message. Several checks in
+    one message are several records, whether each line repeats the command or just says `UI-4 ok`."""
+    out = []
+    marks = list(TYPED.finditer(text or ""))
+    for k, m in enumerate(marks):
+        body = text[m.end():marks[k + 1].start() if k + 1 < len(marks) else len(text)].strip()
+        if m.group(1).lower() == "change":
+            out.append(("change", body))
+            continue
+        current = []
+        for line in (x.strip() for x in body.splitlines()):
+            if current and VERDICT_LINE.match(line) and parse_verdict(line)[1] is not None:
+                out.append(("verify", " ".join(current)))
+                current = [line]
+            elif line:
+                current.append(line)
+        out.append(("verify", " ".join(current)))
+    return out
+
+
+def record_typed(root, cfg, text, by):
+    """Record every verify and change in a message the user typed. Returns the notes for the agent."""
+    notes = []
+    for command, args in typed_items(text):
+        if command == "verify":
+            notes.append(verify_from_user(root, cfg, args, by))
+        else:
+            notes.append(change_from_user(root, args, by))
+    return notes
+
+
+def typed_path(root):
+    return p(root, ".daedalus/typed.json")
+
+
+def queued_typed(root, cfg, data):
+    """Daedalus commands the user sent while the session was busy (Claude Code queues them and folds
+    them into the running turn, and no hook fires): recorded once each, from the transcript entries
+    Claude Code writes for a person's queued message. Returns the notes, or []."""
+    tp = data.get("transcript_path") or ""
+    if HOST["name"] != "claude" or not tp or "/subagents/" in tp.replace("\\", "/"):
+        return []
+    lines = transcript_tail(tp)
+    if not lines or not any('"queued_command"' in ln and "daedalus:" in ln for ln in lines):
+        return []
+    seen_state = load_json(typed_path(root), {})
+    seen = set(seen_state.get("seen") or [])
+    notes, new = [], []
+    for ln in lines:
+        if '"queued_command"' not in ln or "daedalus:" not in ln:
+            continue
+        try:
+            d = json.loads(ln)
+        except ValueError:
+            continue
+        att = d.get("attachment") if isinstance(d, dict) else None
+        if d.get("type") != "attachment" or not isinstance(att, dict) or att.get("type") != "queued_command":
+            continue
+        if (att.get("origin") or {}).get("kind") != "human":
+            continue
+        key = att.get("source_uuid") or d.get("uuid") or att.get("prompt", "")
+        if key in seen:
+            continue
+        seen.add(key)
+        new.append(key)
+        notes += [n.replace("Daedalus recorded", "Daedalus recorded (sent while you were working)", 1)
+                  for n in record_typed(root, cfg, att.get("prompt") or "", "user (sent while the session was busy)")]
+    if new:
+        save_json(typed_path(root), {"seen": (seen_state.get("seen") or [])[-400:] + new})
+    return notes
+
+
+# --- changes to what gets built -----------------------------------------------------------
+#
+# `/daedalus:change <what you want>`, typed by the user, goes into .daedalus/changes.json. Until the
+# orchestrator has put it in the plan (`dd.py change done <n> --where "M9"`), session start and the
+# build-all nudge show it, so a running build folds it in at the next step.
+
+def changes_path(root):
+    return p(root, ".daedalus/changes.json")
+
+
+def change_from_user(root, text, by):
+    text = (text or "").strip()
+    if not text:
+        return (f"Daedalus: the user ran {cmd_name('change')} without saying what to change. Ask them to retype it: "
+                f"`{cmd_name('change')} <what you want>`.")
+    items = load_json(changes_path(root), [])
+    if any(c.get("text") == text for c in items):
+        return f"Daedalus: that change is already recorded: {text[:80]}"
+    n = max([c.get("n", 0) for c in items] + [0]) + 1
+    items.append({"n": n, "text": text, "at": dt.datetime.now().isoformat(timespec="minutes"), "by": by,
+                  "state": "open"})
+    save_json(changes_path(root), items)
+    return (f"Daedalus recorded change {n} from the user: \"{text}\". Fold it into the plan now (a new milestone "
+            "or steps in one, with its spec; an ordering like \"build this last\" becomes an `After:` line on the "
+            f"milestone), then mark it with `python \"{DD}\" change done {n} --where \"<milestone>\"`. If it "
+            "contradicts something already built or decided, ask the user one short question first.")
+
+
+def open_changes(root):
+    return [c for c in load_json(changes_path(root), []) if c.get("state") == "open"]
+
+
+def changes_text(root):
+    items = open_changes(root)
+    if not items:
+        return ""
+    return "\n".join(f"- change {c['n']} ({c['at'].replace('T', ' ')}): {c['text']}" for c in items)
+
+
 def requirements_summary(root, cfg):
     specs, problems = load_specs(root)
     if not specs and not problems:
@@ -1228,17 +1432,28 @@ def requirements_summary(root, cfg):
 
 # --- context budget -------------------------------------------------------------------------
 
+TAILS = {}
+
+
+def transcript_tail(path, tail_bytes=3_000_000):
+    """The last lines of a transcript (read once per hook call), or None."""
+    if (path, tail_bytes) not in TAILS:
+        try:
+            with open(path, "rb") as f:
+                f.seek(0, 2)
+                f.seek(max(0, f.tell() - tail_bytes))
+                TAILS[(path, tail_bytes)] = f.read().decode("utf-8", "replace").splitlines()
+        except (OSError, TypeError):
+            TAILS[(path, tail_bytes)] = None
+    return TAILS[(path, tail_bytes)]
+
+
 def context_tokens(transcript_path, tail_bytes=3_000_000, sidechain=False):
     """(tokens, model) for the context right now: the latest model call's input (fresh + cache reads
     + cache writes), the same sum the status line's used_percentage uses. Main-thread calls only,
     unless `sidechain` (a subagent's own transcript). Reads only the end of the transcript."""
-    try:
-        with open(transcript_path, "rb") as f:
-            f.seek(0, 2)
-            size = f.tell()
-            f.seek(max(0, size - tail_bytes))
-            lines = f.read().decode("utf-8", "replace").splitlines()
-    except (OSError, TypeError):
+    lines = transcript_tail(transcript_path, tail_bytes)
+    if lines is None:
         return None, None
     for line in reversed(lines):
         if '"usage"' not in line:
@@ -1483,6 +1698,10 @@ def integrity_check(root, cfg, data):
         return "deny", ("Daedalus: manual checks are the user's call. Show them the steps "
                         f"(`python <dd.py> try`) and ask them to record what they saw: `{cmd_name('verify')} <ID> ok` "
                         "or `fail <what happened>`, or `python <dd.py> try --ask` in their own terminal.")
+    if (eff and runs_dd(eff, "change", "add")) or (
+            tool == "Skill" and re.search(r"(^|:)change$", str(ti.get("skill") or ti.get("name") or ""))):
+        return "deny", ("Daedalus: what gets built is the user's call. If you think the plan needs a change, ask them; "
+                        f"they record it with `{cmd_name('change')} <what they want>`.")
     if eff and nested_agent(eff):
         return "deny", ("Daedalus: agents don't start Claude Code or Codex sessions from the shell: a nested session "
                         "would run outside its role. The orchestrator starts agents "
@@ -1545,8 +1764,10 @@ def role_check(root, cfg, data):
         return "Daedalus: subagents don't start other agents. Report back; the orchestrator decides who works next."
     if eff and any(g["sub"] in ("commit", "push") for g in eff["git"]):
         return "Daedalus: only the orchestrator commits, after the review. Report back instead."
-    if eff and (runs_dd(eff, "run", "start") or runs_dd(eff, "run", "end")):
-        return "Daedalus: only the orchestrator starts or ends a build-all run. Report back instead."
+    if eff and (runs_dd(eff, "run", "start") or runs_dd(eff, "run", "end") or runs_dd(eff, "change", "done")
+                or runs_dd(eff, "deploy")):
+        return ("Daedalus: only the orchestrator starts or ends a build-all run, deploys, or marks a change as "
+                "planned. Report back instead.")
 
     if role == "builder":
         if tool in EDIT_TOOLS and is_test:
@@ -2392,6 +2613,7 @@ def hook_pre_tool(root, cfg, data):
     if not items:
         deny("Daedalus: couldn't tell which files this patch changes, so it's blocked. Use the standard "
              "`*** Add File:` / `*** Update File:` / `*** Delete File:` headers.")
+    typed = queued_typed(root, cfg, data)
     verdict, msg = context_check(root, cfg, data, items)
     if verdict == "deny":
         deny(msg)
@@ -2409,8 +2631,9 @@ def hook_pre_tool(root, cfg, data):
             hook_pre_bash(root, cfg, d)
         elif tool in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
             hook_pre_edit(root, cfg, d)
-    if verdict == "note":
-        emit_context("PreToolUse", msg)
+    notes = (typed if role_of(data) == "main" else []) + ([msg] if verdict == "note" else [])
+    if notes:
+        emit_context("PreToolUse", "\n".join(notes))
 
 
 def pause_pending(root, cfg, data):
@@ -2430,13 +2653,13 @@ def pause_pending(root, cfg, data):
 def hook_user_prompt(root, cfg, data):
     if role_of(data) != "main":
         return
-    notes = []
+    notes = queued_typed(root, cfg, data)
     if HOST["name"] == "codex":
         # In Codex this hook fires only for a person's input (agents talk to each other through tool
-        # calls, and a subagent's turn carries its agent_id), so typed checks and approvals count.
-        m = re.match(r"\s*[$/]?daedalus:verify\b(.*)", data.get("prompt") or "", re.S | re.I)
-        if m:
-            notes.append(verify_from_user(root, cfg, m.group(1), "user (typed $daedalus:verify)"))
+        # calls, and a subagent's turn carries its agent_id), so typed checks, changes and approvals count.
+        prompt = data.get("prompt") or ""
+        if re.match(r"\s*[$/]?daedalus:(verify|change)\b", prompt, re.I):
+            notes += record_typed(root, cfg, re.sub(r"^\s*daedalus:", "$daedalus:", prompt), "user (typed in Codex)")
         reply = user_reply_to_ask(root, data)
         if reply:
             notes.append(reply)
@@ -2462,18 +2685,22 @@ def hook_prompt_expansion(root, cfg, data):
         return
     name = (data.get("command_name") or "").lower().lstrip("/")
     prompt = data.get("prompt") or ""
-    m = re.match(r"\s*/daedalus:verify\b(.*)", prompt, re.S | re.I)
-    if name != "daedalus:verify" and not m:
+    if name not in ("daedalus:verify", "daedalus:change") and not re.match(r"\s*/daedalus:(verify|change)\b", prompt, re.I):
         return
-    args = data.get("command_args")
-    if not isinstance(args, str):
-        args = m.group(1) if m else ""
-    emit_context("UserPromptExpansion", verify_from_user(root, cfg, args, "user (typed /daedalus:verify)"))
+    if not re.match(r"\s*/daedalus:(verify|change)\b", prompt, re.I):
+        args = data.get("command_args")
+        prompt = f"/{name} {args if isinstance(args, str) else ''}"
+    notes = record_typed(root, cfg, prompt, "user (typed the command)")
+    if notes:
+        emit_context("UserPromptExpansion", "\n".join(notes))
 
 
 def hook_stop(root, cfg, data):
     if role_of(data) != "main":
         return
+    typed = queued_typed(root, cfg, data)
+    if typed:  # the user wrote while the session worked: the agent acknowledges it before stopping
+        emit({"decision": "block", "reason": "\n".join(typed)})
     again = data.get("stop_hook_active")  # an earlier Stop hook already sent the session back once
     pct = None if again else pause_pending(root, cfg, data)
     if pct is not None:
@@ -3082,6 +3309,11 @@ def main():
     rn = sub.add_parser("run", help="the build-all run: start it, end it, or show the milestones left")
     rn.add_argument("action", nargs="?", choices=["status", "start", "end"], default="status")
     rn.add_argument("--reason", default="", help="(end) why the run ends: all done, or what waits on the user")
+    chg = sub.add_parser("change", help="changes to what gets built: list them, add one (the user), or mark one planned")
+    chg.add_argument("action", nargs="?", choices=["list", "add", "done"], default="list")
+    chg.add_argument("what", nargs="*", help="(add) the change, in words; (done) its number")
+    chg.add_argument("--where", default="", help="(done) where it went in the plan, e.g. M9")
+    chg.add_argument("--by", default="user (terminal)", help="(add) who asked for it")
     vm = sub.add_parser("verify-manual", help="(the user only) mark a manual requirement as verified")
     vm.add_argument("id")
     vm.add_argument("--note", required=True, help="what you checked, and how")
@@ -3155,7 +3387,12 @@ def main():
             for r in s.get("requirements") or []:
                 st = state.get(r["id"], {})
                 c = cov.get(r["id"], {})
-                where = ", ".join(c.get("tests", []) + c.get("e2e", [])) or "not covered"
+                if r.get("verify") == "manual":
+                    where = (f"checked by the user on {st.get('at', '')[:10]}" if st.get("passes") else
+                             f"the user reported a problem on {st.get('at', '')[:10]}" if st.get("by") else
+                             "waits for the user (`dd.py try`)")
+                else:
+                    where = ", ".join(c.get("tests", []) + c.get("e2e", [])) or "not covered by any test yet"
                 print(f"  {'PASS' if st.get('passes') else 'open'}  {r['id']:<14} {r.get('verify', 'test'):<6} {where}")
         for x in problems:
             print("problem:", x)
@@ -3171,9 +3408,25 @@ def main():
             if not a.reason.strip():
                 sys.exit("Say why the run ends: --reason \"all milestones done\" or what waits on the user.")
             run, lines = run_end(root, cfg, a.reason.strip())
-            print(f"Build-all run ended ({run['outcome']}): {run['reason']}\n" + "\n".join(lines))
+            print(f"Build-all run ended ({OUTCOMES.get(run['outcome'], run['outcome'])}): {run['reason']}\n"
+                  + "\n".join(lines))
         else:
             print(run_text(root, cfg))
+    elif a.cmd == "change":
+        if a.action == "add":
+            print(change_from_user(root, " ".join(a.what), a.by))
+        elif a.action == "done":
+            items = load_json(changes_path(root), [])
+            hit = next((c for c in items if a.what and str(c.get("n")) == a.what[0]), None)
+            if not hit:
+                sys.exit(f"No change {' '.join(a.what)}. `dd.py change` lists them.")
+            hit.update(state="planned", where=a.where, planned=dt.datetime.now().isoformat(timespec="minutes"))
+            save_json(changes_path(root), items)
+            print(f"Change {hit['n']} is in the plan" + (f" ({a.where})." if a.where else "."))
+        else:
+            items = load_json(changes_path(root), [])
+            print("\n".join(f"{c['n']}. [{'open' if c['state'] == 'open' else 'in the plan: ' + (c.get('where') or '?')}] "
+                            f"{c['at'].replace('T', ' ')} {c['text']}" for c in items) or "No changes recorded.")
     elif a.cmd == "verify-manual":
         specs, _ = load_specs(root)
         req = next((r for s in specs for r in s.get("requirements") or [] if r.get("id") == a.id), None)

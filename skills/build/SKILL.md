@@ -99,8 +99,8 @@ only they can do.
    Stop hook sends you back to work each time you try to end your turn, as long as you've committed
    something since its last nudge. A run that stops twice without a new commit ends itself, so it can
    never trap the session. `dd.py run` shows every milestone, done or open, as the harness sees it.
-3. **Loop:** take the first milestone in plan order whose gate is open and run steps 3–9 above for
-   its steps. The user gave the go-ahead for everything the plan and its spec cover, so, unlike
+3. **Loop:** take the milestone `dd.py run` names as next (plan order, adjusted by `After:` lines) and
+   run steps 3–9 above for its steps. The user gave the go-ahead for everything the plan and its spec cover, so, unlike
    `build M<n>`:
    - **Milestone done** (`dd.py milestone M<n>` exits 0): run `/daedalus:save`, then go straight on to
      the next milestone.
@@ -116,9 +116,15 @@ only they can do.
      spec asks. If writing it forced a choice that spec doesn't make, that's a decision: see above.
    - **Context warning:** finish the step, commit it, run `/daedalus:save`, and carry on. The session
      compacts itself at the limit and the run survives it.
+   - **A change from the user** (`/daedalus:change`, shown at session start and in every nudge): fold it
+     into the plan before the next step, as the change skill says, then `dd.py change done <n> --where M<n>`.
+     "Build this last" or "after What-if" becomes an `After: all` or `After: M8` line on the milestone.
+   - **Deploying** (when `config.json` has a `deploy` section): deploy only with `dd.py deploy`, which runs
+     the live checks after it; never run the deploy command yourself. Deploy after a milestone that
+     changes what's live, and before the final report.
    - **Never push.** Pushing stays the user's call (the hook asks anyway).
 4. **End the run** when every milestone's gate is met, when everything left waits on the user, or
-   when the user asks you to stop: `/daedalus:save`, then
+   when the user asks you to stop (no change from the user may be left open): `/daedalus:save`, then
    `python "${CLAUDE_PLUGIN_ROOT}/scripts/dd.py" run end --reason "<all milestones done | what waits on the user>"`.
 5. **Final report**, in plain words: the milestones done (copied from the harness, not from notes),
    what's built but still has an open gate, and a numbered list of what the user needs to do: each

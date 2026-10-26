@@ -25,7 +25,9 @@ The CLI path is in the session-start context: `python "<dd.py>" …`.
    (`npm run dev`, `uv run app`, …), wait until it answers, and give the user the URL. Mention test
    accounts or sample files they'll need.
 4. **Hand over.** Show the steps, then tell them how to report what they saw:
-   - in Claude Code: `/daedalus:verify UI-3 ok`, or `/daedalus:verify UI-3 fail <what happened>`
+   - in Claude Code: `/daedalus:verify UI-3 ok`, or `/daedalus:verify UI-3 fail <what happened>`; several
+     lines in one message are fine, `all ok` covers every check still waiting, and it works from a phone
+     over Remote Control even while the session is busy
    - in any terminal: `python "<dd.py>" try --ask` walks them through each check and records the answers
 
    Then stop and wait. Never record a check for them, never ask them to paste a command that records

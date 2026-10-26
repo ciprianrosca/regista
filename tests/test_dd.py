@@ -1120,6 +1120,143 @@ class TryItYourself(unittest.TestCase):
             self.assertNotEqual(decision(self.p.hook("pre-tool", as_agent(None, "Bash", command=cmd))), "deny", cmd)
 
 
+def queued(path, prompt, human=True, uid="u1"):
+    """Append the transcript entry Claude Code writes when a queued message joins a running turn."""
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps({"type": "attachment", "uuid": "x" + uid, "attachment": {
+            "type": "queued_command", "prompt": prompt, "source_uuid": uid, "commandMode": "prompt",
+            "origin": {"kind": "human" if human else "agent"}, "humanTurn": human}}) + "\n")
+
+
+class TypedWhileBusy(unittest.TestCase):
+    """Ciprian's checks from his phone were lost while the session worked (25 October 2026)."""
+
+    def setUp(self):
+        self.p = Project(gates=[{"name": "tests", "run": "echo ok"}])
+        self.p.write(".daedalus/specs/signup.json", json.dumps(TRY_SPEC))
+        self.t = os.path.join(tempfile.mkdtemp(prefix="dd-tr-"), "s1.jsonl")
+        open(self.t, "w").close()
+
+    def tearDown(self):
+        self.p.cleanup()
+        shutil.rmtree(os.path.dirname(self.t), ignore_errors=True)
+
+    def state(self):
+        return dd.load_json(dd.requirements_path(self.p.root), {})
+
+    def tool(self, role=None):
+        return self.p.hook("pre-tool", {**as_agent(role, "Bash", command="ls"), "transcript_path": self.t})
+
+    def test_queued_checks_are_recorded_once(self):
+        queued(self.t, "/daedalus:verify UI-1 ok fits my phone")
+        queued(self.t, "/daedalus:verify UI-3 ok", human=False, uid="u2")  # not a person: ignored
+        ctx = self.tool()["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("sent while you were working", ctx)
+        self.assertTrue(self.state()["UI-1"]["passes"])
+        self.assertEqual(self.state()["UI-1"]["by"], "user (sent while the session was busy)")
+        self.assertNotIn("UI-3", self.state())
+        self.assertIsNone(self.tool())  # once only
+
+    def test_stop_reports_a_queued_check(self):
+        queued(self.t, "/daedalus:verify UI-3 fail the logo is cut off", uid="u3")
+        out = self.p.hook("stop", {"transcript_path": self.t})
+        self.assertEqual(out.get("decision"), "block")
+        self.assertIn("NOT working", out["reason"])
+        self.assertFalse(self.state()["UI-3"]["passes"])
+
+    def test_several_checks_in_one_message(self):
+        text = "/daedalus:verify UI-1 ok /daedalus:verify UI-3 ok\nUI-1 ok looks right"
+        self.assertEqual(dd.typed_items(text), [("verify", "UI-1 ok"), ("verify", "UI-3 ok"),
+                                                ("verify", "UI-1 ok looks right")])
+        self.assertEqual(dd.typed_items("/daedalus:verify UI-3 fail the button\nis purple"),
+                         [("verify", "UI-3 fail the button is purple")])
+        out = self.p.hook("user-prompt-expansion", {"command_name": "daedalus:verify", "command_args": "UI-1 ok",
+                                                    "prompt": "/daedalus:verify UI-1 ok\n/daedalus:verify UI-3 ok"})
+        self.assertIn("UI-3", out["hookSpecificOutput"]["additionalContext"])
+        self.assertTrue(self.state()["UI-1"]["passes"] and self.state()["UI-3"]["passes"])
+
+    def test_all_ok_records_every_waiting_check(self):
+        queued(self.t, "/daedalus:verify UI-3 fail colours off", uid="a")
+        queued(self.t, "/daedalus:verify all ok", uid="b")
+        ctx = self.tool()["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("UI-1 as verified by the user (they typed `all ok`)", ctx)
+        self.assertTrue(self.state()["UI-1"]["passes"])
+        self.assertFalse(self.state()["UI-3"]["passes"])  # a reported problem isn't swept up by "all ok"
+        out = self.p.hook("user-prompt-expansion", {"command_name": "daedalus:verify", "command_args": "all fail",
+                                                    "prompt": "/daedalus:verify all fail"})
+        self.assertIn("doesn't say which check failed", out["hookSpecificOutput"]["additionalContext"])
+
+    def test_manual_requirements_read_as_waiting_not_uncovered(self):
+        out = self.p.cli("requirements").stdout
+        self.assertIn("waits for the user", out)
+        self.assertNotIn("UI-1           manual not covered", out)
+
+
+class Changes(unittest.TestCase):
+    """Scope changes during a run: typed by the user, shown until they're in the plan, ordered by After:."""
+
+    def setUp(self):
+        self.p = Project(gates=[{"name": "tests", "run": "echo ok"}])
+        self.t = os.path.join(tempfile.mkdtemp(prefix="dd-tr-"), "s1.jsonl")
+        open(self.t, "w").close()
+
+    def tearDown(self):
+        self.p.cleanup()
+        shutil.rmtree(os.path.dirname(self.t), ignore_errors=True)
+
+    def test_typed_and_queued_changes_are_recorded_and_shown(self):
+        out = self.p.hook("user-prompt-expansion", {"command_name": "daedalus:change",
+                                                    "command_args": "add club crests, build it last",
+                                                    "prompt": "/daedalus:change add club crests, build it last"})
+        self.assertIn("recorded change 1", out["hookSpecificOutput"]["additionalContext"])
+        queued(self.t, "/daedalus:change the bottom bar gets five slots")
+        self.p.hook("pre-tool", {**as_agent(None, "Bash", command="ls"), "transcript_path": self.t})
+        start = self.p.hook("session-start", {})["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("club crests", start)
+        self.assertIn("five slots", start)
+        self.p.cli("run", "start")
+        self.assertIn("five slots", self.p.hook("stop", {})["reason"])
+        self.assertEqual(self.p.cli("change", "done", "1", "--where", "M9").returncode, 0)
+        self.assertNotIn("club crests", self.p.hook("session-start", {})["hookSpecificOutput"]["additionalContext"])
+
+    def test_only_the_user_adds_changes(self):
+        for role in (None, "builder"):
+            self.assertEqual(decision(self.p.hook("pre-tool", as_agent(role, "Bash",
+                                                                       command=f'python "{DD}" change add more pages'))),
+                             "deny", role)
+        self.assertEqual(decision(self.p.hook("pre-tool", as_agent(None, "Skill", skill="daedalus:change"))), "deny")
+        self.assertEqual(decision(self.p.hook("pre-tool", as_agent("builder", "Bash",
+                                                                   command=f'python "{DD}" change done 1'))), "deny")
+        self.assertEqual(self.p.cli("change", "add", "a", "price", "page").returncode, 0)  # the user's own terminal
+        self.assertIn("price page", self.p.cli("change").stdout)
+
+    def test_after_rules_set_the_build_order(self):
+        plan = ("# Plan\n\n## M1 — Engine\n- [x] core\n\n## M9 — Crests\nAfter: all\n- [ ] tiles\n\n"
+                "## M2 — Prices\nAfter: M3\n- [ ] page\n\n## M3 — What-if\n- [ ] toggles\n")
+        self.p.commit(".daedalus/plan.md", plan, "plan")
+        out = self.p.cli("run").stdout
+        order = [ln.split(" ")[1] for ln in out.splitlines() if ln.startswith("- M")]
+        self.assertEqual(order, ["M1", "M3", "M2", "M9"])
+        self.assertIn("M9 — Crests (after every other milestone)", out)
+        self.assertIn("Next in build order: M3.", out)
+
+
+class RunOutcome(unittest.TestCase):
+    def test_a_run_that_only_waits_on_the_user_says_so(self):
+        p = Project(gates=[{"name": "tests", "run": "echo ok"}, E2E_GATE])
+        try:
+            p.commit(".daedalus/plan.md", "# Plan\n\n## M1 — Sign-up\n- [x] form\n", "plan")
+            p.write(".daedalus/specs/signup.json", json.dumps(TRY_SPEC))
+            p.write("e2e/signup_test.sh", "# covers: UI-2\n")
+            self.assertIsNone(decision(p.hook("pre-tool", as_agent(None, "Bash", command="git add -A && git commit -m x"))))
+            self.assertIn("waits only on the user's checks", p.cli("run").stdout)
+            p.cli("run", "start")
+            r = p.cli("run", "end", "--reason", "only phone checks left")
+            self.assertIn("ended (waiting on you)", r.stdout)
+        finally:
+            p.cleanup()
+
+
 class Detect(unittest.TestCase):
     def setUp(self):
         self.root = tempfile.mkdtemp(prefix="dd-detect-")
@@ -1267,7 +1404,7 @@ class Codex(unittest.TestCase):
         note = self.hook("user-prompt", {"prompt": "$daedalus:verify UI-1 ok fits"})["hookSpecificOutput"]
         self.assertIn("recorded UI-1 as verified", note["additionalContext"])
         state = dd.load_json(dd.requirements_path(self.p.root), {})
-        self.assertEqual(state["UI-1"]["by"], "user (typed $daedalus:verify)")
+        self.assertEqual(state["UI-1"]["by"], "user (typed in Codex)")
         # in Claude Code the same prompt records nothing: there only the typed slash command counts
         self.p.hook("user-prompt", {"prompt": "$daedalus:verify UI-3 ok"})
         self.assertNotIn("UI-3", dd.load_json(dd.requirements_path(self.p.root), {}))
