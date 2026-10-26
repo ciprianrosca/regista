@@ -95,6 +95,10 @@ DEFAULTS = {
                "ignore": ["__pycache__/", "*.pyc", "node_modules/", ".pytest_cache/", ".mypy_cache/",
                           ".ruff_cache/", "*.egg-info/", "dist/", "build/", ".venv/", "coverage/", ".coverage"]},
 }
+# Commits that change only these (besides the harness's own records) skip the gates: there's no code to check.
+DEFAULTS["no_gates_for"] = []
+# A gate that passed on exactly the current files isn't run again (by the commit hook or `dd.py gate`).
+DEFAULTS["reuse_passing_runs"] = True
 NESTED = ("context", "roles", "review", "requirements")
 HOOK_GATE_BUDGET = 3300  # seconds of gate runs per commit; the hook itself times out at 3600 and would fail open
 
@@ -133,18 +137,20 @@ def read(path, limit=None):
 
 # --- git ------------------------------------------------------------------------------------
 
-def git(root, *args):
+def git(root, *args, strip=True):
     r = subprocess.run(["git", "-C", root, *args], capture_output=True, text=True,
                        encoding="utf-8", errors="replace")
-    return r.stdout.strip() if r.returncode == 0 else ""
+    return (r.stdout.strip() if strip else r.stdout) if r.returncode == 0 else ""
 
 
 def changed_files(root):
     """Staged, unstaged and untracked paths: a superset of what a commit could include, because a
     hook sees `git add -A && git commit` before the add has run."""
-    out = git(root, "status", "--porcelain", "--untracked-files=all")
+    out = git(root, "status", "--porcelain", "--untracked-files=all", strip=False)  # " M x": the space matters
     files = []
     for line in out.splitlines():
+        if len(line) < 4:
+            continue
         path = line[3:]
         if " -> " in path:
             path = path.split(" -> ", 1)[1]
@@ -310,16 +316,93 @@ def select_gates(cfg, names=None, event=None, include_manual=False, files=None):
     return out
 
 
-def run_gates(root, cfg, gates, accept=False, budget=None):
-    """Run gates in order. With `budget` (seconds), each gate's timeout is cut to what's left, and a
-    gate with no time left fails: the commit hook must decide before its own timeout lets it through."""
-    baseline = load_json(baseline_path(root), {})
-    results = []
+def state_fingerprint(root, cfg):
+    """sha256 over the content gates can see: the committed files and the uncommitted changes, without
+    the harness's own records (status, board, specs, reviews), so writing those doesn't void a run."""
+    import hashlib
+    h = hashlib.sha256()
+    for ln in git(root, "ls-tree", "-r", "HEAD").splitlines():
+        meta, _, path = ln.partition("\t")
+        if not bookkeeping(cfg, path):
+            h.update(path.encode() + b"\0" + meta.encode() + b"\n")
+    h.update(b"--changes--")
+    for f in sorted(changed_files(root)):
+        if bookkeeping(cfg, f):
+            continue
+        h.update(f.encode() + b"\0")
+        try:
+            with open(p(root, f), "rb") as fh:
+                h.update(hashlib.sha256(fh.read()).digest())
+        except OSError:
+            h.update(b"<deleted>")
+    return h.hexdigest()[:20]
+
+
+def passed_path(root):
+    return p(root, ".daedalus/gates/passed.json")
+
+
+def gate_lock(root, wait, note=None):
+    """An exclusive lock on the project's gate runs (released when the process ends), so two runs never
+    share a test database or a port. Waits up to `wait` seconds; returns the open lock file or None."""
+    path = p(root, ".daedalus/gates/.lock")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fh = open(path, "a+")
+    deadline, told = time.time() + wait, False
+    while True:
+        try:
+            if os.name == "nt":
+                import msvcrt
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fh
+        except OSError:
+            if time.time() >= deadline:
+                fh.close()
+                return None
+            if note and not told:
+                print(note, file=sys.stderr)
+                told = True
+            time.sleep(1)
+
+
+def run_gates(root, cfg, gates, accept=False, budget=None, reuse=None):
+    """Run gates in order, one run per project at a time. A gate that already passed on exactly these
+    files is reused instead of run again (unless `reuse` is False). With `budget` (seconds), waiting for
+    the lock and each gate's timeout are cut to what's left, and a gate with no time left fails: the
+    commit hook must decide before its own timeout lets the action through."""
     started = time.time()
+    lock = gate_lock(root, (budget - 60) if budget else 4 * 3600,
+                     note="Daedalus: another gate run is going in this project; waiting for it to finish.")
+    if lock is None:
+        return [{"name": g["name"], "status": "fail", "seconds": 0,
+                 "fails": ["another gate run in this project held the lock for the whole time budget"],
+                 "tail": "Wait for the other run (an agent running the gates), then try again."} for g in gates]
+    try:
+        return _run_gates(root, cfg, gates, accept, budget, started,
+                          cfg.get("reuse_passing_runs", True) if reuse is None else reuse)
+    finally:
+        lock.close()
+
+
+def _run_gates(root, cfg, gates, accept, budget, started, reuse):
+    baseline = load_json(baseline_path(root), {})
+    fp = state_fingerprint(root, cfg)
+    passed = load_json(passed_path(root), {})
+    earlier = (passed.get(fp) or {}).get("gates", {}) if reuse else {}
+    results = []
     for g in gates:
         if g.get("_skip"):
             results.append({"name": g["name"], "status": "skipped", "why": g["_skip"]})
             continue
+        prev = earlier.get(g["name"])
+        if prev and prev.get("run") == g["run"] and not accept:
+            if not (g.get("metrics") and check_metrics(g, prev.get("metrics") or {}, baseline)):
+                results.append({**prev["result"], "reused": prev["at"]})
+                continue
         timeout = g.get("timeout", 600)
         if budget is not None:
             left = budget - (time.time() - started)
@@ -348,6 +431,16 @@ def run_gates(root, cfg, gates, accept=False, budget=None):
     save_json(p(root, ".daedalus/gates/last.json"), record)
     with open(p(root, ".daedalus/gates/history.jsonl"), "a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    fresh = [r for r in results if r["status"] == "pass" and not r.get("reused")]
+    if fresh and state_fingerprint(root, cfg) == fp:  # a run that changed the files proves nothing about them
+        runs = {g["name"]: g["run"] for g in gates}
+        entry = passed.get(fp) or {"gates": {}}
+        for r in fresh:
+            entry["gates"][r["name"]] = {"run": runs[r["name"]], "at": record["date"], "result": r,
+                                         "metrics": r.get("metrics")}
+        entry["at"] = record["date"]
+        passed[fp] = entry
+        save_json(passed_path(root), dict(sorted(passed.items(), key=lambda kv: kv[1]["at"])[-20:]))
     if accept:
         for r in results:
             if r["status"] == "pass" and r.get("metrics"):
@@ -363,7 +456,8 @@ def format_results(results):
             lines.append(f"- {r['name']}: skipped ({r['why']})")
             continue
         m = ", ".join(f"{k}={v}" for k, v in (r.get("metrics") or {}).items())
-        lines.append(f"- {r['name']}: {r['status'].upper()} in {r['seconds']} s" + (f" ({m})" if m else ""))
+        again = f", reused: it passed at {r['reused'][11:16]} on exactly these files" if r.get("reused") else ""
+        lines.append(f"- {r['name']}: {r['status'].upper()} in {r['seconds']} s{again}" + (f" ({m})" if m else ""))
         for fl in r.get("fails", []):
             lines.append(f"    · {fl}")
     return "\n".join(lines)
@@ -385,6 +479,69 @@ def bookkeeping(cfg, path):
     """Files the save step itself writes: committing them is not new work."""
     path = path.replace("\\", "/")
     return path.startswith(".daedalus/") or path in (cfg["status_file"], cfg["board_file"])
+
+
+HOST_FILES = (".claude/settings.json", "AGENTS.md")
+
+
+def harness_only(root, cfg, files):
+    """Does this change touch only the harness's own records (status, board, specs, reviews, the setup
+    files `dd.py init` writes) or `no_gates_for` paths? Then there's no code for the gates to check. The
+    config counts only while it's new: once committed, a config change runs the gates like code."""
+    if not files:
+        return False
+    config_new = not git(root, "ls-files", "--", ".daedalus/config.json")
+    for f in files:
+        if f == ".daedalus/config.json":
+            if not config_new:
+                return False
+        elif not (bookkeeping(cfg, f) or f in HOST_FILES or f.startswith(".codex/")
+                  or matches(f, cfg.get("no_gates_for") or [])):
+            return False
+    return True
+
+
+def config_loosened(root, cfg):
+    """What the working config loosens compared with the last commit's (plain-language list). Adding a
+    gate or a protected path is fine; removing or changing one, or switching a check off, isn't."""
+    try:
+        old = json.loads(git(root, "show", "HEAD:.daedalus/config.json") or "null")
+    except ValueError:
+        return []
+    if not isinstance(old, dict):
+        return []
+    old = {**DEFAULTS, **old, **{k: {**DEFAULTS[k], **(old.get(k) or {})} for k in NESTED}}
+    out = []
+    new_gates = {g.get("name"): g for g in cfg["gates"]}
+    for g in old["gates"]:
+        if g.get("name") not in new_gates:
+            out.append(f"the gate '{g.get('name')}' was removed")
+        elif new_gates[g.get("name")] != g:
+            out.append(f"the gate '{g.get('name')}' was changed")
+
+    def dropped(label, before, after):
+        gone = [x for x in before or [] if x not in (after or [])]
+        if gone:
+            out.append(f"{label} no longer include{'s' if len(gone) == 1 else ''} {', '.join(map(str, gone[:5]))}")
+    dropped("the protected paths", old["protected"], cfg["protected"])
+    for k in ("source", "tests", "test_config"):
+        dropped(f"the {k.replace('_', ' ')} paths", old["roles"].get(k), cfg["roles"].get(k))
+    dropped("the paths that need a review", old["review"].get("required_for"), cfg["review"].get("required_for"))
+    added = [x for x in cfg.get("no_gates_for") or [] if x not in (old.get("no_gates_for") or [])]
+    if added:
+        out.append(f"commits of {', '.join(added)} now skip the gates")
+    if cfg["review"].get("min_changed_lines", 0) > old["review"].get("min_changed_lines", 0):
+        out.append("bigger changes now go without a review")
+    for k, label in (("enforce_coverage", "requirements no longer need a test naming them"),
+                     ("milestone_needs_e2e", "milestones no longer need end-to-end proof")):
+        if old["requirements"].get(k, True) and not cfg["requirements"].get(k, True):
+            out.append(label)
+    if old["mode"] == "orchestrated" and cfg["mode"] != "orchestrated":
+        out.append("the main session may now edit code itself (solo mode)")
+    order = {"block": 0, "ask": 1, "allow": 2}
+    if order.get(cfg["push"], 2) > order.get(old["push"], 2):
+        out.append(f"pushing went from '{old['push']}' to '{cfg['push']}'")
+    return out
 
 
 def commits_since(root, cfg, since):
@@ -719,27 +876,27 @@ def coverage_problems(root, cfg):
 
 
 def record_requirements(root, cfg, results):
-    """After a gate run, the harness alone updates which requirements pass."""
+    """After a gate run on committed code (the commit hook's, or a run on a clean tree), the harness
+    alone updates which requirements pass. An entry is rewritten only when its result changes, so the
+    file doesn't churn with every commit."""
     specs, _ = load_specs(root)
     cov = coverage(root, cfg, specs)
     status = {r["name"]: r["status"] for r in results}
     commit_gates_ok = all(r["status"] != "fail" for r in results)
     e2e_names = {g["name"] for g in e2e_gates(cfg)}
     tests_ran = any(r["name"] not in e2e_names and r["status"] in ("pass", "fail") for r in results)
-    state = load_json(requirements_path(root), {})
+    before = load_json(requirements_path(root), {})
+    state = json.loads(json.dumps(before))
     now = dt.datetime.now().isoformat(timespec="seconds")
     for s in specs:
         for r in s.get("requirements") or []:
             rid, v = r.get("id", ""), r.get("verify", "test")
             prev = state.get(rid, {})
-            if v == "manual":
-                state[rid] = {**prev, "verify": v, "milestone": s.get("milestone"), "spec": s["_file"],
-                              "passes": bool(prev.get("passes"))}
-                continue
+            keep = {**prev, "verify": v, "milestone": s.get("milestone"), "spec": s["_file"],
+                    "passes": bool(prev.get("passes"))}
             c = cov.get(rid, {})
-            if v == "test" and not tests_ran:  # only e2e gates ran: unit-test verdicts stay as they were
-                state[rid] = {**prev, "verify": v, "milestone": s.get("milestone"), "spec": s["_file"],
-                              "passes": bool(prev.get("passes"))}
+            if v == "manual" or (v == "test" and not tests_ran):  # manual: only the user; unit tests didn't run
+                state[rid] = keep
                 continue
             if v == "test":
                 ok = bool(c.get("tests")) and commit_gates_ok
@@ -747,15 +904,23 @@ def record_requirements(root, cfg, results):
             else:
                 ran = [g for g in c.get("e2e", []) if g in status]
                 if not ran:  # its e2e gate didn't run this time: keep the last verdict
-                    state[rid] = {**prev, "verify": v, "milestone": s.get("milestone"), "spec": s["_file"],
-                                  "passes": bool(prev.get("passes"))}
+                    state[rid] = keep
                     continue
                 ok = all(status[g] == "pass" for g in ran) and commit_gates_ok
                 evidence = ran
+            if prev.get("passes") == ok and prev.get("evidence") == evidence and prev.get("at"):
+                state[rid] = keep
+                continue
             state[rid] = {"verify": v, "milestone": s.get("milestone"), "spec": s["_file"], "passes": ok,
                           "evidence": evidence, "at": now, "base": git(root, "rev-parse", "--short", "HEAD")}
-    save_json(requirements_path(root), state)
+    if state != before:
+        save_json(requirements_path(root), state)
     return state
+
+
+def work_changes(root, cfg):
+    """Uncommitted changes the gates can see (not the harness's own records)."""
+    return [f for f in changed_files(root) if not bookkeeping(cfg, f)]
 
 
 def milestone_status(root, cfg, milestone):
@@ -1292,29 +1457,16 @@ def prefixes(globs):
     return out
 
 
-def mentions(cmd, globs):
-    cmd = cmd.replace("\\", "/")
-    return [pre for pre in prefixes(globs) if re.search(r"(?:^|[\s\"'=/])" + re.escape(pre), cmd)]
+def transcripts_dir(data):
+    """Where the host keeps this session's transcripts: the harness reads typed commands from them."""
+    tp = data.get("transcript_path") or ""
+    return os.path.dirname(os.path.abspath(tp)) if tp else None
 
 
-def needles(globs):
-    """Literal path pieces to spot in shell commands: leading folders ('tests/'), plain file names
-    ('conftest.py', 'pytest.ini'), and literal name stems or suffixes ('test_', '.snap')."""
-    out = list(prefixes(globs))
-    for g in globs:
-        base = g.rstrip("/").split("/")[-1]
-        if not re.search(r"[*?\[]", base):
-            out.append(base + ("/" if g.endswith("/") or g.endswith("/**") else ""))
-        else:
-            lit = re.split(r"[*?\[]", base, 1)[0]
-            tail = re.split(r"[*?\]]", base)[-1]
-            if len(lit) >= 4:
-                out.append(lit)
-            if len(tail) >= 4 and tail.startswith("."):
-                out.append(tail)
-        if "__snapshots__" in g:
-            out.append("__snapshots__")
-    return sorted(set(x for x in out if x.strip("/.")))
+def is_transcript(tdir, path):
+    """A session transcript (.jsonl) in the host's transcript folder, or that folder itself."""
+    ap = os.path.abspath(path)
+    return ap == tdir or (ap.startswith(tdir + os.sep) and (ap.endswith(".jsonl") or "." not in os.path.basename(ap)))
 
 
 def integrity_check(root, cfg, data):
@@ -1324,26 +1476,33 @@ def integrity_check(root, cfg, data):
     tool = data.get("tool_name", "")
     ti = data.get("tool_input") or {}
     rel = tool_path(root, ti) if tool in EDIT_TOOLS else None
-    cmd = (ti.get("command") or "") if tool in ("Bash", "PowerShell") else ""
-    if (cmd and ("verify-manual" in cmd or re.search(r"\btry\b.*--ask", cmd))) or (
+    eff = effects_of(root, data)
+    writes = eff["writes"] if eff else []
+    if (eff and (runs_dd(eff, "verify-manual") or runs_dd(eff, "try", "--ask"))) or (
             tool == "Skill" and re.search(r"(^|:)verify$", str(ti.get("skill") or ti.get("name") or ""))):
         return "deny", ("Daedalus: manual checks are the user's call. Show them the steps "
                         f"(`python <dd.py> try`) and ask them to record what they saw: `{cmd_name('verify')} <ID> ok` "
                         "or `fail <what happened>`, or `python <dd.py> try --ask` in their own terminal.")
-    if cmd and NESTED_AGENT.search(cmd) and not re.search(r"(?:^|\s)--?(version|help|V|h)\b", cmd):
+    if eff and nested_agent(eff):
         return "deny", ("Daedalus: agents don't start Claude Code or Codex sessions from the shell: a nested session "
                         "would run outside its role. The orchestrator starts agents "
                         + ("with the Agent tool." if HOST["name"] == "claude" else "with spawn_agent (daedalus-<role>)."))
-    if (rel and rel.startswith(".daedalus/gates/")) or (cmd and writes_to(cmd, [".daedalus/gates"])):
+    tdir = transcripts_dir(data)
+    if tdir:
+        target = ti.get("file_path") or ti.get("notebook_path") or ""
+        if any(is_transcript(tdir, x) for x in ([target] if tool in EDIT_TOOLS and target else []) + writes):
+            return "deny", ("Daedalus: the session transcripts are the host's record of what the user typed; "
+                            "nobody writes them.")
+    if (rel and rel.startswith(".daedalus/gates/")) or under(root, writes, [".daedalus/gates/**"]):
         return "deny", ("Daedalus: .daedalus/gates/ (baseline, requirement results, run logs) is written only by "
                         "the gates. Run `dd.py gate` instead.")
-    if (rel == ".daedalus/config.json") or (cmd and writes_to(cmd, [".daedalus/config.json"])):
+    if (rel == ".daedalus/config.json") or under(root, writes, [".daedalus/config.json"]):
         if role == "main":
             return "ask", "Daedalus: changing the harness config (gates, thresholds, roles) needs the user's OK."
         return "deny", "Daedalus: agents don't change the harness config. Report what you'd change and why."
     # The hosts' own settings decide whether the hooks, the agents and compaction run at all.
-    host_files = [".codex/", ".claude/settings.json", ".claude/settings.local.json"]
-    if (rel and (rel.startswith(".codex/") or rel in host_files)) or (cmd and writes_to(cmd, host_files)):
+    host_files = [".codex/**", ".claude/settings.json", ".claude/settings.local.json"]
+    if (rel and matches(rel, host_files)) or under(root, writes, host_files):
         if role == "main":
             return "ask", ("Daedalus: this changes the agent host's settings (hooks, agents, compaction), which needs "
                            "the user's OK. `dd.py setup` writes the ones Daedalus needs.")
@@ -1361,13 +1520,14 @@ def role_check(root, cfg, data):
     rel = tool_path(root, ti) if tool in EDIT_TOOLS + ("Read", "Grep") else None
     is_src = bool(rel and matches(rel, src) and not matches(rel, tests))
     is_test = bool(rel and matches(rel, tests))
-    cmd = (ti.get("command") or "") if tool in ("Bash", "PowerShell") else ""
+    eff = effects_of(root, data)
+    writes = eff["writes"] if eff else []
 
     # The verdict file and its recorder belong to the reviewer alone.
     if role != "reviewer":
         if tool in EDIT_TOOLS and rel and rel.startswith(".daedalus/reviews/"):
             return f"Daedalus: only the reviewer agent writes reviews. Spawn {agent_name('reviewer')}."
-        if cmd and ("review-record" in cmd or writes_to(cmd, [".daedalus/reviews"])):
+        if eff and (runs_dd(eff, "review-record") or under(root, writes, [".daedalus/reviews/**"])):
             return f"Daedalus: only the reviewer agent records reviews. Spawn {agent_name('reviewer')}."
 
     if role == "main":
@@ -1383,19 +1543,19 @@ def role_check(root, cfg, data):
     # Every subagent: no nested agents, no commits or pushes (the orchestrator commits after review).
     if tool in ("Agent", "Task"):
         return "Daedalus: subagents don't start other agents. Report back; the orchestrator decides who works next."
-    if cmd and (re.search(GIT_SUB.format("commit"), cmd) or re.search(GIT_SUB.format("push"), cmd)):
+    if eff and any(g["sub"] in ("commit", "push") for g in eff["git"]):
         return "Daedalus: only the orchestrator commits, after the review. Report back instead."
-    if cmd and "dd.py" in cmd and re.search(r"\brun\s+(start|end)\b", cmd):
+    if eff and (runs_dd(eff, "run", "start") or runs_dd(eff, "run", "end")):
         return "Daedalus: only the orchestrator starts or ends a build-all run. Report back instead."
 
     if role == "builder":
         if tool in EDIT_TOOLS and is_test:
             return (f"Daedalus: the builder doesn't edit tests or test config ({rel}). If a test is wrong or the "
                     "spec can't be met, stop and report BLOCKED with the reason; the orchestrator decides.")
-        hits = writes_to(cmd, needles(tests)) if cmd else []
+        hits = under(root, writes, tests)
         if hits:
             return (f"Daedalus: the builder doesn't change tests or test config from the shell either "
-                    f"({', '.join(hits)}). Report BLOCKED with the reason instead.")
+                    f"({', '.join(hits[:5])}). Report BLOCKED with the reason instead.")
         return None
     if role == "test-writer":
         if tool in EDIT_TOOLS and rel and not is_test:
@@ -1409,21 +1569,31 @@ def role_check(root, cfg, data):
             if is_src or not target or target == "." or any(
                     pre.startswith(target + "/") or target.startswith(pre.rstrip("/")) for pre in prefixes(src)):
                 return blind + " Point Grep at tests/ or the docs instead."
-        if cmd and mentions(cmd, src):
-            return "Daedalus: the test writer doesn't read or touch implementation files from the shell either."
+        if eff:
+            seen = [x for x in under(root, eff["reads"], src) if not matches(x, tests)]
+            changed = [x for x in under(root, writes, src) if not matches(x, tests)]
+            if changed:
+                return (f"Daedalus: the test writer doesn't change implementation files from the shell either "
+                        f"({', '.join(changed[:5])}).")
+            if seen:
+                return (f"Daedalus: the test writer doesn't read implementation files from the shell either "
+                        f"({', '.join(seen[:5])}). Running the tests is fine; ask the orchestrator for interface details.")
         return None
     if role == "reviewer":
-        if tool in EDIT_TOOLS and rel != REVIEW_DRAFT:
-            return f"Daedalus: the reviewer reports, it doesn't fix. Write only {REVIEW_DRAFT}."
-        if cmd and writes_in_project(cmd) and "review-record" not in cmd and "gate" not in cmd:
-            return ("Daedalus: the reviewer doesn't change project files from the shell (scratch files under "
-                    "/tmp or $TEMP are fine).")
+        if tool in EDIT_TOOLS and rel is not None and rel != REVIEW_DRAFT:
+            return f"Daedalus: the reviewer reports, it doesn't fix. Write only {REVIEW_DRAFT} in the project."
+        inside = in_project(root, writes, [REVIEW_DRAFT]) if eff else []
+        if inside:
+            return (f"Daedalus: the reviewer doesn't change project files from the shell ({', '.join(inside[:5])}). "
+                    "Scratch files outside the project (/tmp, $TMPDIR, the scratchpad) are fine.")
         return None
     if role == "researcher":
-        if tool in EDIT_TOOLS and not (rel or "").startswith(".daedalus/research/"):
-            return "Daedalus: the researcher writes only notes under .daedalus/research/."
-        if cmd and writes_in_project(cmd):
-            return "Daedalus: the researcher doesn't change project files from the shell (/tmp or $TEMP is fine)."
+        if tool in EDIT_TOOLS and rel is not None and not rel.startswith(".daedalus/research/"):
+            return "Daedalus: the researcher writes only notes under .daedalus/research/ in the project."
+        inside = in_project(root, writes, [".daedalus/research/**"]) if eff else []
+        if inside:
+            return (f"Daedalus: the researcher doesn't change project files from the shell ({', '.join(inside[:5])}). "
+                    "Notes go under .daedalus/research/; scratch files outside the project are fine.")
         return None
     # Other subagents (Explore, general-purpose, ...) in orchestrated mode: no source or test edits.
     if cfg["mode"] == "orchestrated" and tool in EDIT_TOOLS and (is_src or is_test):
@@ -1549,40 +1719,564 @@ def user_reply_to_ask(root, data):
     return None
 
 
-GIT_SUB = r"(?:^|[;&|(]\s*|\s)git(?:\s+-C\s+(?:\"[^\"]+\"|'[^']+'|\S+)|\s+-c\s+\S+)*\s+{}\b"
-WRITE_CMD = re.compile(r"(?:^|[;&|]\s*|\s)(rm|mv|cp|del|erase|move|copy|ren|rename|tee|truncate|sed\s+-i|"
-                       r"Remove-Item|Move-Item|Copy-Item|Set-Content|Add-Content|Out-File|New-Item|Clear-Content)\b"
-                       r"|(?<![\d&])>>?(?![&>])(?!\s*(?:/dev/null|\$null|nul))", re.I)
+# --- what a shell command does --------------------------------------------------------------
+#
+# The guards judge what a Bash or PowerShell command writes, reads and runs, not which words it
+# mentions. Matching the text refused about 100 harmless commands in one build: a `>` comparison
+# in an inline script read as a redirect, "snapshot" read as a .snap file, `grep -n` read as
+# `git commit -n`. So the command is split the way a shell splits it (quotes, heredocs, redirects,
+# `cd`, simple variables), and code run inline (a heredoc fed to python or node, `-c`/`-e`
+# arguments, a script file) counts as writing a path when it calls a write API and names the
+# path in a string.
+
+ASSIGN = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", re.S)
+KEYWORDS = {"if", "then", "else", "elif", "fi", "do", "done", "while", "until", "for", "case", "esac", "!", "{",
+            "}", "time", "function", "select", "in"}
+PREFIX_CMDS = {"sudo", "env", "nice", "nohup", "command", "exec", "builtin", "stdbuf", "ionice", "timeout", "xargs",
+               "doas", "caffeinate", "chronic"}
+INTERPRETER = re.compile(r"^(python(\d+(\.\d+)?)?|py|pypy3?|node|nodejs|deno|bun|tsx|ts-node|perl|ruby|php)$", re.I)
+SHELL_CMD = re.compile(r"^(bash|sh|zsh|dash|ksh|pwsh|powershell)$", re.I)
+NULL_TARGET = re.compile(r"^(/dev/(null|stdout|stderr|tty|fd/\d+)|nul|\$null|NUL)$", re.I)
+WRITERS_ALL = {"rm", "rmdir", "unlink", "shred", "truncate", "touch", "tee", "del", "erase", "rd", "ri",
+               "remove-item", "clear-content", "new-item", "set-content", "add-content", "out-file", "mv", "move",
+               "ren", "rename", "move-item", "mi"}
+WRITERS_LAST = {"cp", "copy", "install", "ln", "rsync", "scp", "copy-item", "cpi"}
+READERS = {"cat", "head", "tail", "less", "more", "nl", "bat", "tac", "od", "xxd", "hexdump", "strings", "view",
+           "diff", "cmp", "get-content", "gc", "type", "tar", "zip", "awk", "gawk", "jq"}
+GREPS = {"grep", "egrep", "fgrep", "rg", "ag", "ack", "select-string", "sls"}
+# Writing, reading and starting processes from inline code (Python, JavaScript, Ruby, Perl, PHP).
+WRITE_API = re.compile(
+    r"\bopen\(.{0,200}?,\s*(?:mode\s*=\s*)?['\"][rbt]*[wax]|\bmode\s*=\s*['\"][rbt]*[wax]|write_text|write_bytes|"
+    r"writeFile|appendFile|createWriteStream|\b(?:rmSync|rmdirSync|unlinkSync|renameSync|copyFileSync|cpSync|"
+    r"truncateSync|mkdirSync)\b|\bfs(?:\.promises)?\.(?:rm|rmdir|unlink|rename|copyFile|cp|truncate|mkdir)\(|"
+    r"\bos\.(?:remove|unlink|rename|replace|rmdir|removedirs|makedirs|mkdir|truncate)\(|"
+    r"\bshutil\.(?:copy\w*|move|rmtree)\(|\.unlink\(|\.touch\(|\.rename\(|\bFile\.(?:write|delete|open)|"
+    r"\bfopen\(.{0,200}?['\"][wax]|\bfile_put_contents\(|\bunlink\(", re.S)
+READ_API = re.compile(r"\bopen\(|read_text|read_bytes|readFile|createReadStream|readlines|\bfopen\(|"
+                      r"\bfile_get_contents\(|\bFile\.read|\bfs\.read")
+SPAWN_API = re.compile(r"\bsubprocess\.|\bos\.(?:system|popen|exec\w*|spawn\w*)\(|child_process|\bexecSync\b|"
+                       r"\bspawnSync\b|\bexecFile\w*\(|\bspawn\(|\bexec\(|\bsystem\(|\bDeno\.(?:run|Command)|"
+                       r"\bBun\.spawn|\bpty\.spawn")
+STR_LIT = re.compile(r"""(['"`])((?:\\.|(?!\1)[^\\\n])*)\1""")
+FILE_LIKE = re.compile(r"^\.?[\w@+-][\w@.+-]*\.[A-Za-z0-9]{1,10}$")
 
 
-def writes_to(cmd, paths):
-    """The paths a shell command seems to write: a writing segment (rm, mv, sed -i, >, …) of a
-    compound command that names one of them. `git add x && sed -i … y` writes y, not x."""
-    hits = []
-    for seg in re.split(r"&&|\|\||;|\n", cmd.replace("\\", "/")):
-        if not WRITE_CMD.search(seg):
-            continue
-        for pt in paths:
-            pt = (pt or "").replace("\\", "/")
-            if not pt or pt in hits:
+def shell_segments(text):
+    """Split a command like a POSIX shell: (segments, substitutions). Each segment is
+    {"words", "out", "in", "heredocs"}: its words with the quotes removed, its output and input
+    redirect targets, and the heredoc bodies fed to it. Substitutions ($(…), `…`, <(…)) are the
+    inner commands, which run too."""
+    segs, subs = [], []
+    seg = {"words": [], "out": [], "in": [], "heredocs": []}
+    st = {"word": "", "has": False, "redirect": None}
+    pending = []  # heredocs opened on the current line: (segment, delimiter, strip tabs)
+    i, n = 0, len(text)
+
+    def end_word():
+        if st["has"]:
+            if st["redirect"] == "out":
+                seg["out"].append(st["word"])
+            elif st["redirect"] == "in":
+                seg["in"].append(st["word"])
+            elif st["redirect"] is None:
+                seg["words"].append(st["word"])
+            st["redirect"] = None
+        st["word"], st["has"] = "", False
+
+    def end_seg():
+        nonlocal seg
+        end_word()
+        st["redirect"] = None
+        if seg["words"] or seg["out"] or seg["in"] or seg["heredocs"]:
+            segs.append(seg)
+        seg = {"words": [], "out": [], "in": [], "heredocs": []}
+
+    def closing(j, open_ch, close_ch):
+        """Index of the bracket that closes the one opened just before j (quotes respected)."""
+        depth, q = 1, None
+        while j < n:
+            ch = text[j]
+            if q:
+                if ch == "\\" and q == '"':
+                    j += 1
+                elif ch == q:
+                    q = None
+            elif ch in "'\"":
+                q = ch
+            elif ch == "\\":
+                j += 1
+            elif ch == open_ch:
+                depth += 1
+            elif ch == close_ch:
+                depth -= 1
+                if depth == 0:
+                    return j
+            j += 1
+        return n
+
+    def substitution(j):
+        """text[j] starts `$(`, `<(`, `>(` or a backtick: record the inner command, return the end."""
+        if text[j] == "`":
+            k = text.find("`", j + 1)
+            k = n if k < 0 else k
+            subs.append(text[j + 1:k])
+            return k + 1
+        k = closing(j + 2, "(", ")")
+        subs.append(text[j + 2:k])
+        return k + 1
+
+    while i < n:
+        ch = text[i]
+        if ch == "\\" and i + 1 < n:
+            if text[i + 1] == "\n":
+                i += 2
                 continue
-            # a path piece starts at a word boundary ("tests/" not inside "latest/"); a suffix (".snap") anywhere
-            lead = "" if pt.startswith(".") and "/" not in pt else r"(?:^|[\s\"'=/(<>])"
-            if re.search(lead + re.escape(pt), seg):
-                hits.append(pt)
-    return hits
+            st["word"] += text[i + 1]
+            st["has"] = True
+            i += 2
+            continue
+        if ch == "'":
+            k = text.find("'", i + 1)
+            k = n if k < 0 else k
+            st["word"] += text[i + 1:k]
+            st["has"] = True
+            i = k + 1
+            continue
+        if ch == '"':
+            j = i + 1
+            while j < n and text[j] != '"':
+                if text[j] == "\\" and j + 1 < n:
+                    st["word"] += text[j + 1] if text[j + 1] in '"\\$`' else text[j:j + 2]
+                    j += 2
+                    continue
+                if text.startswith("$(", j) or text[j] == "`":
+                    k = substitution(j)
+                    st["word"] += text[j:k]
+                    j = k
+                    continue
+                st["word"] += text[j]
+                j += 1
+            st["has"] = True
+            i = j + 1
+            continue
+        if text.startswith("$(", i) or ch == "`" or (text.startswith("<(", i) or text.startswith(">(", i)):
+            k = substitution(i)
+            st["word"] += text[i:k]
+            st["has"] = True
+            i = k
+            continue
+        if ch == "#" and not st["has"]:
+            k = text.find("\n", i)
+            i = n if k < 0 else k
+            continue
+        if ch == "\n":
+            end_seg()
+            i += 1
+            for owner, delim, strip in pending:  # heredoc bodies start on the next line
+                lines = []
+                while i < n:
+                    k = text.find("\n", i)
+                    k = n if k < 0 else k
+                    line = text[i:k]
+                    i = k + 1
+                    if (line.lstrip("\t") if strip else line).rstrip("\r") == delim:
+                        break
+                    lines.append(line)
+                owner["heredocs"].append("\n".join(lines))
+            pending = []
+            continue
+        if ch in " \t\r":
+            end_word()
+            i += 1
+            continue
+        if text.startswith("<<<", i):
+            end_word()
+            st["redirect"] = "data"
+            i += 3
+            continue
+        if text.startswith("<<", i):
+            end_word()
+            j = i + 2
+            strip = j < n and text[j] == "-"
+            j += 1 if strip else 0
+            while j < n and text[j] in " \t":
+                j += 1
+            delim = ""
+            while j < n and text[j] not in " \t\n;&|<>()":
+                if text[j] in "'\"\\":
+                    j += 1
+                    continue
+                delim += text[j]
+                j += 1
+            pending.append((seg, delim, strip))
+            i = j
+            continue
+        if ch in "<>" or (ch == "&" and text.startswith("&>", i)):
+            if st["word"].isdigit() and ch == ">":
+                st["word"], st["has"] = "", False  # 2>file: the fd number isn't a word
+            end_word()
+            j = i + (2 if ch == "&" else 1)
+            if ch == ">" and j < n and text[j] in ">|":
+                j += 1
+            if ch == ">" and j < n and text[j] == "&":  # >&2, 2>&1: a descriptor, not a file
+                j += 1
+                while j < n and (text[j].isdigit() or text[j] == "-"):
+                    j += 1
+                i = j
+                continue
+            st["redirect"] = "in" if ch == "<" else "out"
+            i = j
+            continue
+        if ch in ";|&()":
+            end_seg()
+            i += 1
+            continue
+        st["word"] += ch
+        st["has"] = True
+        i += 1
+    end_seg()
+    return segs, subs
 
 
-# Starting a Claude Code or Codex session from the shell: it would run outside the agent's role.
-NESTED_AGENT = re.compile(r"(?:^|[;&|(`]\s*|\$\(\s*)(?:\S*[/\\])?(?:claude|codex)(?:\.exe|\.cmd|\.ps1)?(?=\s|$)"
-                          r"|npx\s+(?:-y\s+)?@(?:openai/codex|anthropic-ai/claude-code)\b", re.I)
-TEMP_MARK = re.compile(r"/tmp/|\$\{?(TMPDIR|TEMP|TMP)\b|%TEMP%|\$env:TEMP|mktemp|AppData/Local/Temp", re.I)
+def expand(word, env):
+    """$NAME, ${NAME}, $env:NAME and a leading ~, where the value is known."""
+    def var(m):
+        name = m.group(1) or m.group(2) or m.group(3)
+        val = env.get(name, os.environ.get(name))
+        if val is None and name in ("TMPDIR", "TEMP", "TMP"):
+            val = tempfile_dir()
+        return m.group(0) if val is None else val
+    word = re.sub(r"\$env:([A-Za-z_]\w*)|\$\{([A-Za-z_]\w*)\}|\$([A-Za-z_]\w*)", var, word)
+    if word.startswith("~"):
+        word = os.path.expanduser(word)
+    return word
 
 
-def writes_in_project(cmd):
-    """A writing segment that doesn't aim at a temp location (scratch files for probing are fine)."""
-    return any(WRITE_CMD.search(seg) and not TEMP_MARK.search(seg)
-               for seg in re.split(r"&&|\|\||;|\n", cmd.replace("\\", "/")))
+def tempfile_dir():
+    import tempfile
+    return tempfile.gettempdir().replace("\\", "/")
+
+
+def resolve(word, cwd):
+    word = word.replace("\\", "/") if os.name == "nt" else word
+    return os.path.normpath(word if os.path.isabs(word) else os.path.join(cwd, word)).replace("\\", "/")
+
+
+def positionals(words, value_opts=()):
+    """The non-option arguments (after `--`, everything is an argument)."""
+    out, skip, rest = [], False, False
+    for w in words:
+        if skip:
+            skip = False
+            continue
+        if rest or not w.startswith("-") or w == "-":
+            out.append(w)
+        elif w == "--":
+            rest = True
+        elif w in value_opts:
+            skip = True
+    return out
+
+
+def agent_script(path, cwd):
+    """A script file an agent wrote outside the project (a scratch file): its code is judged like
+    inline code. The project's own scripts and the harness's are code under review, not probes."""
+    root = find_root(cwd)
+    plug = os.path.abspath(PLUGIN_ROOT).replace("\\", "/")
+    ap = os.path.abspath(path).replace("\\", "/")
+    if ap.startswith(plug + "/") or (root and rel_to_root(root, ap) is not None):
+        return False
+    if os.path.basename(ap) == "dd.py" and '"""Daedalus core' in read(ap, 300):  # another copy of the harness
+        return False
+    return os.path.isfile(ap) and os.path.getsize(ap) < 300_000
+
+
+IMPORT_SPEC = re.compile(r"""\bfrom\s+(['"]).*?\1|\bimport\s*\(\s*(['"]).*?\2\s*\)|\brequire\(\s*(['"]).*?\3\s*\)|"""
+                         r"""^\s*import\s+(['"]).*?\4""", re.M)
+
+
+def path_literals(code):
+    """Strings in source code that look like file paths (module imports aren't files it writes)."""
+    for m in STR_LIT.finditer(IMPORT_SPEC.sub(" ", code)):
+        s = m.group(2)
+        if not s or s in (".", "..") or len(s) > 400 or re.search(r"\s", s) or "://" in s or s.startswith("-"):
+            continue
+        if "/" in s or FILE_LIKE.match(s):
+            yield s
+
+
+def shell_effects(cmd, cwd, powershell=False):
+    """What a shell command does: {"writes", "reads"} (absolute paths, `cd` and simple variables
+    followed), "runs" (each command's words), "code" (inline source it runs), "git" (git
+    subcommands with their repo and arguments)."""
+    eff = {"writes": [], "reads": [], "runs": [], "code": [], "git": []}
+    if powershell:
+        cmd = cmd.replace("\\", "/").replace("`", "'")  # PowerShell paths and its escape character
+    _effects(cmd, cwd.replace("\\", "/"), {}, eff, {}, 0)
+    return eff
+
+
+def _code_effects(code, cwd, eff):
+    eff["code"].append(code)
+    paths = [resolve(x, cwd) for x in path_literals(code)]
+    if WRITE_API.search(code):
+        eff["writes"] += paths
+    if READ_API.search(code):
+        eff["reads"] += paths
+
+
+def _effects(cmd, cwd, env, eff, scripts, depth):
+    if depth > 4:
+        return
+    segs, subs = shell_segments(cmd)
+    for sub in subs:
+        _effects(sub, cwd, dict(env), eff, scripts, depth + 1)
+    for seg in segs:
+        raw = list(seg["words"])
+        words = [expand(w, env) for w in raw]
+        while words and ASSIGN.match(words[0]):
+            name, val = ASSIGN.match(words[0]).groups()
+            env[name] = os.path.join(tempfile_dir(), "mktemp") if "mktemp" in raw[0] else val
+            words, raw = words[1:], raw[1:]
+        while words and (words[0] in KEYWORDS or os.path.basename(words[0]) in PREFIX_CMDS):
+            head = os.path.basename(words.pop(0))
+            raw.pop(0)
+            while words and (words[0].startswith("-") or ASSIGN.match(words[0]) or
+                             (head == "timeout" and re.match(r"^\d+(\.\d+)?[smhd]?$", words[0]))):
+                if head in ("sudo", "doas") and words[0] in ("-u", "-g", "-C"):
+                    words, raw = words[1:], raw[1:]
+                words, raw = words[1:], raw[1:]
+        outs = [resolve(expand(t, env), cwd) for t in seg["out"] if not NULL_TARGET.match(expand(t, env))]
+        eff["writes"] += outs
+        eff["reads"] += [resolve(expand(t, env), cwd) for t in seg["in"]]
+        if not words:
+            continue
+        eff["runs"].append(words)
+        name = os.path.basename(words[0]).lower()
+        name = re.sub(r"\.(exe|cmd|bat|ps1)$", "", name)
+        args = words[1:]
+        if name in ("cd", "pushd", "set-location", "sl", "chdir"):
+            target = next((a for a in args if not a.startswith("-")), None)
+            if target and target != "-":
+                cwd = resolve(target, cwd)
+            continue
+        if INTERPRETER.match(name):
+            code_flags = {"-c"} if name.startswith(("py", "pypy")) else {"-r"} if name == "php" else \
+                {"-e", "--eval", "-p", "--print", "-E"}
+            code, files = None, []
+            for k, a in enumerate(args):
+                if a in code_flags and k + 1 < len(args):
+                    code = args[k + 1]
+                    files = positionals(args[k + 2:])
+                    break
+                if a.startswith("--eval="):
+                    code = a.split("=", 1)[1]
+                    break
+            if code is not None:
+                _code_effects(code, cwd, eff)
+                if name == "perl" and any(re.match(r"^-\w*i", a) for a in args):
+                    eff["writes"] += [resolve(f, cwd) for f in files]  # perl -pi -e … files
+            for body in seg["heredocs"]:
+                _code_effects(body, cwd, eff)
+            script = next((a for a in positionals(args, ("-m", "-W", "-X", "--input-type", "-r", "--require",
+                                                          "--import", "--loader"))
+                           if a != "-"), None) if code is None else None
+            if script:
+                sp = resolve(script, cwd)
+                body = scripts.get(sp)
+                if body is None and agent_script(sp, cwd):
+                    body = read(sp)
+                if body:
+                    _code_effects(body, cwd, eff)
+            continue
+        if SHELL_CMD.match(name):
+            for k, a in enumerate(args):
+                if a in ("-c", "-Command", "-command") and k + 1 < len(args):
+                    _effects(args[k + 1], cwd, dict(env), eff, scripts, depth + 1)
+                    break
+            else:
+                script = next(iter(positionals(args)), None)
+                sp = resolve(script, cwd) if script else None
+                body = scripts.get(sp) if sp else None
+                if sp and body is None and agent_script(sp, cwd):
+                    body = read(sp)
+                if body:
+                    _effects(body, cwd, dict(env), eff, scripts, depth + 1)
+            for body in seg["heredocs"]:
+                _effects(body, cwd, dict(env), eff, scripts, depth + 1)
+            continue
+        if name == "eval":
+            _effects(" ".join(args), cwd, env, eff, scripts, depth + 1)
+            continue
+        if seg["heredocs"] and outs:  # cat > x.py <<EOF: remember the script for a later `python x.py`
+            for o in outs:
+                scripts[o] = "\n".join(seg["heredocs"])
+        if name == "tee":
+            for f in positionals(args):
+                fp = resolve(f, cwd)
+                eff["writes"].append(fp)
+                if seg["heredocs"]:
+                    scripts[fp] = "\n".join(seg["heredocs"])
+            continue
+        if name == "git":
+            k, cdir = 0, None
+            while k < len(args) and args[k].startswith("-"):
+                if args[k] in ("-C", "-c", "--git-dir", "--work-tree", "--namespace") and k + 1 < len(args):
+                    if args[k] == "-C":
+                        cdir = resolve(args[k + 1], cwd)
+                    k += 2
+                else:
+                    k += 1
+            if k < len(args):
+                sub, rest = args[k], args[k + 1:]
+                eff["git"].append({"sub": sub, "args": rest, "cwd": cdir or cwd})
+                if sub in ("checkout", "restore", "rm", "mv"):
+                    paths = rest[rest.index("--") + 1:] if "--" in rest else positionals(rest, ("-s", "--source"))
+                    eff["writes"] += [resolve(x, cdir or cwd) for x in paths]
+            continue
+        pos = positionals(args, ("-s", "--size", "-t", "--target-directory", "-m", "--mode", "-o", "-g",
+                                 "-Value", "-Encoding", "-ItemType", "-Filter", "-Include", "-Exclude"))
+        if name in WRITERS_ALL:
+            eff["writes"] += [resolve(x, cwd) for x in pos]
+            continue
+        if name in WRITERS_LAST and len(pos) >= 2:
+            dest = resolve(pos[-1], cwd)
+            srcs = [resolve(x, cwd) for x in pos[:-1]]
+            eff["reads"] += srcs
+            if os.path.isdir(dest) or pos[-1].endswith("/"):
+                eff["writes"] += [dest.rstrip("/") + "/" + os.path.basename(s.rstrip("/")) for s in srcs]
+            else:
+                eff["writes"].append(dest)
+            continue
+        if name == "sed":
+            inplace = any(a == "--in-place" or a.startswith("--in-place=") or re.match(r"^-[a-zA-Z]*i", a)
+                          for a in args)
+            script_given = any(a in ("-e", "-f", "--expression", "--file") for a in args)
+            files = positionals(args, ("-e", "-f", "--expression", "--file"))
+            files = files if script_given else files[1:]
+            eff["writes" if inplace else "reads"] += [resolve(x, cwd) for x in files]
+            continue
+        if name == "dd":
+            for a in args:
+                if a.startswith("of="):
+                    eff["writes"].append(resolve(a[3:], cwd))
+                elif a.startswith("if="):
+                    eff["reads"].append(resolve(a[3:], cwd))
+            continue
+        if name == "find":
+            starts = []
+            for a in args:
+                if a.startswith("-") or a in ("(", "!"):
+                    break
+                starts.append(a)
+            if "-delete" in args or any(args[k] in ("-exec", "-execdir") and k + 1 < len(args) and
+                                        os.path.basename(args[k + 1]) in ("rm", "mv", "sed", "truncate", "shred")
+                                        for k in range(len(args))):
+                eff["writes"] += [resolve(x, cwd) for x in starts or ["."]]
+            continue
+        if name in GREPS:
+            given = any(a in ("-e", "-f", "--regexp", "--file") or a.startswith("--regexp=") for a in args)
+            files = positionals(args, ("-e", "-f", "--regexp", "--file", "-A", "-B", "-C", "-m", "--max-count",
+                                       "-g", "--glob", "-t", "--type", "--include", "--exclude", "-Pattern", "-Path"))
+            files = files if given else files[1:]
+            recursive = name in ("rg", "ag", "ack") or any(re.match(r"^-[a-zA-Z]*[rR]", a) or a == "--recursive"
+                                                         for a in args)
+            if not files and recursive:
+                files = ["."]
+            eff["reads"] += [resolve(x, cwd) for x in files]
+            continue
+        if name in READERS:
+            eff["reads"] += [resolve(x, cwd) for x in pos]
+
+
+def under(root, paths, globs):
+    """The paths (absolute, from shell_effects) that fall under the globs, or are folders holding
+    something that does, as project-relative paths. A path with an unknown variable is judged by
+    what follows the variable."""
+    hits, folders = [], prefixes(globs)
+    for ap in paths:
+        cands = [ap]
+        if "$" in ap:
+            tail = re.split(r"\$\{?\w+\}?/?", ap)[-1]
+            cands.append(tail)
+        for c in cands:
+            rel = rel_to_root(root, c) if os.path.isabs(c) else c.lstrip("./") or "."
+            if rel is None:
+                continue
+            if rel == "." or matches(rel, globs) or matches(rel.rstrip("/") + "/x", globs) or any(f.startswith(rel.rstrip("/") + "/") for f in folders) or (
+                    os.path.isdir(p(root, rel)) and any(matches(f, globs) for f in git(root, "ls-files", "--", rel).splitlines())):
+                hits.append(rel)
+                break
+    return sorted(set(hits))
+
+
+def in_project(root, paths, allowed=()):
+    """Paths inside the project, except the allowed globs (scratch files outside it are fine)."""
+    out = []
+    for ap in paths:
+        rel = rel_to_root(root, ap)
+        if rel is not None and not (allowed and matches(rel, allowed)):
+            out.append(rel)
+    return out
+
+
+def runs_dd(eff, *subcommand):
+    """Does the command run `dd.py <subcommand…>`, from the shell or from inline code?"""
+    for words in eff["runs"]:
+        for k, w in enumerate(words):
+            if w.replace("\\", "/").endswith(("dd.py", "scripts/dd")) and all(s in words[k + 1:] for s in subcommand):
+                return True
+    return any(SPAWN_API.search(c) and "dd.py" in c and all(s in c for s in subcommand) for c in eff["code"])
+
+
+def nested_agent(eff):
+    """Starting Claude Code or Codex from the shell or from inline code: it would run outside the role."""
+    for words in eff["runs"]:
+        name = re.sub(r"\.(exe|cmd|ps1)$", "", os.path.basename(words[0].replace("\\", "/")).lower())
+        if name in ("claude", "codex") and not any(re.match(r"^--?(version|help|V|h)$", a) for a in words[1:]):
+            return True
+        if name in ("npx", "pnpx", "bunx") and any(re.match(r"^@(openai/codex|anthropic-ai/claude-code)\b", a)
+                                                   for a in words[1:]):
+            return True
+    return any(SPAWN_API.search(c) and re.search(r"""['"`](?:\S*/)?(claude|codex)['"` ]""", c) for c in eff["code"])
+
+
+def commit_no_verify(args):
+    """`git commit --no-verify` or `-n`, also inside a cluster (-qn), but not inside a message."""
+    skip = False
+    for a in args:
+        if skip:
+            skip = False
+            continue
+        if a == "--no-verify":
+            return True
+        if a in ("-m", "-F", "-c", "-C", "-t", "--message", "--file", "--author", "--date", "--template",
+                 "--reuse-message", "--reedit-message", "--fixup", "--squash", "--trailer", "--cleanup"):
+            skip = True
+            continue
+        if a.startswith("-") and not a.startswith("--"):
+            for k, ch in enumerate(a[1:]):
+                if ch == "n":
+                    return True
+                if ch in "mFcCtS":
+                    skip = k == len(a) - 2  # -m with its value in the next word
+                    break
+    return False
+
+
+def effects_of(root, data):
+    """shell_effects of a Bash or PowerShell tool call (cached per call), or None for other tools."""
+    tool = data.get("tool_name", "")
+    if tool not in ("Bash", "PowerShell"):
+        return None
+    cmd = (data.get("tool_input") or {}).get("command") or ""
+    key = (id(data), cmd)
+    if EFFECTS_CACHE.get("key") != key:
+        EFFECTS_CACHE.update(key=key, eff=shell_effects(cmd, data.get("cwd") or root, powershell=tool == "PowerShell"))
+    return EFFECTS_CACHE["eff"]
+
+
+EFFECTS_CACHE = {}
 
 
 def gate_files(root, cfg):
@@ -1596,60 +2290,76 @@ def gate_files(root, cfg):
     return sorted(out)
 
 
-def git_target(root, cmd):
-    """The repo a git command acts on: `git -C <dir>` if given, else the project."""
-    m = re.search(r"git\s+-C\s+(\"[^\"]+\"|'[^']+'|\S+)", cmd)
-    if not m:
-        return root
-    d = os.path.expanduser(m.group(1).strip("\"'"))
-    return os.path.abspath(d if os.path.isabs(d) else os.path.join(root, d))
+def protected_hits(root, cfg, paths):
+    """Which written paths are protected: project globs, or absolute paths outside the project."""
+    rel_globs, hits = [], []
+    for pt in cfg["protected"]:
+        ap = os.path.expanduser(pt)
+        if os.path.isabs(ap) and rel_to_root(root, ap) is None:
+            ap = ap.replace("\\", "/").rstrip("/")
+            hits += [x for x in paths if x == ap or x.startswith(ap + "/") or glob_re(ap).match(x.lstrip("/"))]
+        else:
+            rel_globs.append(pt)
+    return sorted(set(hits + under(root, paths, rel_globs)))
 
 
 def hook_pre_bash(root, cfg, data):
-    cmd = (data.get("tool_input") or {}).get("command") or ""
-    if re.search(GIT_SUB.format("commit"), cmd):
-        target = git_target(root, cmd)
-        if rel_to_root(root, target) is None or find_root(target) not in (None, root):
-            return  # another repo's commit: its own config (if any) decides
-        if re.search(r"--no-verify|(?:^|\s)-n(?:\s|$)", cmd):
-            deny("Daedalus: commits must run the gates; --no-verify / -n is not allowed.")
-        problems = coverage_problems(root, cfg)
-        if problems:
-            deny("Daedalus blocked this commit: requirements in .daedalus/specs/ aren't covered or aren't valid.\n- "
-                 + "\n- ".join(problems[:15]) + "\nSend the missing tests to the test writer (it adds "
-                 "`covers: <ID>`), or mark a spec not started yet as \"state\": \"planned\".")
-        gates = select_gates(cfg, event="commit", files=changed_files(root))
-        if gates:
-            results = run_gates(root, cfg, gates, budget=HOOK_GATE_BUDGET)
-            record_requirements(root, cfg, results)
-            failed = [r for r in results if r["status"] == "fail"]
-            if failed:
-                tails = "\n\n".join(f"[{r['name']}]\n{r.get('tail', '')}" for r in failed)
-                deny("Daedalus blocked this commit: a gate failed.\n" + format_results(results) +
-                     "\n\nFix the cause (or revert the change) and commit again. Never weaken a gate to pass it.\n\n" + tails)
-        why = review_status(root, cfg)
-        if why:
-            deny(why)
-        return
-    if re.search(GIT_SUB.format("push"), cmd):
-        if cfg["push"] == "block":
-            deny("Daedalus: pushing is disabled for this project (config push=block). Ask the user to push.")
-        if cfg["push"] == "ask":
-            ask("Daedalus: pushes need the user's go-ahead.")
-        return
+    eff = effects_of(root, data) or {"writes": [], "git": []}
     if cfg["protected"]:
-        hits = writes_to(cmd, [pt.split("*")[0].rstrip("/") for pt in cfg["protected"] if pt.split("*")[0].strip("/")])
+        hits = protected_hits(root, cfg, eff["writes"])
         if hits:
-            deny(f"Daedalus: this command looks like it writes to a protected path ({', '.join(hits)}). "
+            deny(f"Daedalus: this command writes to a protected path ({', '.join(hits[:5])}). "
                  "Protected paths are the user's deliverables: never write, move or delete them.")
+    for g in eff["git"]:
+        if g["sub"] == "commit":
+            if rel_to_root(root, g["cwd"]) is None or find_root(g["cwd"]) not in (None, root):
+                continue  # another repo's commit: its own config (if any) decides
+            if commit_no_verify(g["args"]):
+                deny("Daedalus: commits must run the gates; --no-verify / -n is not allowed.")
+            commit_check(root, cfg)
+        elif g["sub"] == "push":
+            if cfg["push"] == "block":
+                deny("Daedalus: pushing is disabled for this project (config push=block). Ask the user to push.")
+            if cfg["push"] == "ask":
+                ask("Daedalus: pushes need the user's go-ahead.")
+
+
+def commit_check(root, cfg):
+    """The commit hook: coverage, gates (unless only the harness's own records change), the review,
+    then the requirement results, which describe the commit. A loosened config needs the user."""
+    problems = coverage_problems(root, cfg)
+    if problems:
+        deny("Daedalus blocked this commit: requirements in .daedalus/specs/ aren't covered or aren't valid.\n- "
+             + "\n- ".join(problems[:15]) + "\nSend the missing tests to the test writer (it adds "
+             "`covers: <ID>`), or mark a spec not started yet as \"state\": \"planned\".")
+    files = changed_files(root)
+    gates = [] if harness_only(root, cfg, files) else select_gates(cfg, event="commit", files=files)
+    results = []
+    if gates:
+        results = run_gates(root, cfg, gates, budget=HOOK_GATE_BUDGET)
+        failed = [r for r in results if r["status"] == "fail"]
+        if failed:
+            tails = "\n\n".join(f"[{r['name']}]\n{r.get('tail', '')}" for r in failed)
+            deny("Daedalus blocked this commit: a gate failed.\n" + format_results(results) +
+                 "\n\nFix the cause (or revert the change) and commit again. Never weaken a gate to pass it.\n\n" + tails)
+    why = review_status(root, cfg)
+    if why:
+        deny(why)
+    if results:
+        record_requirements(root, cfg, results)
+    loose = config_loosened(root, cfg)
+    if loose:
+        ask("Daedalus: this commit loosens the harness's checks compared with the last commit: " + "; ".join(loose)
+            + ". That needs the user's OK, whichever way the config was changed.")
 
 
 def hook_pre_edit(root, cfg, data):
     ti = data.get("tool_input") or {}
     path = ti.get("file_path") or ti.get("notebook_path") or ti.get("path") or ""
     rel = rel_to_root(root, path) if path else None
-    if rel and matches(rel, cfg["protected"]):
-        deny(f"Daedalus: {rel} is protected ({', '.join(matches(rel, cfg['protected']))}). "
+    hits = protected_hits(root, cfg, [os.path.abspath(path).replace("\\", "/")]) if path and cfg["protected"] else []
+    if hits:
+        deny(f"Daedalus: {rel or path} is protected. "
              "Protected paths are the user's deliverables: never write or edit them. Ask the user instead.")
     if rel == ".daedalus/gates/baseline.json":
         deny("Daedalus: the gate baseline changes only through `dd.py gate --accept` after a passing run.")
@@ -1789,6 +2499,7 @@ def hook_stop(root, cfg, data):
 
 
 def hook_session_start(root, cfg, data):
+    ensure_gitignore(root)
     seen = load_json(hosts_seen_path(root), {})  # for `dd.py doctor`: proof the hooks run on this host
     seen[HOST["name"]] = dt.datetime.now().isoformat(timespec="seconds")
     save_json(hosts_seen_path(root), seen)
@@ -2293,6 +3004,23 @@ def doctor(root, cfg):
     return not bad, lines
 
 
+LOCAL_STATE = ["gates/last.json", "gates/history.jsonl", "gates/passed.json", "gates/.lock", "context.json",
+               "compactions.jsonl", "hosts.json", "approvals.json", "hooks.log", "agents/", "reviews/draft.json",
+               "run.json", "typed.json"]
+
+
+def ensure_gitignore(root):
+    """.daedalus/.gitignore lists the local run state (the gate baseline and results are committed);
+    entries added by newer versions are appended, the rest is left alone."""
+    gi = p(root, ".daedalus/.gitignore")
+    text = read(gi) or "# Local run state; the gate baseline is committed.\n"
+    missing = [x for x in LOCAL_STATE if x not in text.splitlines()]
+    if missing:
+        os.makedirs(os.path.dirname(gi), exist_ok=True)
+        with open(gi, "w", encoding="utf-8") as f:
+            f.write(text.rstrip("\n") + "\n" + "\n".join(missing) + "\n")
+
+
 # --- init -----------------------------------------------------------------------------------
 
 def init(name, auto=False):
@@ -2312,10 +3040,7 @@ def init(name, auto=False):
                 text = f.read().replace("{{PROJECT}}", name or os.path.basename(root))
             with open(dst, "w", encoding="utf-8") as f:
                 f.write(text)
-    gi = os.path.join(target, ".gitignore")
-    with open(gi, "w", encoding="utf-8") as f:
-        f.write("# Local run state; the gate baseline is committed.\ngates/last.json\ngates/history.jsonl\ncontext.json\n"
-                "compactions.jsonl\nhosts.json\napprovals.json\nhooks.log\nagents/\nreviews/draft.json\nrun.json\n")
+    ensure_gitignore(root)
     if not auto:
         print(f"Created {target}. Next: fill config.json (gates, protected) and plan.md.")
         return
@@ -2347,6 +3072,7 @@ def main():
     g.add_argument("names", nargs="*")
     g.add_argument("--all", action="store_true", help="include manual-only gates")
     g.add_argument("--accept", action="store_true", help="store passing metrics as the new baseline")
+    g.add_argument("--fresh", action="store_true", help="run every gate even if it passed on exactly these files")
     s = sub.add_parser("snapshot")
     s.add_argument("--reason", default="manual")
     sub.add_parser("review-record", help="the reviewer agent: validate and stamp .daedalus/reviews/draft.json")
@@ -2408,9 +3134,14 @@ def main():
         gates = select_gates(cfg, names=a.names or None, include_manual=a.all)
         if not gates:
             sys.exit("No gates selected. Configure them in .daedalus/config.json → gates.")
-        results = run_gates(root, cfg, gates, accept=a.accept)
-        record_requirements(root, cfg, results)
+        results = run_gates(root, cfg, gates, accept=a.accept, reuse=not a.fresh)
         print(format_results(results))
+        pending = work_changes(root, cfg)
+        if pending:
+            print(f"\nRequirement results not updated: {len(pending)} uncommitted file(s). They describe committed "
+                  "code, so the commit hook records them (or a gate run on a clean tree).")
+        else:
+            record_requirements(root, cfg, results)
         for r in results:
             if r.get("tail"):
                 print(f"\n[{r['name']}] last lines:\n{r['tail']}")

@@ -561,10 +561,11 @@ class ReviewGate(unittest.TestCase):
 
     def test_compound_commands_checked_per_segment(self):
         # Seen live: `sed -i` on the plan + `git add` of the verdict + commit was refused as a review write.
-        self.assertEqual(dd.writes_to("sed -i 's/x/y/' .daedalus/plan.md && git add -A .daedalus/reviews/a.json && "
-                                      "git commit -m x", [".daedalus/reviews"]), [])
-        self.assertEqual(dd.writes_to("git status && cp a.json .daedalus/reviews/b.json", [".daedalus/reviews"]),
-                         [".daedalus/reviews"])
+        def reviews(cmd):
+            return dd.under(self.p.root, dd.shell_effects(cmd, self.p.root)["writes"], [".daedalus/reviews/**"])
+        self.assertEqual(reviews("sed -i 's/x/y/' .daedalus/plan.md && git add -A .daedalus/reviews/a.json && "
+                                 "git commit -m x"), [])
+        self.assertEqual(reviews("git status && cp a.json .daedalus/reviews/b.json"), [".daedalus/reviews/b.json"])
         self.assertIsNone(self.p.hook("pre-tool", as_agent(None, "Bash", command=(
             "sed -i 's/x/y/' .daedalus/plan.md && git add -A .daedalus/reviews/a.json && git commit -m x"))))
 
@@ -653,6 +654,204 @@ class TestIntegrity(unittest.TestCase):
         self.assertIsNone(self.check(None, "Bash", command=f'python "{DD}" gate'))
 
 
+class ShellReading(unittest.TestCase):
+    """The guards judge what a command writes and reads, not the words in it. The allowed cases are
+    refusals the FPL build actually hit (25-26 October 2026); the denied ones are the routes that
+    must stay closed."""
+
+    def setUp(self):
+        self.p = Project(protected=[".env", ".env.*.local", "*.pem"])
+        self.tmp = tempfile.mkdtemp(prefix="dd-scratch-")
+
+    def tearDown(self):
+        self.p.cleanup()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def check(self, role, cmd, **extra):
+        return decision(self.p.hook("pre-tool", {**as_agent(role, "Bash", command=cmd), **extra}))
+
+    def test_fpl_false_alarms_are_allowed(self):
+        t = self.tmp
+        allowed = [
+            ("researcher", 'node -e "console.log([1].map(x => x+1))"'),
+            ("researcher", f"cd {t} && python3 -I -c \"\nimport json\nif len([1])>1: print('x')\n\""),
+            ("researcher", "cat > .daedalus/research/prices.md <<'EOF'\n# Notes\nprices > 0 and rm -rf x\nEOF"),
+            ("reviewer", f"S={t}; mkdir -p $S/shot && cat > $S/mk.mjs <<'EOF'\n"
+                         f"import {{ writeFileSync }} from 'node:fs';\nimport {{ f }} from '{self.p.root}/src/a.js';\n"
+                         "writeFileSync(process.argv[2], JSON.stringify(f()));\nEOF\nnode $S/mk.mjs $S/out.json"),
+            ("reviewer", f"cd {t} && node --input-type=module -e 'const a = [1]; console.log(a.length > 0)'"),
+            ("reviewer", f'D=$(mktemp -d) && echo hi > "$D/probe.txt"'),
+            ("builder", "python3 - <<'EOF'\np='src/poll.js'\ns=open(p).read()\n"
+                        "s=s.replace('a','buildMonthSnapshots(db.snapshot)')\nopen(p,'w').write(s)\nEOF"),
+            ("builder", "grep -n 'assert' tests/test_a.py; sed -n 1,20p tests/test_a.py"),
+            ("builder", f"node --test tests/e2e/fonts.test.js > {t}/out.txt 2>&1; tail -5 {t}/out.txt"),
+            ("test-writer", "node --test tests/unit/a.test.js 2>&1 | head; ls src/core"),
+            ("test-writer", 'pgrep -af "src/api/main.js" | head'),
+            ("test-writer", "python3 - <<'EOF'\np='tests/unit/w.test.js'\ns=open(p).read()\n"
+                            "s=s.replace(\"from '../../src/core/whatif.js'\", \"from '../../src/core/w2.js'\")\n"
+                            "open(p,'w').write(s)\nEOF"),
+            ("test-writer", f"M={t}/mirror; mkdir -p $M/src && cp -r tests $M/ && cat > $M/src/ref.js <<'EOF'\n"
+                            "export const f = () => 1;\nEOF"),
+            (None, "cat > deploy/systemd/fpl.service <<'EOF'\nEnvironmentFile=/etc/fpl/fpl.env\nEOF\n"
+                   "cat > deploy/fpl.env.example <<'EOF'\nDATABASE_URL=x\nEOF"),
+            (None, f"cat > {t}/list.py <<'EOF'\ncp = env_file('/x/.env')\nprint(cp)\nEOF\npython3 -I {t}/list.py"),
+            (None, "grep -n 'ownership' docs/spec.md | head -3 && git add -A && git commit -qm 'docs: spec -n'"),
+            (None, "python3 - <<'EOF'\np='.daedalus/status.md'; t=open(p).read()\n"
+                   "t+='record it with verify-manual'\nopen(p,'w').write(t)\nEOF"),
+        ]
+        for role, cmd in allowed:
+            self.assertNotEqual(self.check(role, cmd), "deny", f"{role}: {cmd}")
+        self.assertIsNone(decision(self.p.hook("pre-tool", as_agent("reviewer", "Write", file_path=f"{t}/probe.mjs"))))
+        self.assertIsNone(decision(self.p.hook("pre-tool", as_agent("researcher", "Write", file_path=f"{t}/b.py"))))
+
+    def test_writes_by_any_route_are_still_caught(self):
+        t = self.tmp
+        denied = [
+            ("builder", "python3 - <<'EOF'\nopen('tests/test_a.py', 'w').write('')\nEOF"),
+            ("builder", "node -e \"require('fs').writeFileSync('tests/a.test.js', '')\""),
+            ("builder", f"cat > {t}/x.py <<'EOF'\nopen('tests/test_a.py', 'w')\nEOF\npython3 {t}/x.py"),
+            ("builder", "S=tests; echo x > $S/test_a.py"),
+            ("builder", "cd tests && echo x > test_a.py"),
+            ("builder", 'bash -c "rm tests/test_a.py"'),
+            ("builder", "git checkout -- tests/test_a.py"),
+            ("builder", "find tests -name '*.py' -delete"),
+            ("builder", "perl -pi -e 's/a/b/' tests/test_a.py"),
+            ("builder", "tee -a tests/test_a.py < /dev/null"),
+            ("builder", "echo x | sudo tee tests/test_a.py"),
+            ("builder", "cp {}/x.py tests/".format(t)),
+            ("builder", "echo '[pytest]' >| pytest.ini"),
+            ("reviewer", "node -e \"require('fs').writeFileSync('src/a.py', 'x')\""),
+            ("reviewer", "sed -i 's/a/b/' src/a.py"),
+            ("researcher", "echo x > notes.md"),
+            ("test-writer", "cat src/a.py"),
+            ("test-writer", "grep -rn 'def ' ."),
+            ("test-writer", "python3 -c \"print(open('src/a.py').read())\""),
+            ("test-writer", "cp src/a.py /tmp/a.py"),
+            (None, "echo SECRET=1 >> .env"),
+            (None, "rm -f certs/server.pem"),
+            (None, "git commit -qn -m x"),
+            (None, "git commit --no-verify -m x"),
+        ]
+        os.makedirs(os.path.join(self.p.root, "tests"), exist_ok=True)
+        for role, cmd in denied:
+            self.assertEqual(self.check(role, cmd), "deny", f"{role}: {cmd}")
+        self.assertEqual(self.check(None, "python3 - <<'EOF'\nimport json\np='.daedalus/config.json'\n"
+                                          "c=json.load(open(p)); c['gates']=[]\njson.dump(c, open(p, 'w'))\nEOF"), "ask")
+
+    def test_protected_paths_outside_the_project(self):
+        outside = os.path.join(self.tmp, "klotho")
+        self.p = Project(protected=[outside])
+        self.assertEqual(self.check(None, f"rm -rf {outside}/data"), "deny")
+        self.assertEqual(decision(self.p.hook("pre-tool", as_agent(None, "Write", file_path=f"{outside}/a.txt"))), "deny")
+        self.assertIsNone(self.check(None, f"cat {outside}/a.txt"))
+
+    def test_nobody_writes_the_transcripts(self):
+        tdir = os.path.join(self.tmp, "projects", "-demo")
+        os.makedirs(tdir)
+        extra = {"transcript_path": os.path.join(tdir, "s1.jsonl")}
+        self.assertEqual(self.check(None, f"echo '{{}}' >> {tdir}/s1.jsonl", **extra), "deny")
+        self.assertEqual(decision(self.p.hook("pre-tool", {**as_agent(None, "Write", file_path=f"{tdir}/s1.jsonl"),
+                                                             **extra})), "deny")
+        self.assertIsNone(self.check(None, f"echo hi > {self.tmp}/note.txt", **extra))
+
+
+class GateRuns(unittest.TestCase):
+    """Gates run once per state of the files, one run at a time, and the setup commit needs none."""
+
+    def setUp(self):
+        self.count = tempfile.mktemp(prefix="dd-count-")
+        self.p = Project(gates=[{"name": "tests", "run": f"echo run >> {self.count}"}])
+
+    def tearDown(self):
+        self.p.cleanup()
+        if os.path.exists(self.count):
+            os.remove(self.count)
+
+    def runs(self):
+        return len(dd.read(self.count).splitlines())
+
+    def commit(self):
+        return self.p.hook("pre-tool", as_agent(None, "Bash", command="git add -A && git commit -m x"))
+
+    def test_a_passing_run_is_reused_for_the_same_files(self):
+        self.p.write("src/a.py", "x = 1\n")
+        self.assertEqual(self.p.cli("gate").returncode, 0)
+        self.assertIn("reused", self.p.cli("gate").stdout)
+        self.p.write(".daedalus/status.md", "notes\n")  # the harness's own records don't void it
+        self.assertIsNone(decision(self.commit()))
+        self.assertEqual(self.runs(), 1)
+        self.p.cli("gate", "--fresh")
+        self.assertEqual(self.runs(), 2)
+        self.p.write("src/a.py", "x = 2\n")
+        self.assertIsNone(decision(self.commit()))
+        self.assertEqual(self.runs(), 3)
+
+    def test_one_gate_run_at_a_time(self):
+        held = dd.gate_lock(self.p.root, 1)
+        self.assertIsNotNone(held)
+        self.assertIsNone(dd.gate_lock(self.p.root, 1))
+        held.close()
+        again = dd.gate_lock(self.p.root, 1)
+        self.assertIsNotNone(again)
+        again.close()
+
+    def test_setup_and_record_commits_skip_the_gates(self):
+        fresh = tempfile.mkdtemp(prefix="dd-fresh-")
+        try:
+            sh(fresh, "git", "init", "-q", "-b", "main")
+            subprocess.run([PY, DD, "init", "--name", "New"], cwd=fresh, check=True, capture_output=True,
+                           env={**os.environ, "CLAUDE_PROJECT_DIR": fresh})
+            cfgfile = os.path.join(fresh, ".daedalus", "config.json")
+            c = dd.load_json(cfgfile, {})
+            c["gates"] = [{"name": "tests", "run": "npm test"}]  # no package.json yet: it can't pass
+            dd.save_json(cfgfile, c)
+            r = subprocess.run([PY, DD, "hook", "pre-tool"], capture_output=True, text=True, input=json.dumps(
+                {"cwd": fresh, **bash("git add -A && git commit -m 'chore: set up Daedalus'")}))
+            self.assertEqual(r.stdout.strip(), "", r.stdout)
+        finally:
+            shutil.rmtree(fresh, ignore_errors=True)
+        self.p = Project(gates=[{"name": "tests", "run": "exit 1"}], no_gates_for=["docs/**"])
+        self.p.write(".daedalus/status.md", "done\n")
+        self.p.write("docs/spec.md", "spec\n")
+        self.assertIsNone(decision(self.commit()))
+        self.p.write("src/a.py", "x = 1\n")
+        self.assertEqual(decision(self.commit()), "deny")
+
+    def test_loosening_the_config_needs_the_user(self):
+        cfgfile = os.path.join(self.p.root, ".daedalus", "config.json")
+        c = dd.load_json(cfgfile, {})
+        c["gates"].append({"name": "lint", "run": "echo lint"})
+        c["protected"] = ["data/**"]
+        dd.save_json(cfgfile, c)
+        self.assertIsNone(decision(self.commit()))  # adding checks is fine
+        sh(self.p.root, "git", "add", "-A")
+        sh(self.p.root, "git", "commit", "-q", "-m", "more checks")
+        c["gates"] = c["gates"][:1]
+        c["protected"] = []
+        dd.save_json(cfgfile, c)
+        out = self.commit()
+        self.assertEqual(decision(out), "ask")
+        reason = out["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertIn("'lint' was removed", reason)
+        self.assertIn("data/**", reason)
+
+    def test_requirement_results_describe_commits_and_dont_churn(self):
+        self.p.write(".daedalus/specs/stats.json", json.dumps({**SPEC, "requirements": [SPEC["requirements"][0]]}))
+        self.p.write("tests/test_stats.py", "# covers: STATS-1\n")
+        self.assertIsNone(decision(self.commit()))
+        state = dd.load_json(dd.requirements_path(self.p.root), {})
+        self.assertTrue(state["STATS-1"]["passes"])
+        sh(self.p.root, "git", "add", "-A")
+        sh(self.p.root, "git", "commit", "-q", "-m", "stats")
+        before = dd.read(dd.requirements_path(self.p.root))
+        self.p.write("src/a.py", "half finished\n")
+        out = self.p.cli("gate")
+        self.assertIn("not updated", out.stdout)
+        self.p.write("src/a.py", "x = 1\n")
+        self.assertIsNone(decision(self.commit()))
+        self.assertEqual(dd.read(dd.requirements_path(self.p.root)), before)  # same result: no rewrite
+
+
 class FailClosed(unittest.TestCase):
     """Improvement 2: a broken guard blocks; it never waves the action through."""
 
@@ -732,6 +931,10 @@ class Requirements(unittest.TestCase):
         self.p.write("tests/test_stats.py", "# covers: STATS-1\n")
         self.p.write("e2e/cli_test.sh", "# covers: STATS-2\n")
         self.assertEqual(decision(self.commit()), "deny")
+        self.assertNotIn("STATS-1", self.state())  # a refused commit records nothing: results describe commits
+        sh(self.p.root, "git", "add", "-A")
+        sh(self.p.root, "git", "commit", "-q", "-m", "tests")
+        self.assertNotEqual(self.p.cli("gate").returncode, 0)  # a run on a clean tree describes the commit
         self.assertFalse(self.state()["STATS-1"]["passes"])
         self.assertNotEqual(self.p.cli("milestone", "M1").returncode, 0)
 
