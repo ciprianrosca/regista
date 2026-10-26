@@ -12,6 +12,7 @@ projects. The rules that matter are **enforced by hooks**, not left to the model
 | No push without the user's OK | `PreToolUse` hook asks for permission on `git push` |
 | No turn ends with commits that no handoff covers | `Stop` hook sends Claude back to save |
 | **Build everything**: `build all` goes through every milestone without stopping in between, and stops only for what needs you | `Stop` hook sends the session back to work while the run is active and keeps committing; a run that stalls ends itself |
+| **An overseer and parallel workers**: you talk to one session; it starts a worker session per milestone that can be built alongside the others, each in its own git worktree, and merges their work behind the gates. You can also open any worker directly, and the overseer still hears about it | `dd.py fleet`; the workers' `UserPromptSubmit` and `Stop` hooks record what you tell them and what they did for the overseer, whose hooks show it; workers can't push, deploy, merge or start workers |
 | Nothing is lost when a session dies or compacts without a save | `PreCompact` and `SessionEnd` hooks write a mechanical snapshot |
 | **A context window compacts itself at 65%**: at 55% the agent is told to finish the step and checkpoint; at 65% the host compacts the conversation and the work carries on from the saved state, with nothing for you to clear or restart. If compaction doesn't happen, a hard pause at 75% saves the work instead | the hosts' own compaction, set by `dd.py setup`; `PreToolUse`, `PreCompact` and `SessionStart` hooks, measuring the session's real token use from its transcript |
 | **Try it yourself**: what only a person can judge gets click-by-click steps, and only you can record the result, even from your phone while the session is busy | `UserPromptExpansion` (Claude Code) or `UserPromptSubmit` (Codex) records `verify` commands you type; messages queued while the session works are read from the transcript; agents are refused |
@@ -72,6 +73,7 @@ In a project's repo root (in Codex, `$daedalus:<name>` instead of `/daedalus:<na
 /daedalus:build next    next step: brief → test writer → builder → reviewer → gates → commit
 /daedalus:build M2      keep going until milestone 2's gate passes or a step is blocked
 /daedalus:build all     build every milestone in the plan, one after another; stop only for what needs you
+/daedalus:oversee       the same with parallel workers: this session oversees, workers build side by side
 /daedalus:try           what to try yourself, step by step (you record it with /daedalus:verify)
 /daedalus:verify UI-3 ok    record a check only you can make (or: fail <what happened>; all ok; M3 ok)
 /daedalus:change <what you want>   change what gets built, at any time, also during a run
@@ -190,6 +192,51 @@ again. It ends with `dd.py run end --reason "…"` once every milestone is done 
 on you (the run then ends "waiting on you", not "stopped"), and the final report lists what you need
 to do: decisions, checks to try, blocked steps.
 Nothing is pushed. `dd.py run` shows where it stands.
+
+### The overseer and its workers
+
+`/daedalus:build all` builds in one session, one milestone after another, and that session is busy for
+hours: a message you send waits until it finishes its step. `/daedalus:oversee` splits the job. The
+session you talk to becomes the overseer: it doesn't build, so it always has time for you. It starts a
+worker for each milestone that can be built alongside the others, and keeps the plan, the board and the
+status itself.
+
+- **A worker** is a whole Claude Code session running the build loop with its own agents, in its own git
+  worktree (`.daedalus/worktrees/<name>`, branch `daedalus/<name>`). It starts in tmux with Remote
+  Control on, so you can open it from the Claude app as well (without tmux it runs as a background
+  session, which you open with `claude attach`). Up to three run at once (`fleet.max_workers`).
+- **What runs side by side**: milestones that no `After:` line holds back, which the overseer narrows to
+  the ones that don't need each other's code or touch the same files. Fonts, navigation or anything else
+  that touches every page runs alone, after the rest.
+- **Staying in step**: the sessions message each other through Claude Code's own messages between
+  sessions. The overseer hears when a worker pauses, and a worker tells the overseer when it finishes,
+  gets blocked or needs an answer (its `Stop` hook reminds it). On top of that, the hooks record what
+  happens in each worker for the overseer, whatever the models say: what you told it directly, its
+  commits, its last words each turn. `/daedalus:verify` and `/daedalus:change` typed in a worker are
+  recorded in the overseer's project.
+- **Merging**: `dd.py fleet merge <name>` merges a worker's branch in one merge commit, made only when
+  the commit gates pass on the merged code. The overseer keeps its own board and status (the merge lists
+  what the worker wrote on its copy), and the harness's JSON records merge by content. A code conflict or
+  a failing gate leaves the project untouched and says what to ask the worker.
+- **Limits**: only the overseer starts, merges, stops and removes workers, deploys, and (with your OK)
+  pushes. A worker writes only in its own worktree, and the overseer doesn't edit a worker's files.
+  Workers run in the overseer's permission mode, because Claude Code holds messages from a session in a
+  different mode for your approval.
+- **Tests that share a database**: gate runs of all worktrees take turns by default. If your tests
+  choose their database or port from `DAEDALUS_SLOT` (0 in the project folder, 1, 2, … in the
+  workers), set `fleet.isolated_gates` to true and they run side by side.
+
+```json
+"fleet": {"max_workers": 3, "setup": "npm ci --silent", "copy": [".env"], "isolated_gates": false,
+          "claude_args": ["--model", "sonnet"]}
+```
+
+`setup` runs in each new worktree (installing dependencies), `copy` brings over local files the tests
+need, and `claude_args` are extra options for the workers' `claude` command. `dd.py fleet` shows the
+workers; `fleet show <name>` prints a worker's screen; `fleet stop`, `fleet resume` and `fleet remove`
+do what they say. In a project Claude Code hasn't opened before, the first worker stops at Claude
+Code's "do you trust this folder" question; `dd.py fleet spawn` says so, and you answer it once with
+`tmux attach -t <session>`.
 
 ### Context budget
 

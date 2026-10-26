@@ -1307,6 +1307,353 @@ class Deploy(unittest.TestCase):
 LAUNCHER = os.path.join(os.path.dirname(DD), "dd")
 
 
+FAKE = r'''#!PYTHON
+"""Stand-in for `claude` and `tmux` in the fleet tests: records each call and keeps a session list."""
+import json, os, sys, uuid
+d = os.environ["FAKE_DIR"]
+tool = os.path.basename(sys.argv[0])
+args = sys.argv[1:]
+with open(os.path.join(d, "calls.jsonl"), "a") as f:
+    f.write(json.dumps({"tool": tool, "args": args, "cwd": os.getcwd()}) + "\n")
+sp = os.path.join(d, "sessions.json")
+sessions = json.load(open(sp)) if os.path.exists(sp) else []
+def save():
+    json.dump(sessions, open(sp, "w"))
+if tool == "claude":
+    if args[:2] == ["agents", "--json"]:
+        print(json.dumps(sessions))
+    elif "--bg" in args:
+        name = args[args.index("-n") + 1]
+        sessions.append({"name": name, "sessionId": str(uuid.uuid4()), "status": "idle", "id": "bg1234"})
+        save()
+        print("backgrounded · bg1234 · " + name)
+    elif args[:1] == ["stop"]:
+        sessions[:] = [s for s in sessions if s.get("id") != args[1]]
+        save()
+elif tool == "tmux":
+    if args[0] == "new-session":
+        name = args[args.index("-s") + 1]
+        sessions.append({"name": name, "sessionId": str(uuid.uuid4()), "status": "idle"})
+        save()
+    elif args[0] == "capture-pane":
+        print("/remote-control is active · Continue here, on your phone, or at https://claude.ai/code/session_TEST123")
+    elif args[0] == "kill-session":
+        name = args[args.index("-t") + 1]
+        sessions[:] = [s for s in sessions if s.get("name") != name]
+        save()
+'''
+
+FLEET_PLAN = """# Plan
+
+## M1 — Base
+- [x] base step
+
+## M2 — Pages
+- [ ] the pages
+
+## M3 — Charts
+- [ ] the charts
+
+## M4 — Polish
+After: M2
+- [ ] polish
+"""
+
+
+def jload(path):
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def jsave(path, data):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+
+
+class Fleet(unittest.TestCase):
+    def setUp(self):
+        self.p = Project(gates=[{"name": "tests", "run": "test ! -f broken.txt", "when": ["commit"]}],
+                         review={"required_for": []}, requirements={"enforce_coverage": False,
+                                                                     "milestone_needs_e2e": False})
+        self.p.commit(".daedalus/plan.md", FLEET_PLAN, "plan")
+        self.fake = tempfile.mkdtemp(prefix="dd-fake-")
+        for tool in ("claude", "tmux"):
+            path = os.path.join(self.fake, tool)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(FAKE.replace("PYTHON", sys.executable))
+            os.chmod(path, 0o755)
+        self.env = {"DAEDALUS_CLAUDE": os.path.join(self.fake, "claude"), "DAEDALUS_TMUX": os.path.join(self.fake, "tmux"),
+                    "FAKE_DIR": self.fake, "DAEDALUS_LAUNCH_WAIT": "3", "CLAUDE_CODE_SESSION_ID": "overseer-1"}
+
+    def tearDown(self):
+        sh(self.p.root, "git", "worktree", "prune")
+        self.p.cleanup()
+        shutil.rmtree(self.fake, ignore_errors=True)
+
+    def fleet(self, *args, cwd=None):
+        env = {k: v for k, v in os.environ.items() if k != "CLAUDE_PROJECT_DIR"}
+        env.update(self.env)
+        return subprocess.run([PY, DD, "fleet", *args], cwd=cwd or self.p.root, capture_output=True, text=True,
+                              encoding="utf-8", env=env)
+
+    def hook(self, event, payload, cwd=None):
+        return self.p.hook(event, {"cwd": cwd or self.p.root, **payload}, extra_env=self.env)
+
+    def calls(self, tool):
+        with open(os.path.join(self.fake, "calls.jsonl"), encoding="utf-8") as f:
+            return [c for c in map(json.loads, f) if c["tool"] == tool]
+
+    def wt(self, name="m2"):
+        return os.path.join(self.p.root, ".daedalus", "worktrees", name)
+
+    def spawn(self, target="M2", *extra):
+        # the overseer's hook sees it run `dd.py fleet` and notes its session and permission mode
+        self.hook("pre-tool", {**bash(f'python3 "{DD}" fleet spawn {target}'), "session_id": "overseer-1",
+                               "permission_mode": "acceptEdits"})
+        return self.fleet("spawn", target, *extra)
+
+    def test_spawn_starts_a_worker_in_its_own_worktree(self):
+        r = self.spawn()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("https://claude.ai/code/session_TEST123", r.stdout)
+        self.assertTrue(os.path.isfile(os.path.join(self.wt(), "README.md")))
+        self.assertEqual(sh(self.wt(), "git", "rev-parse", "--abbrev-ref", "HEAD").strip(), "daedalus/m2")
+        info = jload(os.path.join(self.wt(), ".daedalus", "worker.json"))
+        self.assertEqual((info["milestone"], info["slot"], info["overseer_root"]), ("M2", 1, self.p.root))
+        self.assertTrue(jload(os.path.join(self.wt(), ".daedalus", "run.json"))["active"])
+        new = self.calls("tmux")[0]["args"]
+        self.assertEqual(new[:2], ["new-session", "-d"])
+        self.assertIn("--remote-control", new[-1])
+        self.assertIn("--permission-mode acceptEdits", new[-1])  # the overseer's mode, so messages flow
+        self.assertIn("/daedalus:build M2", new[-1])
+        self.assertEqual(sh(self.p.root, "git", "status", "--porcelain").strip(), "")  # the overseer's tree stays clean
+        w = jload(os.path.join(self.p.root, ".daedalus", "fleet", "workers.json"))["m2"]
+        self.assertEqual((w["state"], w["session_name"]), ("running", "demo-m2"))
+        self.assertTrue(w["session_id"])
+        status = self.fleet().stdout
+        self.assertIn("m2: M2 — Pages", status)
+        self.assertIn("M3 (Charts)", status)  # ready: nothing holds it back
+        self.assertNotIn("M4 (", status)  # After: M2, which isn't merged yet
+
+    def test_spawn_refusals(self):
+        self.assertIn("isn't ready", self.spawn("M4").stdout)
+        self.assertIn("all its steps are ticked", self.spawn("M1").stdout)
+        self.assertEqual(self.spawn("M2").returncode, 0)
+        self.assertIn("already has a worker", self.spawn("M2", "--name", "again").stdout)
+        self.p.write("src/a.py", "x = 1\n")
+        sh(self.p.root, "git", "add", "-A")
+        self.assertIn("uncommitted changes", self.spawn("M3").stdout)
+        sh(self.p.root, "git", "commit", "-q", "-m", "a")
+        cfg_path = os.path.join(self.p.root, ".daedalus", "config.json")
+        c = jload(cfg_path)
+        c["fleet"] = {"max_workers": 1}
+        jsave(cfg_path, c)
+        sh(self.p.root, "git", "commit", "-qam", "one worker")
+        self.assertIn("the most fleet.max_workers allows", self.spawn("M3").stdout)
+
+    def test_background_launch_without_tmux(self):
+        cfg_path = os.path.join(self.p.root, ".daedalus", "config.json")
+        c = jload(cfg_path)
+        c["fleet"] = {"launch": "bg"}
+        jsave(cfg_path, c)
+        sh(self.p.root, "git", "commit", "-qam", "bg")
+        r = self.spawn()
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn("claude attach bg1234", r.stdout)
+        bg = [c for c in self.calls("claude") if "--bg" in c["args"]][0]
+        self.assertEqual(os.path.realpath(bg["cwd"]), os.path.realpath(self.wt()))
+
+    def test_worker_hooks_keep_the_overseer_in_step(self):
+        self.spawn()
+        start = self.hook("session-start", {}, cwd=self.wt())["hookSpecificOutput"]["additionalContext"]
+        self.assertIn('you are the worker "m2"', start)
+        self.assertIn("SendMessage", start)
+        # the overseer's opening command and a message from another session aren't the user
+        self.hook("user-prompt", {"prompt": "/daedalus:build M2"}, cwd=self.wt())
+        self.hook("user-prompt", {"prompt": '<cross-session-message from="x">do it</cross-session-message>'}, cwd=self.wt())
+        self.hook("user-prompt", {"prompt": "Make the header blue please"}, cwd=self.wt())
+        out = self.hook("user-prompt", {"prompt": "how is it going?"})
+        news = out["hookSpecificOutput"]["additionalContext"]
+        self.assertIn('the user wrote to it directly: "Make the header blue please"', news)
+        self.assertNotIn("do it", news)
+        self.assertNotIn("/daedalus:build", news)
+        self.assertIsNone(self.hook("user-prompt", {"prompt": "and now?"}))  # each piece of news once
+        # the worker commits and pauses: the record goes to the overseer, and the worker is sent to tell it
+        os.makedirs(os.path.join(self.wt(), "src"), exist_ok=True)
+        with open(os.path.join(self.wt(), "src", "pages.py"), "w") as f:
+            f.write("pages = 1\n")
+        sh(self.wt(), "git", "add", "src/pages.py")
+        sh(self.wt(), "git", "commit", "-q", "-m", "feat: the pages")
+        out = self.hook("stop", {"last_assistant_message": "The pages are built."}, cwd=self.wt())
+        self.assertEqual(out["decision"], "block")
+        self.assertIn('SendMessage to "', out["reason"])
+        self.assertIn("what the user asked you", out["reason"])
+        self.assertIn("Then carry on", out["reason"])  # its run is still active
+        out = self.hook("stop", {"last_assistant_message": "Told the overseer."}, cwd=self.wt())
+        self.assertNotIn("SendMessage", (out or {}).get("reason", ""))  # asked once; the run carries on
+        stop = self.hook("stop", {})
+        self.assertEqual(stop["decision"], "block")
+        self.assertIn("committed 1 (feat: the pages)", stop["reason"])
+        self.assertIn("The pages are built.", stop["reason"])
+
+    def test_checks_and_changes_typed_in_a_worker_reach_the_overseer(self):
+        self.p.commit(".daedalus/specs/m2.json", json.dumps({"milestone": "M2", "requirements": [
+            {"id": "UI-1", "text": "looks right", "verify": "manual"}]}), "spec")
+        self.spawn()
+        self.hook("user-prompt-expansion", {"command_name": "daedalus:verify", "prompt": "/daedalus:verify UI-1 ok"},
+                  cwd=self.wt())
+        for root in (self.p.root, self.wt()):
+            state = jload(os.path.join(root, ".daedalus", "gates", "requirements.json"))
+            self.assertTrue(state["UI-1"]["passes"], root)
+        out = self.hook("user-prompt-expansion", {"command_name": "daedalus:change",
+                                                  "prompt": "/daedalus:change add a dark mode"}, cwd=self.wt())
+        self.assertIn("for the overseer", out["hookSpecificOutput"]["additionalContext"])
+        changes = jload(os.path.join(self.p.root, ".daedalus", "changes.json"))
+        self.assertEqual(changes[0]["text"], "add a dark mode")
+        self.assertFalse(os.path.exists(os.path.join(self.wt(), ".daedalus", "changes.json")))
+
+    def test_who_may_do_what(self):
+        self.spawn()
+        w = self.wt()
+        for cmd in (f'python3 "{DD}" fleet spawn M3', "git push origin daedalus/m2", f'python3 "{DD}" deploy'):
+            self.assertEqual(decision(self.hook("pre-tool", bash(cmd), cwd=w)), "deny", cmd)
+        self.assertIsNone(decision(self.hook("pre-tool", bash(f'python3 "{DD}" fleet'), cwd=w)))  # looking is fine
+        out = self.hook("pre-tool", {"tool_name": "Write", "tool_input": {
+            "file_path": os.path.join(self.p.root, "src", "x.py"), "content": ""}}, cwd=w)
+        self.assertEqual(decision(out), "deny")
+        self.assertIn("overseer's project folder", out["hookSpecificOutput"]["permissionDecisionReason"])
+        out = self.hook("pre-tool", {"tool_name": "Edit", "tool_input": {
+            "file_path": os.path.join(w, "src", "x.py")}})
+        self.assertEqual(decision(out), "deny")  # the overseer doesn't edit a worker's files
+        out = self.hook("pre-tool", {**bash(f"echo x > {self.p.root}/.daedalus/fleet/events.jsonl")})
+        self.assertEqual(decision(out), "deny")
+        out = self.hook("pre-tool", {**bash(f'python3 "{DD}" fleet merge m2'), "agent_id": "a1",
+                                     "agent_type": "daedalus:builder"})
+        self.assertEqual(decision(out), "deny")
+
+    def worker_commit(self, rel, text, msg="feat: work"):
+        fp = os.path.join(self.wt(), *rel.split("/"))
+        os.makedirs(os.path.dirname(fp), exist_ok=True)
+        with open(fp, "w", encoding="utf-8") as f:
+            f.write(text)
+        sh(self.wt(), "git", "add", "-A")
+        sh(self.wt(), "git", "commit", "-q", "-m", msg)
+
+    def test_merge_behind_the_gates(self):
+        self.p.commit(".daedalus/TODO.md", "# Board\n- [ ] decide the colours\n", "board")
+        self.spawn()
+        self.worker_commit("src/pages.py", "pages = 1\n")
+        self.worker_commit(".daedalus/TODO.md", "# Board\n- [ ] decide the colours\n- [ ] ask about fonts\n", "board")
+        self.p.commit("other.txt", "overseer's own commit\n", "other")
+        r = self.fleet("merge", "m2")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("Merged m2", r.stdout)
+        self.assertIn("ask about fonts", r.stdout)  # its board lines are handed to the overseer
+        self.assertIn("tests: PASS", r.stdout)
+        self.assertEqual(sh(self.p.root, "git", "show", "HEAD:src/pages.py"), "pages = 1\n")
+        self.assertNotIn("fonts", sh(self.p.root, "git", "show", "HEAD:.daedalus/TODO.md"))
+        self.assertEqual(len(sh(self.p.root, "git", "show", "-s", "--format=%P", "HEAD").split()), 2)
+        self.assertEqual(sh(self.p.root, "git", "status", "--porcelain", "--untracked-files=no").strip(), "")
+        self.assertIn("Nothing to merge", self.fleet("merge", "m2").stdout)
+
+    def test_merge_refuses_a_failing_gate_and_a_code_conflict(self):
+        self.spawn()
+        sessions = jload(os.path.join(self.fake, "sessions.json"))
+        sessions[0]["status"] = "busy"
+        jsave(os.path.join(self.fake, "sessions.json"), sessions)
+        self.worker_commit("src/pages.py", "pages = 1\n")
+        self.assertIn("m2 is busy", self.fleet("merge", "m2").stdout)
+        sessions[0]["status"] = "idle"
+        jsave(os.path.join(self.fake, "sessions.json"), sessions)
+        self.worker_commit("broken.txt", "")
+        r = self.fleet("merge", "m2")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("fails a gate", r.stdout)
+        self.assertFalse(os.path.exists(os.path.join(self.p.root, "broken.txt")))
+        self.assertEqual(sh(self.p.root, "git", "status", "--porcelain", "--untracked-files=no").strip(), "")
+        sh(self.wt(), "git", "rm", "-q", "broken.txt")
+        sh(self.wt(), "git", "commit", "-q", "-m", "fix")
+        self.worker_commit("README.md", "worker's readme\n")
+        self.p.commit("README.md", "overseer's readme\n", "readme")
+        r = self.fleet("merge", "m2")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("README.md", r.stdout)
+        self.assertIn("git merge main", r.stdout)
+        self.assertEqual(sh(self.p.root, "git", "status", "--porcelain", "--untracked-files=no").strip(), "")
+
+    def test_harness_records_merge_by_content(self):
+        self.assertEqual(dd.merge_json({"a": {"at": "1"}}, {"a": {"at": "2", "passes": False}, "b": 1},
+                                       {"a": {"at": "3", "passes": True}, "c": 2}),
+                         {"a": {"at": "3", "passes": True}, "b": 1, "c": 2})
+        self.assertEqual(dd.merge_json(["x"], ["x", "y"], ["x", "z"]), ["x", "y", "z"])
+        self.assertEqual(dd.merge_json({"k": 1, "gone": 1}, {"k": 1, "gone": 1}, {"k": 2}), {"k": 2})
+
+    def test_stop_resume_remove(self):
+        self.spawn()
+        self.assertEqual(self.fleet("stop", "m2").returncode, 0)
+        self.assertIn("m2: M2 — Pages. stopped", self.fleet().stdout)
+        r = self.fleet("resume", "m2")
+        self.assertEqual(r.returncode, 0, r.stdout)
+        starts = [c["args"][-1] for c in self.calls("tmux") if c["args"][0] == "new-session"]
+        self.assertIn("--resume", starts[-1])
+        self.worker_commit("src/pages.py", "pages = 1\n")
+        self.assertIn("aren't merged", self.fleet("remove", "m2").stdout)
+        self.assertEqual(self.fleet("merge", "m2").returncode, 0)
+        r = self.fleet("remove", "m2")
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertFalse(os.path.exists(self.wt()))
+        self.assertEqual(sh(self.p.root, "git", "branch", "--list", "daedalus/m2").strip(), "")
+        r = self.spawn("M2")  # its steps are still open in the plan
+        self.assertIn('"demo-m2-2"', r.stdout)  # a new session gets a name of its own
+
+    def test_a_worker_that_already_reported_isnt_asked_again(self):
+        self.spawn()
+        tp = os.path.join(self.fake, "worker.jsonl")
+        with open(tp, "w", encoding="utf-8") as f:
+            for d in ({"type": "user", "message": {"content": "/daedalus:build M2"}},
+                      {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "SendMessage"}]}},
+                      {"type": "user", "message": {"content": [{"type": "tool_result", "content": "sent"}]}},
+                      {"type": "assistant", "message": {"content": [{"type": "text", "text": "Done; told the overseer."}]}}):
+                f.write(json.dumps(d) + "\n")
+        jsave(os.path.join(self.wt(), ".daedalus", "run.json"), {"active": False})
+        self.worker_commit("src/pages.py", "pages = 1\n")
+        self.assertIsNone(self.hook("stop", {"transcript_path": tp}, cwd=self.wt()))
+        self.worker_commit("src/more.py", "more = 1\n")
+        out = self.hook("stop", {"transcript_path": os.path.join(self.fake, "none.jsonl")}, cwd=self.wt())
+        self.assertIn("Then stop.", out["reason"])  # outside a run, a pause with new work is reported
+
+    def test_build_output_doesnt_keep_a_merged_worktree(self):
+        self.spawn()
+        self.worker_commit("src/pages.py", "pages = 1\n")
+        self.assertEqual(self.fleet("merge", "m2").returncode, 0)
+        os.makedirs(os.path.join(self.wt(), "src", "__pycache__"))
+        with open(os.path.join(self.wt(), "src", "__pycache__", "pages.cpython-312.pyc"), "w") as f:
+            f.write("x")
+        with open(os.path.join(self.wt(), "notes.txt"), "w") as f:
+            f.write("half a thought")
+        r = self.fleet("remove", "m2")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("notes.txt", r.stdout)
+        self.assertNotIn("pyc", r.stdout)
+        os.remove(os.path.join(self.wt(), "notes.txt"))
+        self.assertEqual(self.fleet("remove", "m2").returncode, 0)
+
+    def test_init_proposes_how_a_worktree_gets_its_dependencies(self):
+        self.assertEqual(dd.worktree_setup(self.p.root), "")
+        self.p.write("package-lock.json", "{}")
+        self.assertEqual(dd.worktree_setup(self.p.root), "npm ci --silent --no-audit --no-fund")
+        self.assertEqual(dd.detect(self.p.root)["fleet"]["setup"], "npm ci --silent --no-audit --no-fund")
+
+    def test_workers_share_one_gate_lock_and_learn_their_slot(self):
+        self.spawn()
+        self.assertEqual(dd.gate_lock_path(self.wt()), dd.gate_lock_path(self.p.root))
+        self.assertTrue(dd.gate_lock_path(self.wt()).endswith("daedalus-gates.lock"))
+        self.assertEqual(dd.gate_env(self.wt())["DAEDALUS_SLOT"], "1")
+        self.assertEqual(dd.gate_env(self.p.root)["DAEDALUS_SLOT"], "0")
+        self.assertIn("M2", dd.run_text(self.wt(), dd.load_config(self.wt())))
+        self.assertNotIn("M3", dd.run_text(self.wt(), dd.load_config(self.wt())))  # a worker's run is its milestone
+
+
 class Launcher(unittest.TestCase):
     """The FPL server had only `python3`, and every hook failed to start (25 October 2026)."""
 

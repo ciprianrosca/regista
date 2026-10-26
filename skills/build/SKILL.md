@@ -92,6 +92,11 @@ Build the whole plan, milestone after milestone, without stopping in between. It
 hands over a full spec and wants to come back to the finished product, or to one list of the things
 only they can do.
 
+When milestones could be built side by side, or the user wants to keep talking to a session that isn't
+busy, suggest `/daedalus:oversee` instead: this session becomes the overseer and workers build in
+parallel. A worker started by an overseer runs this loop for its own milestone only (the session-start
+context says so).
+
 1. **Resume** (`/daedalus:start`) and read the plan and any spec it links. If the plan doesn't cover
    the linked spec yet (milestones missing, steps missing), add them first, each milestone with its
    gate and at least one end-to-end requirement. Show the plan to the user only where it changes or
