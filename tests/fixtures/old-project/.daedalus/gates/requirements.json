@@ -1,0 +1,13 @@
+{
+  "TALLY-1": {
+    "verify": "test",
+    "milestone": "M1",
+    "spec": ".daedalus/specs/m1-total.json",
+    "passes": true,
+    "evidence": [
+      "tests/test_tally.py"
+    ],
+    "at": "2026-01-05T10:45:00",
+    "base": "0000000"
+  }
+}

@@ -1,0 +1,17 @@
+# Local run state; the gate baseline is committed.
+gates/last.json
+gates/history.jsonl
+gates/passed.json
+gates/.lock
+context.json
+compactions.jsonl
+hosts.json
+approvals.json
+hooks.log
+agents/
+reviews/draft.json
+run.json
+typed.json
+worker.json
+fleet/
+worktrees/

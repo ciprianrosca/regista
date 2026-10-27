@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/dd\" hook session-start",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/regista\" hook session-start",
             "timeout": 60
           }
         ]
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/dd\" hook user-prompt",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/regista\" hook user-prompt",
             "timeout": 30
           }
         ]
@@ -27,7 +27,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/dd\" hook user-prompt-expansion",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/regista\" hook user-prompt-expansion",
             "timeout": 30
           }
         ]
@@ -39,7 +39,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/dd\" hook pre-tool",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/regista\" hook pre-tool",
             "timeout": 3600,
             "onFailure": "block"
           }
@@ -51,7 +51,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/dd\" hook stop",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/regista\" hook stop",
             "timeout": 60
           }
         ]
@@ -59,11 +59,11 @@
     ],
     "SubagentStart": [
       {
-        "matcher": "^daedalus:",
+        "matcher": "^regista:",
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/dd\" hook subagent-start",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/regista\" hook subagent-start",
             "timeout": 30
           }
         ]
@@ -71,11 +71,11 @@
     ],
     "SubagentStop": [
       {
-        "matcher": "^daedalus:",
+        "matcher": "^regista:",
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/dd\" hook subagent-stop",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/regista\" hook subagent-stop",
             "timeout": 30
           }
         ]
@@ -86,7 +86,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/dd\" hook pre-compact",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/regista\" hook pre-compact",
             "timeout": 60
           }
         ]
@@ -97,7 +97,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/dd\" hook session-end",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/regista\" hook session-end",
             "timeout": 60
           }
         ]

@@ -1,0 +1,89 @@
+{
+  "project": "Tally",
+  "plan": ".daedalus/plan.md",
+  "status_file": ".daedalus/status.md",
+  "board_file": ".daedalus/TODO.md",
+  "state_dir": ".daedalus/state",
+  "memory_dir": ".daedalus/memory",
+  "knowledge_file": ".daedalus/knowledge.json",
+  "gates": [
+    {
+      "name": "tests",
+      "run": "python3 -m unittest discover -s tests -q",
+      "when": [
+        "commit"
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "e2e",
+      "run": "test \"$(python3 tally.py 2 3 4)\" = 9",
+      "when": [
+        "commit"
+      ],
+      "timeout": 60,
+      "evidence": "e2e",
+      "tests": [
+        "tests/**"
+      ]
+    },
+    {
+      "name": "live",
+      "run": "python3 tally.py",
+      "when": [
+        "manual"
+      ],
+      "timeout": 60
+    }
+  ],
+  "protected": [
+    ".env",
+    ".env.local",
+    "*.pem",
+    "*.key",
+    "**/secrets/**",
+    ".daedalus/gates/requirements.json"
+  ],
+  "no_gates_for": [
+    "docs/**",
+    ".daedalus/research/**"
+  ],
+  "push": "ask",
+  "stop": "block",
+  "auto_snapshot": true,
+  "context": {
+    "warn_pct": 55,
+    "limit_pct": 65,
+    "window": "auto"
+  },
+  "roles": {
+    "source": [
+      "tally.py"
+    ],
+    "tests": [
+      "tests/**",
+      "**/test_*.*"
+    ],
+    "test_config": [
+      "**/conftest.py",
+      ".daedalus/gates/requirements.json"
+    ]
+  },
+  "review": {
+    "required_for": [
+      "tally.py"
+    ],
+    "min_changed_lines": 15,
+    "max_rounds": 3,
+    "ignore": [
+      "__pycache__/",
+      "*.pyc"
+    ]
+  },
+  "milestones": "parallel",
+  "mode": "orchestrated",
+  "requirements": {
+    "enforce_coverage": true,
+    "milestone_needs_e2e": true
+  }
+}

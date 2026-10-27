@@ -1,0 +1,3 @@
+name = "daedalus-builder"
+description = "Daedalus builder: builds one step from its spec."
+developer_instructions = "Work from .daedalus/plan.md and the step's spec in .daedalus/specs/."

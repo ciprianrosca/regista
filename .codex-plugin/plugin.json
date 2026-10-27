@@ -1,10 +1,12 @@
 {
-  "name": "daedalus",
-  "version": "0.8.0",
+  "name": "regista",
+  "version": "0.9.0",
   "description": "A build harness for long-running projects: saved state between sessions, milestone gates, roles in separate contexts, and hooks that block commits when tests or metrics regress.",
   "author": {
     "name": "Ciprian Rosca"
   },
+  "homepage": "https://github.com/ciprianrosca/regista",
+  "repository": "https://github.com/ciprianrosca/regista",
   "skills": "./skills/",
   "hooks": "./hooks/codex-hooks.json"
 }

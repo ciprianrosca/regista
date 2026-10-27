@@ -1,3 +1,3 @@
-# Codex: only the user starts this skill ($daedalus:verify); the hook records the check from their prompt.
+# Codex: only the user starts this skill ($regista:verify); the hook records the check from their prompt.
 policy:
   allow_implicit_invocation: false

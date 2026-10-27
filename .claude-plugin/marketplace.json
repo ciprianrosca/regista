@@ -1,14 +1,17 @@
 {
-  "name": "daedalus",
+  "name": "regista",
   "owner": {
     "name": "Ciprian Rosca"
   },
-  "description": "Daedalus: a build harness for long-running projects in Claude Code and Codex.",
+  "description": "Regista: a build harness for long-running projects in Claude Code and Codex.",
   "plugins": [
     {
-      "name": "daedalus",
+      "name": "regista",
       "source": "./",
-      "description": "Build harness: saved state, gates, roles in separate contexts, self-compaction, try-it-yourself checks."
+      "version": "0.9.0",
+      "description": "Build harness: saved state, gates, roles in separate contexts, self-compaction, try-it-yourself checks.",
+      "homepage": "https://github.com/ciprianrosca/regista",
+      "repository": "https://github.com/ciprianrosca/regista"
     }
   ]
 }

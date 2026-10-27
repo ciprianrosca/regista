@@ -1,12 +1,12 @@
 {
-  "description": "Daedalus for Codex: the same dd.py hooks as in Claude Code, with --host codex. Decisions are JSON on stdout (exit 0), so they hold under PowerShell too.",
+  "description": "Regista for Codex: the same regista.py hooks as in Claude Code, with --host codex. Decisions are JSON on stdout (exit 0), so they hold under PowerShell too.",
   "hooks": {
     "SessionStart": [
       {
         "hooks": [
           {
             "type": "command",
-            "command": "python \"${PLUGIN_ROOT}/scripts/dd.py\" hook session-start --host codex",
+            "command": "python \"${PLUGIN_ROOT}/scripts/regista.py\" hook session-start --host codex",
             "timeout": 60
           }
         ]
@@ -17,7 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python \"${PLUGIN_ROOT}/scripts/dd.py\" hook user-prompt --host codex",
+            "command": "python \"${PLUGIN_ROOT}/scripts/regista.py\" hook user-prompt --host codex",
             "timeout": 30
           }
         ]
@@ -29,7 +29,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python \"${PLUGIN_ROOT}/scripts/dd.py\" hook pre-tool --host codex",
+            "command": "python \"${PLUGIN_ROOT}/scripts/regista.py\" hook pre-tool --host codex",
             "timeout": 3600
           }
         ]
@@ -40,7 +40,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python \"${PLUGIN_ROOT}/scripts/dd.py\" hook stop --host codex",
+            "command": "python \"${PLUGIN_ROOT}/scripts/regista.py\" hook stop --host codex",
             "timeout": 60
           }
         ]
@@ -51,7 +51,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python \"${PLUGIN_ROOT}/scripts/dd.py\" hook subagent-start --host codex",
+            "command": "python \"${PLUGIN_ROOT}/scripts/regista.py\" hook subagent-start --host codex",
             "timeout": 30
           }
         ]
@@ -62,7 +62,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python \"${PLUGIN_ROOT}/scripts/dd.py\" hook subagent-stop --host codex",
+            "command": "python \"${PLUGIN_ROOT}/scripts/regista.py\" hook subagent-stop --host codex",
             "timeout": 30
           }
         ]
@@ -73,7 +73,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python \"${PLUGIN_ROOT}/scripts/dd.py\" hook pre-compact --host codex",
+            "command": "python \"${PLUGIN_ROOT}/scripts/regista.py\" hook pre-compact --host codex",
             "timeout": 60
           }
         ]
@@ -84,7 +84,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python \"${PLUGIN_ROOT}/scripts/dd.py\" hook session-end --host codex",
+            "command": "python \"${PLUGIN_ROOT}/scripts/regista.py\" hook session-end --host codex",
             "timeout": 3
           }
         ]

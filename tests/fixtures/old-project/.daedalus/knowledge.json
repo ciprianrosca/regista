@@ -1,0 +1,8 @@
+{
+  "environment": {
+    "python": "Python 3, standard library only; tests run with python3 -m unittest."
+  },
+  "patterns": {
+    "specs": "Each build step has its spec in .daedalus/specs/; tests name the requirement IDs they cover."
+  }
+}

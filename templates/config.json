@@ -1,11 +1,11 @@
 {
   "project": "{{PROJECT}}",
-  "plan": ".daedalus/plan.md",
-  "status_file": ".daedalus/status.md",
-  "board_file": ".daedalus/TODO.md",
-  "state_dir": ".daedalus/state",
-  "memory_dir": ".daedalus/memory",
-  "knowledge_file": ".daedalus/knowledge.json",
+  "plan": ".regista/plan.md",
+  "status_file": ".regista/status.md",
+  "board_file": ".regista/TODO.md",
+  "state_dir": ".regista/state",
+  "memory_dir": ".regista/memory",
+  "knowledge_file": ".regista/knowledge.json",
   "gates": [
     {
       "name": "tests",

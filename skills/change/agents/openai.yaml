@@ -1,3 +1,3 @@
-# Codex: only the user starts this skill ($daedalus:change); the hook records the change from their prompt.
+# Codex: only the user starts this skill ($regista:change); the hook records the change from their prompt.
 policy:
   allow_implicit_invocation: false

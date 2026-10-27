@@ -1,6 +1,6 @@
 # {{PROJECT}}: plan
 
-The spec Daedalus builds against. Milestones run in order; a milestone starts only when the previous
+The spec Regista builds against. Milestones run in order; a milestone starts only when the previous
 one's gate is met. A line `After: M3` (or `After: all`) under a milestone's heading builds it later.
 Keep each step small enough to finish, test and commit in one sitting.
 

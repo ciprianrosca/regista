@@ -1,37 +1,37 @@
 #!/usr/bin/env python3
-"""Daedalus core: state, gates and hook decisions for long-running builds in Claude Code and Codex.
+"""Core of the harness: state, gates and hook decisions for long-running builds in Claude Code and Codex.
 
 Deterministic on purpose. The hooks call this script, so the rules hold even when the model forgets
 them. Standard library only.
 
-Project setup lives in `.daedalus/config.json` at the project root (see templates/config.json).
+Project setup lives in `config.json` in the harness folder at the project root (see templates/config.json).
 In a folder without one, every hook exits silently, so the plugin can stay enabled everywhere.
 
 CLI (run from anywhere inside the project):
-  python dd.py init [--name NAME]         create .daedalus/ from the templates
-  python dd.py resume                     where we are / next / blocked, from files and git
-  python dd.py status                     resume + gate results + git details
-  python dd.py gate [NAME...] [--all] [--accept]
+  python regista.py init [--name NAME]         create the harness folder from the templates
+  python regista.py resume                     where we are / next / blocked, from files and git
+  python regista.py status                     resume + gate results + git details
+  python regista.py gate [NAME...] [--all] [--accept]
                                           run gates; --all includes manual ones; --accept stores the
                                           passing metrics as the new baseline
-  python dd.py snapshot [--reason TEXT]   write a mechanical handoff (git state, recent commits)
-  python dd.py handoff-name SLUG          print the path for a new handoff file
-  python dd.py context TRANSCRIPT         context use of a session transcript (tokens, window, %)
-  python dd.py review-status              does the current change set need a review, and is there one?
-  python dd.py review-record              (reviewer agent only) record .daedalus/reviews/draft.json
-  python dd.py requirements               requirements, their coverage and pass/fail (set by the gates)
-  python dd.py milestone M1               is M1's gate met? exit 0 = done
-  python dd.py run [start|end --reason T] the build-all run: start it, end it, or show the milestones left
-  python dd.py deploy                     deploy HEAD (config deploy.run), then run the live checks
-  python dd.py change [add TEXT|done N]   changes to what gets built (add: the user only)
-  python dd.py verify-manual ID --note T  (the user only) record a manual check
-  python dd.py try [M1|ID] [--ask]        what to try yourself; --ask (the user, in a terminal) records it
-  python dd.py detect                     propose gates, roles and protected paths (JSON)
-  python dd.py init --auto [--name NAME]  init + detect + setup, in one go
-  python dd.py setup                      the agent hosts' project settings (compaction, Codex agents)
-  python dd.py doctor                     does the harness work here? plain language, with fixes
+  python regista.py snapshot [--reason TEXT]   write a mechanical handoff (git state, recent commits)
+  python regista.py handoff-name SLUG          print the path for a new handoff file
+  python regista.py context TRANSCRIPT         context use of a session transcript (tokens, window, %)
+  python regista.py review-status              does the current change set need a review, and is there one?
+  python regista.py review-record              (reviewer agent only) record the review draft, reviews/draft.json
+  python regista.py requirements               requirements, their coverage and pass/fail (set by the gates)
+  python regista.py milestone M1               is M1's gate met? exit 0 = done
+  python regista.py run [start|end --reason T] the build-all run: start it, end it, or show the milestones left
+  python regista.py deploy                     deploy HEAD (config deploy.run), then run the live checks
+  python regista.py change [add TEXT|done N]   changes to what gets built (add: the user only)
+  python regista.py verify-manual ID --note T  (the user only) record a manual check
+  python regista.py try [M1|ID] [--ask]        what to try yourself; --ask (the user, in a terminal) records it
+  python regista.py detect                     propose gates, roles and protected paths (JSON)
+  python regista.py init --auto [--name NAME]  init + detect + setup, in one go
+  python regista.py setup                      the agent hosts' project settings (compaction, Codex agents)
+  python regista.py doctor                     does the harness work here? plain language, with fixes
 Hooks (stdin = the host's hook JSON; --host codex for Codex, default claude):
-  python dd.py hook session-start | pre-tool | user-prompt | user-prompt-expansion | stop |
+  python regista.py hook session-start | pre-tool | user-prompt | user-prompt-expansion | stop |
                     subagent-start | subagent-stop | pre-compact | session-end [--host codex]
                                           (pre-bash and pre-edit are pre-tool's per-tool parts)
 """
@@ -46,6 +46,23 @@ import subprocess
 import sys
 import time
 
+# The harness's name, in every form the code uses. Everything else derives from these lines.
+DISPLAY_NAME = "Regista"             # the name in messages and documents
+SLUG = "regista"                     # plugin name; /<SLUG>:<skill> ($ in Codex); agents <SLUG>:<role>, in Codex <SLUG>-<role>
+PROJECT_DIR = ".regista"             # the harness folder in each project
+ENV_PREFIX = "REGISTA_"              # environment variables, e.g. <ENV_PREFIX>SLOT
+BRANCH_PREFIX = "regista/"           # worker branches <BRANCH_PREFIX><name>
+GATE_LOCK = "regista-gates.lock"     # the shared gate lock file name
+
+OLD_ENV_PREFIX = "DAEDALUS_"  # the old name's environment variables, still read as a fallback through 0.9
+# The old name (0.8). A project it set up keeps its folder, worker branches and gate lock until it moves to the
+# new folder, and the old name's typed commands (verify and change) still count.
+OLD_DISPLAY_NAME = "Daedalus"
+OLD_SLUG = "daedalus"
+OLD_PROJECT_DIR = ".daedalus"
+OLD_BRANCH_PREFIX = "daedalus/"
+OLD_GATE_LOCK = "daedalus-gates.lock"
+
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
@@ -55,14 +72,48 @@ DD = os.path.abspath(__file__)
 # How to run the CLI on this machine, for the commands the harness tells agents and people to run.
 PY = "python" if os.name == "nt" or not shutil.which("python3") else "python3"
 
+
+def is_old_project(root):
+    """Set up by the old name: OLD_PROJECT_DIR/config.json and no PROJECT_DIR folder. It keeps working on its
+    old folder until the user agrees to move it. With PROJECT_DIR present, it's a new project."""
+    return bool(root) and (os.path.isfile(os.path.join(root, OLD_PROJECT_DIR, "config.json"))
+                           and not os.path.isdir(os.path.join(root, PROJECT_DIR)))
+
+
+def harness_dir(root):
+    """The harness folder's name in the project at `root`."""
+    return OLD_PROJECT_DIR if is_old_project(root) else PROJECT_DIR
+
+
+def harness_path(root, *parts):
+    """A path inside the harness folder of the project at `root`; harness_path(root) is the folder itself."""
+    return os.path.join(root, harness_dir(root), *parts)
+
+
+# The harness folder of the project this run works on. hook() and main() set it from the root they find, so
+# the few paths built without a root at hand (messages before a project is found, rootless helpers) follow an
+# old project too. Code that has the root passes it instead.
+ACTIVE = {"dir": PROJECT_DIR}
+
+
+def use_project(root):
+    ACTIVE["dir"] = harness_dir(root)
+
+
+def harness_rel(*parts, root=None):
+    """The same path relative to the project root, with forward slashes: for git pathspecs, config defaults
+    and messages. With `root`, in that project's harness folder; without, in the active project's."""
+    return "/".join((harness_dir(root) if root else ACTIVE["dir"],) + parts)
+
+
 DEFAULTS = {
     "project": "",
-    "status_file": ".daedalus/status.md",
-    "board_file": ".daedalus/TODO.md",
+    "status_file": harness_rel("status.md"),
+    "board_file": harness_rel("TODO.md"),
     "plan": "",
-    "state_dir": ".daedalus/state",
-    "memory_dir": ".daedalus/memory",
-    "knowledge_file": ".daedalus/knowledge.json",
+    "state_dir": harness_rel("state"),
+    "memory_dir": harness_rel("memory"),
+    "knowledge_file": harness_rel("knowledge.json"),
     "gates": [],
     "protected": [],
     "push": "ask",          # ask | block | allow
@@ -73,7 +124,7 @@ DEFAULTS = {
     # Codex's compaction settings) and the work carries on from the saved state; only if the context
     # still passes pause_pct (compaction off or failed) does the old pause apply. on_limit "pause": at
     # limit_pct every tool except saving is refused until the work is saved and the user has the
-    # resume prompt. window: tokens, or "auto" (env DAEDALUS_CONTEXT_WINDOW, else 1M once usage passes
+    # resume prompt. window: tokens, or "auto" (env <ENV_PREFIX>CONTEXT_WINDOW, else 1M once usage passes
     # 200k, else 200k).
     "context": {"warn_pct": 55, "limit_pct": 65, "window": "auto", "on_limit": "compact", "pause_pct": None},
     # orchestrated: the main session coordinates and never edits source or tests itself; the
@@ -87,8 +138,8 @@ DEFAULTS = {
               # files that decide what the tests check: guarded exactly like tests
               "test_config": ["**/conftest.py", "pytest.ini", "tox.ini", ".coveragerc", "**/jest.config.*",
                               "**/vitest.config.*", "**/playwright.config.*", "**/__snapshots__/**", "**/*.snap"]},
-    # Requirements live in .daedalus/specs/*.json (written with the plan); whether they pass is decided
-    # only by the gates and kept in .daedalus/gates/requirements.json, which no agent can write.
+    # Requirements live in the harness folder's specs/*.json (written with the plan); whether they pass is
+    # decided only by the gates and kept in its gates/requirements.json, which no agent can write.
     # A milestone is done only when all its requirements pass and, with milestone_needs_e2e, at least
     # one of them is proven by an end-to-end gate.
     "requirements": {"enforce_coverage": True, "milestone_needs_e2e": True},
@@ -101,14 +152,14 @@ DEFAULTS = {
 }
 # Commits that change only these (besides the harness's own records) skip the gates: there's no code to check.
 DEFAULTS["no_gates_for"] = []
-# A gate that passed on exactly the current files isn't run again (by the commit hook or `dd.py gate`).
+# A gate that passed on exactly the current files isn't run again (by the commit hook or `regista.py gate`).
 DEFAULTS["reuse_passing_runs"] = True
-# The overseer's worker sessions (`dd.py fleet`): at most max_workers at once; launch "auto" (tmux with
+# The overseer's worker sessions (`regista.py fleet`): at most max_workers at once; launch "auto" (tmux with
 # Remote Control when tmux is there, else `claude --bg`), "tmux" or "bg"; setup runs in each new
 # worktree (e.g. `npm ci`); copy lists untracked local files the tests need (.env); claude_args are
 # extra options for the workers' `claude` command (e.g. ["--model", "sonnet"]). Gate runs of all
 # worktrees take turns (one test database, one set of ports) unless isolated_gates says the project's
-# tests use DAEDALUS_SLOT to pick their own.
+# tests use <ENV_PREFIX>SLOT to pick their own.
 DEFAULTS["fleet"] = {"max_workers": 3, "launch": "auto", "setup": "", "copy": [".env", ".env.local", ".env.test"],
                      "isolated_gates": False, "claude_args": []}
 NESTED = ("context", "roles", "review", "requirements", "fleet")
@@ -120,7 +171,7 @@ HOOK_GATE_BUDGET = 3300  # seconds of gate runs per commit; the hook itself time
 def find_root(start=None):
     d = os.path.abspath(start or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
     while True:
-        if os.path.isfile(os.path.join(d, ".daedalus", "config.json")):
+        if os.path.isfile(harness_path(d, "config.json")):  # the new folder, or an old project's
             return d
         parent = os.path.dirname(d)
         if parent == d:
@@ -128,10 +179,20 @@ def find_root(start=None):
         d = parent
 
 
+FOLDER_PATHS = ("status_file", "board_file", "state_dir", "memory_dir", "knowledge_file")
+
+
+def with_defaults(root, cfg):
+    """A config with DEFAULTS filled in, their paths in the harness folder this project uses."""
+    d, folder = DEFAULTS, harness_dir(root)
+    if folder != PROJECT_DIR:  # DEFAULTS name the new folder
+        d = {**d, **{k: folder + d[k][len(PROJECT_DIR):] for k in FOLDER_PATHS}}
+    return {**d, **cfg, **{k: {**d[k], **(cfg.get(k) or {})} for k in NESTED}}
+
+
 def load_config(root):
-    with open(os.path.join(root, ".daedalus", "config.json"), encoding="utf-8") as f:
-        cfg = json.load(f)
-    return {**DEFAULTS, **cfg, **{k: {**DEFAULTS[k], **(cfg.get(k) or {})} for k in NESTED}}
+    with open(harness_path(root, "config.json"), encoding="utf-8") as f:
+        return with_defaults(root, json.load(f))
 
 
 def p(root, rel):
@@ -217,11 +278,23 @@ def rel_to_root(root, path):
     return None if rel.startswith("..") else rel.replace("\\", "/")
 
 
+# --- the harness's own environment variables -------------------------------------------------
+
+def env_value(name, default=None):
+    """The harness's own variable `name` (e.g. "SLOT"): <ENV_PREFIX><name> when set and not empty, else the
+    old name's <OLD_ENV_PREFIX><name> (a fallback through 0.9), else default."""
+    for prefix in (ENV_PREFIX, OLD_ENV_PREFIX):
+        value = os.environ.get(prefix + name)
+        if value:
+            return value
+    return default
+
+
 # --- shell for gate commands ----------------------------------------------------------------
 
 def find_bash():
-    if os.environ.get("DAEDALUS_BASH"):
-        return os.environ["DAEDALUS_BASH"]
+    if env_value("BASH"):
+        return env_value("BASH")
     if os.name != "nt":
         return shutil.which("bash")
     gitexe = shutil.which("git")
@@ -242,7 +315,7 @@ def run_shell(cmd, cwd, timeout, env=None):
         return r.returncode, (r.stdout or "") + (r.stderr or "")
     except subprocess.TimeoutExpired as e:
         out = (e.stdout or "") if isinstance(e.stdout, str) else ""
-        return 124, out + f"\n[daedalus] timed out after {timeout} s"
+        return 124, out + f"\n[{SLUG}] timed out after {timeout} s"
 
 
 # --- gates ----------------------------------------------------------------------------------
@@ -266,7 +339,7 @@ def last_json(text):
 
 
 def baseline_path(root):
-    return p(root, ".daedalus/gates/baseline.json")
+    return harness_path(root, "gates", "baseline.json")
 
 
 def load_json(path, default):
@@ -335,11 +408,11 @@ def state_fingerprint(root, cfg):
     h = hashlib.sha256()
     for ln in git(root, "ls-tree", "-r", "HEAD").splitlines():
         meta, _, path = ln.partition("\t")
-        if not bookkeeping(cfg, path):
+        if not bookkeeping(root, cfg, path):
             h.update(path.encode() + b"\0" + meta.encode() + b"\n")
     h.update(b"--changes--")
     for f in sorted(changed_files(root)):
-        if bookkeeping(cfg, f):
+        if bookkeeping(root, cfg, f):
             continue
         h.update(f.encode() + b"\0")
         try:
@@ -351,7 +424,7 @@ def state_fingerprint(root, cfg):
 
 
 def passed_path(root):
-    return p(root, ".daedalus/gates/passed.json")
+    return harness_path(root, "gates", "passed.json")
 
 
 def gate_lock_path(root, cfg=None):
@@ -361,15 +434,18 @@ def gate_lock_path(root, cfg=None):
     if not cfg["fleet"].get("isolated_gates") and (worker_info(root) or load_workers(root)):
         common = git(root, "rev-parse", "--path-format=absolute", "--git-common-dir")
         if common and os.path.isdir(common):
-            return os.path.join(common, "daedalus-gates.lock")
-    return p(root, ".daedalus/gates/.lock")
+            return os.path.join(common, OLD_GATE_LOCK if is_old_project(root) else GATE_LOCK)
+    return harness_path(root, "gates", ".lock")
 
 
 def gate_env(root):
-    """Gate commands learn which worktree they run in: DAEDALUS_WORKER (empty in the project folder)
-    and DAEDALUS_SLOT (0 there, 1, 2, … in the workers), to pick their own database or port."""
+    """Gate commands learn which worktree they run in: <ENV_PREFIX>WORKER (empty in the project folder)
+    and <ENV_PREFIX>SLOT (0 there, 1, 2, … in the workers), to pick their own database or port. The same
+    values go out under <OLD_ENV_PREFIX> too, for gate scripts written before the rename."""
     w = worker_info(root)
-    return {**os.environ, "DAEDALUS_WORKER": w.get("name", ""), "DAEDALUS_SLOT": str(w.get("slot", 0))}
+    worker, slot = w.get("name", ""), str(w.get("slot", 0))
+    return {**os.environ, **{prefix + "WORKER": worker for prefix in (ENV_PREFIX, OLD_ENV_PREFIX)},
+            **{prefix + "SLOT": slot for prefix in (ENV_PREFIX, OLD_ENV_PREFIX)}}
 
 
 def gate_lock(root, wait, note=None, path=None):
@@ -406,7 +482,7 @@ def run_gates(root, cfg, gates, accept=False, budget=None, reuse=None):
     commit hook must decide before its own timeout lets the action through."""
     started = time.time()
     lock = gate_lock(root, (budget - 60) if budget else 4 * 3600, path=gate_lock_path(root, cfg),
-                     note="Daedalus: another gate run is going in this project; waiting for it to finish.")
+                     note=f"{DISPLAY_NAME}: another gate run is going in this project; waiting for it to finish.")
     if lock is None:
         return [{"name": g["name"], "status": "fail", "seconds": 0,
                  "fails": ["another gate run in this project held the lock for the whole time budget"],
@@ -458,8 +534,8 @@ def _run_gates(root, cfg, gates, accept, budget, started, reuse):
         results.append(res)
     record = {"date": dt.datetime.now().isoformat(timespec="seconds"),
               "commit": git(root, "rev-parse", "--short", "HEAD"), "results": results}
-    save_json(p(root, ".daedalus/gates/last.json"), record)
-    with open(p(root, ".daedalus/gates/history.jsonl"), "a", encoding="utf-8") as f:
+    save_json(harness_path(root, "gates", "last.json"), record)
+    with open(harness_path(root, "gates", "history.jsonl"), "a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
     fresh = [r for r in results if r["status"] == "pass" and not r.get("reused")]
     if fresh and state_fingerprint(root, cfg) == fp:  # a run that changed the files proves nothing about them
@@ -505,27 +581,66 @@ def newest_handoff(root, cfg, real_only=False):
     return hs[-1] if hs else None
 
 
-def bookkeeping(cfg, path):
-    """Files the save step itself writes: committing them is not new work."""
+def bookkeeping(root, cfg, path, folders=None):
+    """Files the save step itself writes: committing them is not new work. `folders` are the harness folders
+    that count (default: the one the project at `root` uses)."""
     path = path.replace("\\", "/")
-    return path.startswith(".daedalus/") or path in (cfg["status_file"], cfg["board_file"])
+    return (any(path.startswith(f + "/") for f in folders or (harness_dir(root),))
+            or path in (cfg["status_file"], cfg["board_file"]))
 
 
 HOST_FILES = (".claude/settings.json", "AGENTS.md")
+MOVE_HOST_FILES = re.compile(r"\.gitignore|\.claude/settings[^/]*\.json")  # also changed by a folder move
+
+
+def folder_move(root):
+    """Is the change set moving an old project's harness folder to the new one? Decided from git, as half_moved
+    is: the last commit has the old folder's config and not the new one's, and the change set brings the new
+    one's (staged, or on disk for a `git add -A && git commit`). A leftover copy of the old config on disk,
+    untracked or ignored, changes nothing: the move is still compared with the old config."""
+    old, new = OLD_PROJECT_DIR + "/config.json", PROJECT_DIR + "/config.json"
+    return ((bool(git(root, "ls-files", "--cached", "--", new)) or os.path.isfile(p(root, new)))
+            and bool(git(root, "rev-parse", "--verify", "-q", "HEAD:" + old))
+            and not git(root, "rev-parse", "--verify", "-q", "HEAD:" + new))
+
+
+def committed_config(root, rel, move=False):
+    """The config at `rel` in the last commit, with defaults filled in (its old-folder values read as in the new
+    folder when `move`), or None when there's none to read."""
+    try:
+        data = json.loads(git(root, "show", "HEAD:" + rel) or "null")
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    return with_defaults(root, moved_values(data)[0] if move else data)
+
+
+def committed_old_config(root):
+    """During a folder move: the last commit's old-folder config, its paths read as in the new folder."""
+    return committed_config(root, OLD_PROJECT_DIR + "/config.json", move=True)
 
 
 def harness_only(root, cfg, files):
     """Does this change touch only the harness's own records (status, board, specs, reviews, the setup
-    files `dd.py init` writes) or `no_gates_for` paths? Then there's no code for the gates to check. The
-    config counts only while it's new: once committed, a config change runs the gates like code."""
+    files `regista.py init` writes) or `no_gates_for` paths? Then there's no code for the gates to check. The
+    config counts only while it's new: once committed, a config change runs the gates like code. A move of
+    an old project's folder (`regista.py migrate`) counts too, with the host files it rewrites; its config is
+    compared with the old one by config_loosened."""
     if not files:
         return False
-    config_new = not git(root, "ls-files", "--", ".daedalus/config.json")
+    move = folder_move(root)
+    folders = (OLD_PROJECT_DIR, PROJECT_DIR) if move else (harness_dir(root),)
+    if move:  # what counts as records comes from the last commit's config, never from the uncommitted one
+        old = committed_old_config(root) or with_defaults(root, {})
+        cfg = {**cfg, **{k: old[k] for k in ("status_file", "board_file", "no_gates_for")}}
+    config_new = move or not git(root, "ls-files", "--", harness_rel("config.json", root=root))
     for f in files:
-        if f == ".daedalus/config.json":
+        if f == harness_rel("config.json", root=root):
             if not config_new:
                 return False
-        elif not (bookkeeping(cfg, f) or f in HOST_FILES or f.startswith(".codex/")
+        elif not (bookkeeping(root, cfg, f, folders) or f in HOST_FILES or f.startswith(".codex/")
+                  or (move and MOVE_HOST_FILES.fullmatch(f))
                   or matches(f, cfg.get("no_gates_for") or [])):
             return False
     return True
@@ -533,14 +648,11 @@ def harness_only(root, cfg, files):
 
 def config_loosened(root, cfg):
     """What the working config loosens compared with the last commit's (plain-language list). Adding a
-    gate or a protected path is fine; removing or changing one, or switching a check off, isn't."""
-    try:
-        old = json.loads(git(root, "show", "HEAD:.daedalus/config.json") or "null")
-    except ValueError:
+    gate or a protected path is fine; removing or changing one, or switching a check off, isn't. During a
+    folder move the last commit's config is the old folder's, with its paths read as in the new folder."""
+    old = committed_old_config(root) if folder_move(root) else committed_config(root, harness_rel("config.json", root=root))
+    if old is None:
         return []
-    if not isinstance(old, dict):
-        return []
-    old = {**DEFAULTS, **old, **{k: {**DEFAULTS[k], **(old.get(k) or {})} for k in NESTED}}
     out = []
     new_gates = {g.get("name"): g for g in cfg["gates"]}
     for g in old["gates"]:
@@ -582,7 +694,7 @@ def commits_since(root, cfg, since):
         if len(parts) < 2 or not parts[1].isdigit() or int(parts[1]) <= since:
             continue
         files = git(root, "show", "--name-only", "--format=", parts[0]).splitlines()
-        if files and all(bookkeeping(cfg, f) for f in files):
+        if files and all(bookkeeping(root, cfg, f) for f in files):
             continue
         out.append(parts[0] + " " + (parts[2] if len(parts) > 2 else ""))
     return out
@@ -606,11 +718,11 @@ def resume_text(root, cfg, detailed=False):
     hand = read(h) if h else ""
     status = read(p(root, cfg["status_file"]), 6000)
     board = read(p(root, cfg["board_file"]), 4000)
-    last = load_json(p(root, ".daedalus/gates/last.json"), {})
+    last = load_json(harness_path(root, "gates", "last.json"), {})
     dirty = changed_files(root)
-    parts = [f"# Daedalus: {name}",
+    parts = [f"# {DISPLAY_NAME}: {name}",
              f"Root: {root}",
-             f"Daedalus CLI: {PY} \"{DD}\" <resume|status|gate|snapshot|handoff-name> (run from the project)",
+             f"{DISPLAY_NAME} CLI: {PY} \"{DD}\" <resume|status|gate|snapshot|handoff-name> (run from the project)",
              ""]
     parts.append("## Latest handoff" + (f" ({os.path.relpath(h, root)})" if h else ""))
     if hand:
@@ -669,7 +781,7 @@ def snapshot(root, cfg, reason):
     path = os.path.join(p(root, cfg["state_dir"]), f"{now:%Y-%m-%d}-auto-{now:%H%M%S}.md")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     dirty = changed_files(root)
-    body = f"""# Daedalus handoff — {now:%Y-%m-%d} (automatic snapshot)
+    body = f"""# {DISPLAY_NAME} handoff — {now:%Y-%m-%d} (automatic snapshot)
 
 Written by the harness ({reason}), not by a save. It records git state only; the next session should
 check it against the conversation-free facts (git, status file) and write a proper handoff.
@@ -696,7 +808,7 @@ def needs_snapshot(root, cfg):
         return True
     for f in changed_files(root):
         fp = p(root, f)
-        if os.path.exists(fp) and os.path.getmtime(fp) > since and not bookkeeping(cfg, f):
+        if os.path.exists(fp) and os.path.getmtime(fp) > since and not bookkeeping(root, cfg, f):
             return True
     return False
 
@@ -752,7 +864,7 @@ def review_needed(root, cfg):
 
 
 def review_path(root, fp):
-    return p(root, f".daedalus/reviews/{fp}.json")
+    return harness_path(root, "reviews", f"{fp}.json")
 
 
 def review_status(root, cfg):
@@ -762,24 +874,25 @@ def review_status(root, cfg):
         return None
     rec = load_json(review_path(root, fp), None)
     if rec is None:
-        return (f"Daedalus: this change ({len(files)} file(s) under {', '.join(cfg['review']['required_for'])}, "
-                f"fingerprint {fp}) has no review. Spawn the daedalus reviewer agent on the current changes; it "
-                "records its verdict with `dd.py review-record`. Any edit after the review needs a new review.")
+        return (f"{DISPLAY_NAME}: this change ({len(files)} file(s) under {', '.join(cfg['review']['required_for'])}, "
+                f"fingerprint {fp}) has no review. Spawn the {SLUG} reviewer agent on the current changes; it "
+                "records its verdict with `regista.py review-record`. Any edit after the review needs a new review.")
     if rec.get("verdict") != "approve":
-        return (f"Daedalus: the reviewer asked for changes on this exact change set ({fp}): "
+        return (f"{DISPLAY_NAME}: the reviewer asked for changes on this exact change set ({fp}): "
                 + "; ".join(f"{x.get('file')}:{x.get('line')} {x.get('issue')}" for x in rec.get("findings", [])[:5])
                 + ". Send the findings to a fresh builder agent, then review again.")
     return None
 
 
-REVIEW_DRAFT = ".daedalus/reviews/draft.json"
+def review_draft(root=None):
+    return harness_rel("reviews", "draft.json", root=root)
 
 
 def review_record(root, cfg):
     """Validate the reviewer's draft and stamp it with the fingerprint of the current change set."""
-    draft = load_json(p(root, REVIEW_DRAFT), None)
+    draft = load_json(p(root, review_draft(root)), None)
     if draft is None:
-        sys.exit(f"Write your verdict to {REVIEW_DRAFT} first (see the reviewer agent's format).")
+        sys.exit(f"Write your verdict to {review_draft(root)} first (see the reviewer agent's format).")
     problems = []
     if draft.get("verdict") not in ("approve", "changes"):
         problems.append('verdict must be "approve" or "changes"')
@@ -802,33 +915,33 @@ def review_record(root, cfg):
     rec = {**draft, "fingerprint": fp, "files": files, "at": dt.datetime.now().isoformat(timespec="seconds"),
            "base": git(root, "rev-parse", "--short", "HEAD")}
     save_json(review_path(root, fp), rec)
-    os.remove(p(root, REVIEW_DRAFT))
+    os.remove(p(root, review_draft(root)))
     print(f"Recorded review {rec['verdict']} for {len(files)} file(s), fingerprint {fp}.")
 
 
 # --- requirements ---------------------------------------------------------------------------
 #
-# .daedalus/specs/<step>.json, written by the orchestrator when a step starts:
+# specs/<step>.json in the harness folder, written by the orchestrator when a step starts:
 #   {"step": "stats", "milestone": "M1", "title": "...", "state": "active" | "planned",
 #    "requirements": [{"id": "STATS-1", "text": "WHEN the list is empty mean SHALL raise ValueError",
 #                      "verify": "test" | "e2e" | "manual"}]}
 # A requirement is covered when a test file names its ID (e.g. a `# covers: STATS-1` comment):
 # "test" in any test file, "e2e" in a file under an e2e gate's `tests` globs. It passes when it is
 # covered and every gate that proves it passed in the same run. "manual" passes only through
-# `dd.py verify-manual`, which no agent may run. Results: .daedalus/gates/requirements.json.
+# `regista.py verify-manual`, which no agent may run. Results: the harness folder's gates/requirements.json.
 
 REQ_ID = re.compile(r"^[A-Za-z][A-Za-z0-9_.]*-\d+$")
 VERIFY = ("test", "e2e", "manual")
 
 
 def requirements_path(root):
-    return p(root, ".daedalus/gates/requirements.json")
+    return harness_path(root, "gates", "requirements.json")
 
 
 def load_specs(root):
     """(specs, problems). Each spec gains `_file`."""
     specs, problems = [], []
-    for f in sorted(glob.glob(p(root, ".daedalus/specs/*.json"))):
+    for f in sorted(glob.glob(harness_path(root, "specs", "*.json"))):
         name = os.path.relpath(f, root).replace("\\", "/")
         try:
             with open(f, encoding="utf-8") as fh:
@@ -957,7 +1070,7 @@ def record_requirements(root, cfg, results):
 
 def work_changes(root, cfg):
     """Uncommitted changes the gates can see (not the harness's own records)."""
-    return [f for f in changed_files(root) if not bookkeeping(cfg, f)]
+    return [f for f in changed_files(root) if not bookkeeping(root, cfg, f)]
 
 
 def milestone_status(root, cfg, milestone):
@@ -968,7 +1081,7 @@ def milestone_status(root, cfg, milestone):
     reqs = [(s, r) for s in specs if s.get("milestone") == milestone for r in s.get("requirements") or []]
     reasons = list(problems)
     if not reqs:
-        reasons.append(f"no requirements are specified for {milestone} in .daedalus/specs/")
+        reasons.append(f"no requirements are specified for {milestone} in {harness_rel('specs', root=root)}/")
     for s, r in reqs:
         if not state.get(r["id"], {}).get("passes"):
             reasons.append(f"{r['id']} doesn't pass yet ({r.get('verify', 'test')})")
@@ -982,13 +1095,13 @@ def milestone_status(root, cfg, milestone):
 # --- deploy: what's live, checked where it's served ------------------------------------------
 #
 # The gates check the repository; a deploy can still serve something else (cached assets, data built
-# by the old code). With a `deploy` section in the config, `dd.py deploy` ships a commit and then
+# by the old code). With a `deploy` section in the config, `regista.py deploy` ships a commit and then
 # runs the gates marked `"when": ["deploy"]` against the live system, and records which commit is
-# live and whether those checks passed (.daedalus/gates/deployed.json, committed). Agents deploy only
+# live and whether those checks passed (the harness folder's gates/deployed.json, committed). Agents deploy only
 # through it: the deploy command itself is refused, so the live checks can't be skipped.
 
 def deployed_path(root):
-    return p(root, ".daedalus/gates/deployed.json")
+    return harness_path(root, "gates", "deployed.json")
 
 
 def deploy(root, cfg):
@@ -996,7 +1109,7 @@ def deploy(root, cfg):
     d = cfg.get("deploy") or {}
     if not d.get("run"):
         return False, ["No deploy configured: add \"deploy\": {\"run\": \"<your deploy command>\"} to "
-                       ".daedalus/config.json, and gates with \"when\": [\"deploy\"] that check the live site."]
+                       f"{harness_rel('config.json', root=root)}, and gates with \"when\": [\"deploy\"] that check the live site."]
     pending = work_changes(root, cfg)
     if pending:
         return False, [f"Commit first: a deploy ships a commit, and {len(pending)} file(s) aren't committed "
@@ -1030,9 +1143,9 @@ def live_text(root, cfg):
         return ""
     rec = load_json(deployed_path(root), {})
     if not rec:
-        return "Live: nothing deployed through `dd.py deploy` yet."
+        return "Live: nothing deployed through `regista.py deploy` yet."
     behind = [c for c in git(root, "rev-list", f"{rec['commit']}..HEAD").splitlines()
-              if not all(bookkeeping(cfg, f) for f in git(root, "show", "--name-only", "--format=", c).splitlines())]
+              if not all(bookkeeping(root, cfg, f) for f in git(root, "show", "--name-only", "--format=", c).splitlines())]
     state = ("live checks passed" if rec.get("ok") else
              "the deploy FAILED" if rec.get("deploy", {}).get("exit") else "live checks FAILED")
     return (f"Live: {rec['commit']}, deployed {rec['at'].replace('T', ' ')[:16]}, {state}"
@@ -1040,7 +1153,7 @@ def live_text(root, cfg):
 
 
 def runs_deploy_command(cfg, eff):
-    """Does the command run the configured deploy command directly (not through `dd.py deploy`)?"""
+    """Does the command run the configured deploy command directly (not through `regista.py deploy`)?"""
     run = (cfg.get("deploy") or {}).get("run")
     if not run or not eff:
         return False
@@ -1051,14 +1164,14 @@ def runs_deploy_command(cfg, eff):
 
 # --- build all: one run through every milestone ---------------------------------------------
 #
-# `/daedalus:build all` builds the plan milestone after milestone. `dd.py run start` marks the run
-# active in .daedalus/run.json (local); while it is, the Stop hook sends the session back to work
+# `/<SLUG>:build all` builds the plan milestone after milestone. `regista.py run start` marks the run
+# active in the harness folder's run.json (local); while it is, the Stop hook sends the session back to work
 # instead of letting the turn end, as long as each stop comes after new commits. A run that stops
 # twice without committing anything ends itself, so a stuck run can't trap the session.
-# `dd.py run end --reason …` ends it: everything is done, or everything left waits on the user.
+# `regista.py run end --reason …` ends it: everything is done, or everything left waits on the user.
 
 def run_path(root):
-    return p(root, ".daedalus/run.json")
+    return harness_path(root, "run.json")
 
 
 AFTER = re.compile(r"^\s*(?:[-*]\s*)?\**After\**\s*:\**\s*(.+?)\s*$", re.M | re.I)
@@ -1067,7 +1180,7 @@ AFTER = re.compile(r"^\s*(?:[-*]\s*)?\**After\**\s*:\**\s*(.+?)\s*$", re.M | re.
 def plan_milestones(root, cfg):
     """The plan's milestones in plan order ('## M1 — name' headings), with their unticked steps and
     their ordering rule: an `After: M8` line (or `After: all` for the last ones)."""
-    md = read(p(root, cfg["plan"] or ".daedalus/plan.md"))
+    md = read(p(root, cfg["plan"] or harness_rel("plan.md", root=root)))
     heads = list(re.finditer(r"^##\s+(M\d+[a-z]?)\b[\s—–:.-]*(.*)$", md, re.M))
     out = []
     for i, m in enumerate(heads):
@@ -1131,16 +1244,16 @@ def run_report(root, cfg, details=None):
         if done:
             lines.append(f"- {name}{rule}: DONE (gate met)")
         elif waits_on_user(root, cfg, m):
-            lines.append(f"- {name}{rule}: built; waits only on the user's checks (`dd.py try {m['id']}`)")
+            lines.append(f"- {name}{rule}: built; waits only on the user's checks (`regista.py try {m['id']}`)")
             if details is not None:
                 details.setdefault("waiting", []).append(m["id"])
         else:
             steps = f"{m['open_steps']} step(s) unticked in the plan, " if m["open_steps"] else ""
-            lines.append(f"- {name}{rule}: gate open ({steps}{len(why)} reason(s); `dd.py milestone {m['id']}`)")
+            lines.append(f"- {name}{rule}: gate open ({steps}{len(why)} reason(s); `regista.py milestone {m['id']}`)")
             if details is not None:
                 details.setdefault("open", []).append(m["id"])
     if not ms:
-        lines.append(f"- no milestones in {cfg['plan'] or '.daedalus/plan.md'} (headings like `## M1 — <name>`)")
+        lines.append(f"- no milestones in {cfg['plan'] or harness_rel('plan.md', root=root)} (headings like `## M1 — <name>`)")
         all_done = False
     if nxt:
         lines.append(f"Next in build order: {nxt['id']}.")
@@ -1213,7 +1326,7 @@ def run_nudge(root, cfg, data):
     head = git(root, "rev-parse", "HEAD")
     if run.get("nudged_at") == head:
         run_end(root, cfg, "the session tried to stop twice without committing anything new", outcome="stalled")
-        return {"systemMessage": "Daedalus: the build-all run stopped because no new step was committed since the "
+        return {"systemMessage": f"{DISPLAY_NAME}: the build-all run stopped because no new step was committed since the "
                                  f"last nudge. Read the last report; {cmd_name('build')} all picks it up again."}
     run.update(nudged_at=head, nudges=run.get("nudges", 0) + 1)
     save_json(run_path(root), run)
@@ -1222,7 +1335,7 @@ def run_nudge(root, cfg, data):
     save_note = (f" {len(unsaved)} commit(s) since the last handoff: run {cmd_name('save')} when a milestone closes."
                  if unsaved else "")
     return {"decision": "block", "reason":
-            f"Daedalus: a build-all run is active (since {run.get('started')}), so don't stop yet. Carry on with the "
+            f"{DISPLAY_NAME}: a build-all run is active (since {run.get('started')}), so don't stop yet. Carry on with the "
             f"next step that isn't blocked ({cmd_name('build')} all).{save_note}\nMilestones:\n" + "\n".join(lines) +
             f"\nIf every milestone is done, or everything left waits on the user (a decision, a manual check, a "
             f"step that stayed blocked), or the user asked you to stop: save, run `{PY} \"{DD}\" run end --reason "
@@ -1233,35 +1346,48 @@ def run_nudge(root, cfg, data):
 #
 # For a long build the user talks to one session, the overseer. It runs in the project folder and
 # doesn't build anything itself: it starts worker sessions, one per milestone that can be built
-# alongside the others, each in its own git worktree (.daedalus/worktrees/<name>, on the branch
-# daedalus/<name>), merges their branches when their work is done, and keeps the plan, the board and
+# alongside the others, each in its own git worktree (worktrees/<name> in the harness folder, on the
+# branch <BRANCH_PREFIX><name>), merges their branches when their work is done, and keeps the plan, the board and
 # the status. A worker is a whole Claude Code session running the build loop with its own agents. It
 # runs in tmux with Remote Control on, so the user can open any worker from the Claude app as well
 # (without tmux: `claude --bg`, reached with `claude attach`). The sessions talk through Claude Code's
 # messages between sessions (SendMessage). The hooks keep both sides in step whatever the models do: a
 # worker's hooks write what happens there (what the user told it, its commits, its report at the end
-# of each turn) to the overseer's .daedalus/fleet/events.jsonl, and the overseer's hooks show what's
+# of each turn) to the overseer's fleet/events.jsonl, and the overseer's hooks show what's
 # new. A check or a change the user types in a worker is recorded in the overseer's project, the one
 # record of what the user said.
 
-WORKER_FILE = ".daedalus/worker.json"
-FLEET_LOCAL = [".daedalus/worktrees/", ".daedalus/fleet/", ".daedalus/worker.json"]
+def worker_file(root):
+    return harness_path(root, "worker.json")
+
+
+def fleet_local(root, folder=None):
+    """What stays out of git: the worktrees, the fleet's records and a worktree's worker.json (in `folder`,
+    by default the harness folder the project at `root` uses)."""
+    return [f"{folder or harness_dir(root)}/{x}" for x in ("worktrees/", "fleet/", "worker.json")]
+
+
+def exclude_block(lines):
+    """The fleet's block in git's exclude file: its heading line, then `lines`."""
+    return f"# {DISPLAY_NAME} workers\n" + "\n".join(lines) + "\n"
+
+
 FLEET_WRITES = ("spawn", "merge", "stop", "resume", "remove")
 
 
 def worker_info(root):
     """This worktree's worker record (written by the overseer when it started the worker), or {}."""
-    return load_json(p(root, WORKER_FILE), {}) if root else {}
+    return load_json(worker_file(root), {}) if root else {}
 
 
 def overseer_root(root):
     """A worker's overseer project folder, where checks, changes and news go; None elsewhere."""
     home = worker_info(root).get("overseer_root")
-    return home if home and os.path.isfile(os.path.join(home, ".daedalus", "config.json")) else None
+    return home if home and os.path.isfile(harness_path(home, "config.json")) else None
 
 
 def fleet_dir(root):
-    return p(root, ".daedalus/fleet")
+    return harness_path(root, "fleet")
 
 
 def load_workers(root):
@@ -1285,8 +1411,8 @@ def fleet_event(home, worker, kind, text, **extra):
 
 
 def tool_exe(name):
-    """The claude or tmux command; DAEDALUS_CLAUDE or DAEDALUS_TMUX names a stand-in (the tests use one)."""
-    return os.environ.get(f"DAEDALUS_{name.upper()}") or shutil.which(name)
+    """The claude or tmux command; <ENV_PREFIX>CLAUDE or <ENV_PREFIX>TMUX names a stand-in (the tests use one)."""
+    return env_value(name.upper()) or shutil.which(name)
 
 
 def call(argv, cwd=None, timeout=60):
@@ -1323,7 +1449,7 @@ def slugify(text):
 
 def overseer_self(root, sessions):
     """The overseer's own session: its id (Claude Code puts it in the shell's environment), its name,
-    and its permission mode (from the hook that saw it run `dd.py fleet`)."""
+    and its permission mode (from the hook that saw it run `regista.py fleet`)."""
     seen = load_json(os.path.join(fleet_dir(root), "overseer.json"), {})
     sid = os.environ.get("CLAUDE_CODE_SESSION_ID") or seen.get("session_id", "")
     s = next((x for x in sessions if x.get("sessionId") == sid), {}) if sid else {}
@@ -1339,11 +1465,11 @@ def exclude_local(root):
         return
     path = os.path.join(common, "info", "exclude")
     text = read(path) or ""
-    missing = [x for x in FLEET_LOCAL if x not in text.splitlines()]
+    missing = [x for x in fleet_local(root) if x not in text.splitlines()]
     if missing:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "a", encoding="utf-8") as f:
-            f.write(("" if text.endswith("\n") or not text else "\n") + "# Daedalus workers\n" + "\n".join(missing) + "\n")
+            f.write(("" if text.endswith("\n") or not text else "\n") + exclude_block(missing))
 
 
 def ready_milestones(root, cfg, workers=None):
@@ -1373,7 +1499,7 @@ def launch_worker(cfg, wt, sname, mode, prompt, resume=""):
         code, out = call([tmux, "new-session", "-d", "-s", sname, "-x", "200", "-y", "50", "-c", wt, cmd])
         if code:
             return None, None, "", [f"tmux couldn't start the session: {out.strip()[-300:]}"]
-        url, problems, deadline = "", [], time.time() + float(os.environ.get("DAEDALUS_LAUNCH_WAIT", "40"))
+        url, problems, deadline = "", [], time.time() + float(env_value("LAUNCH_WAIT", "40"))
         while time.time() < deadline:
             code, screen = call([tmux, "capture-pane", "-p", "-t", sname])
             m = re.search(r"https://claude\.ai/code/session_\w+", screen)
@@ -1414,7 +1540,7 @@ def fleet_spawn(root, cfg, milestone="", name="", task="", force=False):
     """Start a worker: a worktree on its own branch, and a Claude Code session in it that builds the
     milestone (or does the task). Returns (ok, lines)."""
     if worker_info(root):
-        return False, ["Daedalus: only the overseer starts workers. Send it what you need (SendMessage)."]
+        return False, [f"{DISPLAY_NAME}: only the overseer starts workers. Send it what you need (SendMessage)."]
     if not milestone and not task:
         return False, ["Say what the worker does: a milestone (`fleet spawn M3`) or a task (`--task \"…\"`)."]
     if not tool_exe("claude"):
@@ -1448,7 +1574,8 @@ def fleet_spawn(root, cfg, milestone="", name="", task="", force=False):
     if git(root, "status", "--porcelain", "--untracked-files=no"):
         return False, ["The project folder has uncommitted changes. Commit them first (the plan above all): "
                        "the worker starts from the last commit and wouldn't see them."]
-    branch, rel = f"daedalus/{name}", f".daedalus/worktrees/{name}"
+    prefix = OLD_BRANCH_PREFIX if is_old_project(root) else BRANCH_PREFIX  # an old project keeps 0.8's branches
+    branch, rel = f"{prefix}{name}", harness_rel("worktrees", name, root=root)
     wt = p(root, rel)
     if os.path.exists(wt) or git(root, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"):
         return False, [f"{rel} or the branch {branch} is left over from an earlier worker. `fleet remove {name} "
@@ -1468,7 +1595,7 @@ def fleet_spawn(root, cfg, milestone="", name="", task="", force=False):
     info = {"name": name, "milestone": milestone, "title": title, "task": task, "branch": branch, "slot": slot,
             "overseer_root": root, "overseer": me["name"], "base": git(root, "rev-parse", "HEAD"),
             "started": now_iso()}
-    save_json(p(wt, WORKER_FILE), info)
+    save_json(worker_file(wt), info)
     if milestone:  # the worker keeps building until its milestone is done, like a build-all run
         save_json(run_path(wt), {"active": True, "started": now_iso(), "worker": name,
                                  "head_at_start": git(wt, "rev-parse", "--short", "HEAD")})
@@ -1484,8 +1611,8 @@ def fleet_spawn(root, cfg, milestone="", name="", task="", force=False):
     generation = workers.get(name, {}).get("generation", 0) + 1
     sname = slugify(f"{cfg.get('project') or os.path.basename(root)}-{name}") + (f"-{generation}" if generation > 1 else "")
     mode = me["mode"] or "auto"
-    prompt = f"/daedalus:build {milestone}" if milestone else task
-    save_json(p(wt, WORKER_FILE), {**info, "prompts": [prompt.strip()]})
+    prompt = f"/{SLUG}:build {milestone}" if milestone else task
+    save_json(worker_file(wt), {**info, "prompts": [prompt.strip()]})
     how, ref, url, problems = launch_worker(cfg, wt, sname, mode, prompt)
     if not how:
         remove_worktree(root, wt, branch)
@@ -1593,9 +1720,9 @@ def fleet_news(root):
     if not events:
         return ""
     shown = events[-25:]
-    more = f" ({len(events) - len(shown)} earlier ones in `dd.py fleet news --all`)" if len(events) > len(shown) else ""
-    return ("Daedalus: news from the workers" + more + ". Act on what needs you: answer a worker with SendMessage, "
-            "tell the user what matters, merge finished work (`dd.py fleet merge <name>`):\n"
+    more = f" ({len(events) - len(shown)} earlier ones in `regista.py fleet news --all`)" if len(events) > len(shown) else ""
+    return (f"{DISPLAY_NAME}: news from the workers" + more + ". Act on what needs you: answer a worker with SendMessage, "
+            "tell the user what matters, merge finished work (`regista.py fleet merge <name>`):\n"
             + "\n".join(f"- {e['worker']} at {e['at'][11:16]}: {describe_event(e)}" for e in shown))
 
 
@@ -1629,11 +1756,11 @@ def fleet_merge(root, cfg, name, force=False):
     """Merge a worker's branch into the project: one merge commit, made only when the commit gates
     pass on the merged code. The overseer's status and board stay as they are. Returns (ok, lines)."""
     if worker_info(root):
-        return False, ["Daedalus: only the overseer merges. Tell it your work is ready (SendMessage)."]
+        return False, [f"{DISPLAY_NAME}: only the overseer merges. Tell it your work is ready (SendMessage)."]
     workers = load_workers(root)
     w = workers.get(name)
     if not w or w.get("state") == "removed":
-        return False, [f"There's no worker {name}. `dd.py fleet` lists them."]
+        return False, [f"There's no worker {name}. `regista.py fleet` lists them."]
     if git(root, "status", "--porcelain", "--untracked-files=no"):
         return False, ["The project folder has uncommitted changes. Commit them first, so the merge is a commit of "
                        "its own."]
@@ -1660,7 +1787,7 @@ def fleet_merge(root, cfg, name, force=False):
     for f in conflicted:
         if f in keep:
             call(["git", "-C", root, "checkout", "--ours", "--", f])
-        elif f.startswith(".daedalus/") and f.endswith(".json"):
+        elif f.startswith(harness_rel(root=root) + "/") and f.endswith(".json"):
             try:
                 sides = [json.loads(git(root, "show", f":{k}:{f}", strip=False) or "null") for k in (1, 2, 3)]
             except ValueError:
@@ -1691,7 +1818,7 @@ def fleet_merge(root, cfg, name, force=False):
             [f"Ask {name} to merge the project into its branch, fix it there and commit; then merge again."]
     if results:
         record_requirements(root, cfg, results)
-        call(["git", "-C", root, "add", "--", ".daedalus/gates/requirements.json"])
+        call(["git", "-C", root, "add", "--", harness_rel("gates", "requirements.json", root=root)])
     what = f"{w['milestone']} — {w['title']}" if w.get("milestone") else (w.get("task") or name)[:60]
     code, out = call(["git", "-C", root, "commit", "-q", "-m", f"Merge {what} (worker {name})"])
     if code:
@@ -1745,7 +1872,7 @@ def fleet_resume(root, cfg, name):
                        "a new one."]
     wt = p(root, w["worktree"])
     info = worker_info(wt)
-    save_json(p(wt, WORKER_FILE), {**info, "prompts": (info.get("prompts") or []) + [RESUME_PROMPT]})
+    save_json(worker_file(wt), {**info, "prompts": (info.get("prompts") or []) + [RESUME_PROMPT]})
     how, ref, url, problems = launch_worker(cfg, wt, w["session_name"], w.get("mode") or "auto", RESUME_PROMPT,
                                             resume=w["session_id"])
     if not how:
@@ -1803,8 +1930,8 @@ def worker_note(root, cfg):
     w = worker_info(root)
     what = (f"build {w['milestone']} — {w.get('title', '')} (`{cmd_name('build')} {w['milestone']}`) until its "
             "gate is met or everything left waits on the user" if w.get("milestone") else f"this task: {w.get('task')}")
-    return (f"Daedalus: you are the worker \"{w['name']}\" of this project, started by the overseer session "
-            f"\"{w.get('overseer') or '(see dd.py fleet)'}\". You run in your own git worktree on the branch "
+    return (f"{DISPLAY_NAME}: you are the worker \"{w['name']}\" of this project, started by the overseer session "
+            f"\"{w.get('overseer') or '(see regista.py fleet)'}\". You run in your own git worktree on the branch "
             f"{w['branch']}; other workers build other milestones beside you, and the overseer merges each branch. "
             f"Your job: {what}" + (f". The overseer's notes: {w['task']}" if w.get("milestone") and w.get("task") else "")
             + ".\nHow you work with the overseer:\n"
@@ -1836,10 +1963,10 @@ def worker_heard_user(root, data):
         return
     w = worker_info(root)
     if prompt.strip() in (w.get("prompts") or []):  # what the overseer started (or resumed) it with
-        save_json(p(root, WORKER_FILE), {**w, "prompts": [x for x in w["prompts"] if x != prompt.strip()]})
+        save_json(worker_file(root), {**w, "prompts": [x for x in w["prompts"] if x != prompt.strip()]})
         return
     fleet_event(home, w["name"], "user", prompt[:1200])
-    save_json(p(root, WORKER_FILE), {**w, "user_since_report": True})
+    save_json(worker_file(root), {**w, "user_since_report": True})
 
 
 def last_said(data):
@@ -1875,7 +2002,7 @@ def worker_record_turn(root, data):
         return
     commits = git(root, "log", "--format=%s", f"{since}..HEAD").splitlines() if since and since != head else []
     fleet_event(home, w["name"], "turn", last_said(data)[:1500], commits=commits[:20], head=head[:12])
-    save_json(p(root, WORKER_FILE), {**worker_info(root), "reported_head": head})
+    save_json(worker_file(root), {**worker_info(root), "reported_head": head})
 
 
 def messaged_this_turn(data):
@@ -1909,13 +2036,13 @@ def worker_tell(root, data, during_run, extra=""):
     user = w.get("user_since_report")
     if not user and (during_run or head == w.get("messaged_head")):
         return None
-    save_json(p(root, WORKER_FILE), {**w, "messaged_head": head, "user_since_report": False})
+    save_json(worker_file(root), {**w, "messaged_head": head, "user_since_report": False})
     if messaged_this_turn(data):
         return None
     to = w.get("overseer") or "the overseer"
-    where = f"`dd.py milestone {w['milestone']}`" if w.get("milestone") else "done or not"
+    where = f"`regista.py milestone {w['milestone']}`" if w.get("milestone") else "done or not"
     return {"decision": "block", "reason": (extra + "\n" if extra else "") +
-            f"Daedalus: before you pause, tell the overseer: SendMessage to \"{to}\" with two to four plain lines: "
+            f"{DISPLAY_NAME}: before you pause, tell the overseer: SendMessage to \"{to}\" with two to four plain lines: "
             + ("what the user asked you and what you did about it, " if user else "what you did, ")
             + f"where your work stands ({where}), and anything you need from it or the user."
             + (" Then carry on." if during_run else " Then stop.")}
@@ -1928,8 +2055,8 @@ def worker_tell(root, data, during_run, extra=""):
 #    "try": {"title": "Sign-up works on a phone", "steps": ["Run `npm run dev`", "Open …/signup"],
 #            "expect": "You land on the dashboard and see your name"}}
 # Any requirement may carry "try" (then it's shown as "see it yourself"); manual ones must be
-# recorded by the user: `/daedalus:verify UI-3 ok` typed in Claude Code (the hook records it; the
-# model can't invoke that command), or `dd.py try --ask` in the user's own terminal.
+# recorded by the user: `/<SLUG>:verify UI-3 ok` typed in Claude Code (the hook records it; the
+# model can't invoke that command), or `regista.py try --ask` in the user's own terminal.
 
 OK_WORDS = ("ok", "pass", "passed", "yes", "y", "works", "worked", "good", "verified", "done", "✓", "✅")
 FAIL_WORDS = ("fail", "failed", "no", "n", "broken", "bug", "wrong", "doesn't", "doesnt", "✗", "❌")
@@ -1981,7 +2108,7 @@ def try_items(root, cfg, which=None):
 def try_text(root, cfg, which=None):
     items = try_items(root, cfg, which)
     if not items:
-        return ("Nothing to try yet" + (f" for {which}" if which else "") + ": no requirement in .daedalus/specs/ "
+        return ("Nothing to try yet" + (f" for {which}" if which else "") + f": no requirement in {harness_rel('specs', root=root)}/ "
                 "is marked for a manual check (\"verify\": \"manual\") or has \"try\" steps.")
     waiting = [x for x in items if x[1].get("verify") == "manual" and not x[2].get("passes")]
     lines = [f"Try it yourself{' — ' + which if which else ''}: "
@@ -2011,55 +2138,55 @@ def try_text(root, cfg, which=None):
         lines.append("")
     if waiting:
         lines += ["Tell the harness what you saw (only you can record these):",
-                  f"  in Claude Code:  /daedalus:verify {waiting[0][1]['id']} ok   or   "
-                  f"/daedalus:verify {waiting[0][1]['id']} fail <what happened>",
-                  f"  in Codex:        $daedalus:verify {waiting[0][1]['id']} ok   (or fail <what happened>)",
+                  f"  in Claude Code:  /{SLUG}:verify {waiting[0][1]['id']} ok   or   "
+                  f"/{SLUG}:verify {waiting[0][1]['id']} fail <what happened>",
+                  f"  in Codex:        ${SLUG}:verify {waiting[0][1]['id']} ok   (or fail <what happened>)",
                   f"  in a terminal:   {PY} \"{DD}\" try --ask   (walks you through each check)"]
     return "\n".join(lines)
 
 
 def verify_from_user(root, cfg, args, by):
-    """Record a check the user typed (`/daedalus:verify UI-3 ok …`). Returns the note for the agent."""
+    """Record a check the user typed (`/<SLUG>:verify UI-3 ok …`). Returns the note for the agent."""
     rid, ok, note = parse_verdict(args)
     usage = f"`{cmd_name('verify')} <ID> ok` or `{cmd_name('verify')} <ID> fail <what happened>`"
     if not rid:
-        return f"Daedalus: the user ran {cmd_name('verify')} without an ID. Show them {cmd_name('try')} and the form {usage}."
+        return f"{DISPLAY_NAME}: the user ran {cmd_name('verify')} without an ID. Show them {cmd_name('try')} and the form {usage}."
     s, r = find_requirement(root, rid)
     group = rid.lower() == "all" or bool(re.fullmatch(r"M\d+[a-z]?", rid, re.I))
     if not r and group:  # `all ok`, `M3 ok`: every check still waiting (in that milestone)
         waiting = [x[1]["id"] for x in try_items(root, cfg, None if rid.lower() == "all" else rid)
                    if x[1].get("verify") == "manual" and not x[2].get("by")]
         if ok is not True:
-            return (f"Daedalus: nothing recorded: `{rid} fail` doesn't say which check failed. Ask the user which one, "
+            return (f"{DISPLAY_NAME}: nothing recorded: `{rid} fail` doesn't say which check failed. Ask the user which one, "
                     f"as `{cmd_name('verify')} <ID> fail <what happened>`. Waiting: {', '.join(waiting) or 'none'}.")
         if not waiting:
-            return f"Daedalus: no checks are waiting for the user{'' if rid.lower() == 'all' else ' in ' + rid}."
+            return f"{DISPLAY_NAME}: no checks are waiting for the user{'' if rid.lower() == 'all' else ' in ' + rid}."
         for x in waiting:
             record_manual(root, x, True, note or f"verified with `{rid} ok`", by)
-        return (f"Daedalus recorded {', '.join(waiting)} as verified by the user (they typed `{rid} ok`). Tell them, "
+        return (f"{DISPLAY_NAME} recorded {', '.join(waiting)} as verified by the user (they typed `{rid} ok`). Tell them, "
                 "in one line, exactly which checks that covered, and carry on.")
     if not r and not overseer_root(root):
         for name, w in load_workers(root).items():  # a spec still on a running worker's branch
             wt = p(root, w.get("worktree", ""))
             if w.get("state") == "running" and os.path.isdir(wt) and find_requirement(wt, rid)[1]:
                 return verify_from_user(wt, load_config(wt), args, by).replace(
-                    "Daedalus recorded", f"Daedalus recorded (in the worker {name}, whose branch has that check)", 1)
+                    f"{DISPLAY_NAME} recorded", f"{DISPLAY_NAME} recorded (in the worker {name}, whose branch has that check)", 1)
     if not r:
         ids = [x[1]["id"] for x in try_items(root, cfg) if x[1].get("verify") == "manual"]
-        return (f"Daedalus: there's no requirement {rid}. Checks waiting for the user: {', '.join(ids) or 'none'}. "
+        return (f"{DISPLAY_NAME}: there's no requirement {rid}. Checks waiting for the user: {', '.join(ids) or 'none'}. "
                 f"Ask them to retype: {usage}.")
     if r.get("verify") != "manual":
-        return (f"Daedalus: {r['id']} is proven by the gates ({r.get('verify', 'test')}), so nothing was recorded. "
+        return (f"{DISPLAY_NAME}: {r['id']} is proven by the gates ({r.get('verify', 'test')}), so nothing was recorded. "
                 + ("The user reports it doesn't work: treat that as a bug the tests miss: add a failing test for it "
                    "through the test writer, then fix it." if ok is False else "Tell them it's already covered."))
     if ok is None:
-        return (f"Daedalus: nothing recorded for {r['id']}: the command needs ok or fail. Ask the user to retype: "
+        return (f"{DISPLAY_NAME}: nothing recorded for {r['id']}: the command needs ok or fail. Ask the user to retype: "
                 f"{usage}.")
     record_manual(root, r["id"], ok, note or ("worked as described" if ok else ""), by)
     if ok:
-        return (f"Daedalus recorded {r['id']} as verified by the user"
+        return (f"{DISPLAY_NAME} recorded {r['id']} as verified by the user"
                 + (f" ({note})" if note else "") + ". Acknowledge it in one line and carry on.")
-    return (f"Daedalus recorded {r['id']} as NOT working, reported by the user: {note or '(no details)'}. Thank them, "
+    return (f"{DISPLAY_NAME} recorded {r['id']} as NOT working, reported by the user: {note or '(no details)'}. Thank them, "
             "add it to the board, and fix it through the build loop (spec, tests, builder, review). Ask what "
             "happened if the report isn't clear enough to act on.")
 
@@ -2096,18 +2223,20 @@ def try_ask(root, cfg, which=None):
 
 # --- what the user typed --------------------------------------------------------------------
 #
-# `/daedalus:verify` and `/daedalus:change` are the user's own words: a check only they can make,
+# `/<SLUG>:verify` and `/<SLUG>:change` are the user's own words: a check only they can make,
 # and a change to what gets built. Claude Code's UserPromptExpansion hook sees them when the
 # session is idle. A message sent while the session is busy is queued and folded into the running
 # turn without any hook, so the hooks also read the transcript for queued messages Claude Code
 # marks as typed by a person, and record each one once. Nobody may write the transcripts.
 
-TYPED = re.compile(r"(?:^|(?<=\s))[/$]daedalus:(verify|change)\b", re.I)
+TYPED_SLUG = f"(?:{re.escape(SLUG)}|{re.escape(OLD_SLUG)})"  # the old name's commands count the same
+TYPED = re.compile(r"(?:^|(?<=\s))[/$]" + TYPED_SLUG + r":(verify|change)\b", re.I)
+QUEUED_SLUG = re.compile(TYPED_SLUG + ":", re.I)  # a quick look at a transcript line before parsing it
 VERDICT_LINE = re.compile(r"^[A-Za-z][A-Za-z0-9_.]*-\d+[:.,]?\s+\S")
 
 
 def typed_items(text):
-    """[(command, args)] for each /daedalus:verify or /daedalus:change in a message. Several checks in
+    """[(command, args)] for each /<SLUG>:verify or /<SLUG>:change in a message. Several checks in
     one message are several records, whether each line repeats the command or just says `UI-4 ok`."""
     out = []
     marks = list(TYPED.finditer(text or ""))
@@ -2143,7 +2272,7 @@ def record_typed(root, cfg, text, by):
         elif home:
             change_from_user(home, args, f"{by}, in the worker {name}")
             fleet_event(home, name, "change", args)
-            notes.append(f"Daedalus recorded the user's change for the overseer, which plans it: \"{args.strip()}\". "
+            notes.append(f"{DISPLAY_NAME} recorded the user's change for the overseer, which plans it: \"{args.strip()}\". "
                          "Don't build it unless it's within your milestone and the overseer agrees; tell it what the "
                          "user asked.")
         else:
@@ -2152,25 +2281,23 @@ def record_typed(root, cfg, text, by):
 
 
 def typed_path(root):
-    return p(root, ".daedalus/typed.json")
+    return harness_path(root, "typed.json")
 
 
 def queued_typed(root, cfg, data):
-    """Daedalus commands the user sent while the session was busy (Claude Code queues them and folds
+    """The harness's commands the user sent while the session was busy (Claude Code queues them and folds
     them into the running turn, and no hook fires): recorded once each, from the transcript entries
     Claude Code writes for a person's queued message. Returns the notes, or []."""
     tp = data.get("transcript_path") or ""
     if HOST["name"] != "claude" or not tp or "/subagents/" in tp.replace("\\", "/"):
         return []
-    lines = transcript_tail(tp)
-    if not lines or not any('"queued_command"' in ln and "daedalus:" in ln for ln in lines):
+    lines = [ln for ln in transcript_tail(tp) or [] if '"queued_command"' in ln and QUEUED_SLUG.search(ln)]
+    if not lines:
         return []
     seen_state = load_json(typed_path(root), {})
     seen = set(seen_state.get("seen") or [])
     notes, new = [], []
     for ln in lines:
-        if '"queued_command"' not in ln or "daedalus:" not in ln:
-            continue
         try:
             d = json.loads(ln)
         except ValueError:
@@ -2185,7 +2312,7 @@ def queued_typed(root, cfg, data):
             continue
         seen.add(key)
         new.append(key)
-        notes += [n.replace("Daedalus recorded", "Daedalus recorded (sent while you were working)", 1)
+        notes += [n.replace(f"{DISPLAY_NAME} recorded", f"{DISPLAY_NAME} recorded (sent while you were working)", 1)
                   for n in record_typed(root, cfg, att.get("prompt") or "", "user (sent while the session was busy)")]
     if new:
         save_json(typed_path(root), {"seen": (seen_state.get("seen") or [])[-400:] + new})
@@ -2194,27 +2321,27 @@ def queued_typed(root, cfg, data):
 
 # --- changes to what gets built -----------------------------------------------------------
 #
-# `/daedalus:change <what you want>`, typed by the user, goes into .daedalus/changes.json. Until the
-# orchestrator has put it in the plan (`dd.py change done <n> --where "M9"`), session start and the
+# `/<SLUG>:change <what you want>`, typed by the user, goes into the harness folder's changes.json. Until the
+# orchestrator has put it in the plan (`regista.py change done <n> --where "M9"`), session start and the
 # build-all nudge show it, so a running build folds it in at the next step.
 
 def changes_path(root):
-    return p(root, ".daedalus/changes.json")
+    return harness_path(root, "changes.json")
 
 
 def change_from_user(root, text, by):
     text = (text or "").strip()
     if not text:
-        return (f"Daedalus: the user ran {cmd_name('change')} without saying what to change. Ask them to retype it: "
+        return (f"{DISPLAY_NAME}: the user ran {cmd_name('change')} without saying what to change. Ask them to retype it: "
                 f"`{cmd_name('change')} <what you want>`.")
     items = load_json(changes_path(root), [])
     if any(c.get("text") == text for c in items):
-        return f"Daedalus: that change is already recorded: {text[:80]}"
+        return f"{DISPLAY_NAME}: that change is already recorded: {text[:80]}"
     n = max([c.get("n", 0) for c in items] + [0]) + 1
     items.append({"n": n, "text": text, "at": dt.datetime.now().isoformat(timespec="minutes"), "by": by,
                   "state": "open"})
     save_json(changes_path(root), items)
-    return (f"Daedalus recorded change {n} from the user: \"{text}\". Fold it into the plan now (a new milestone "
+    return (f"{DISPLAY_NAME} recorded change {n} from the user: \"{text}\". Fold it into the plan now (a new milestone "
             "or steps in one, with its spec; an ordering like \"build this last\" becomes an `After:` line on the "
             f"milestone), then mark it with `{PY} \"{DD}\" change done {n} --where \"<milestone>\"`. If it "
             "contradicts something already built or decided, ask the user one short question first.")
@@ -2303,7 +2430,7 @@ NATIVE_1M = re.compile(r"claude-(fable-\d|sonnet-([5-9]|\d\d)|haiku-(5-[5-9]|[6-
 def context_window(cfg, tokens, model=""):
     """The model's context window, in Claude Code's order: explicit setting, the env caps Claude Code
     itself honours, the model's documented default, then usage (over 200k can only mean 1M)."""
-    w = os.environ.get("DAEDALUS_CONTEXT_WINDOW") or cfg["context"].get("window")
+    w = env_value("CONTEXT_WINDOW") or cfg["context"].get("window")
     if isinstance(w, (int, float)) or (isinstance(w, str) and w.isdigit()):
         return int(w)
     if os.environ.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS", "").isdigit():
@@ -2356,7 +2483,7 @@ def context_pct(cfg, data):
         tokens, window = codex_context(data.get("transcript_path"))
         if tokens is None:
             return None, None
-        w = os.environ.get("DAEDALUS_CONTEXT_WINDOW") or cfg["context"].get("window")
+        w = env_value("CONTEXT_WINDOW") or cfg["context"].get("window")
         window = int(w) if isinstance(w, (int, float)) or (isinstance(w, str) and w.isdigit()) else window
         return round(100 * tokens / window, 1), tokens
     if data.get("agent_id"):
@@ -2370,7 +2497,7 @@ def context_pct(cfg, data):
 
 
 def ctx_state_path(root):
-    return p(root, ".daedalus/context.json")
+    return harness_path(root, "context.json")
 
 
 def ctx_state(root, session):
@@ -2398,7 +2525,7 @@ def pause_done(root, cfg, st):
 
 
 SAFE_SEGMENT = re.compile(r"^\s*(cd\s|git\s+(-C\s+\S+\s+)?(status|diff|log|add|commit|show|rev-parse|branch|stash)\b|"
-                          r"python3?\s+\S*dd\.py\b|echo\b|date\b|ls\b|pwd\b)", re.I)
+                          r"python3?\s+\S*regista\.py\b|echo\b|date\b|ls\b|pwd\b)", re.I)
 
 
 def allowed_while_paused(root, cfg, tool, ti):
@@ -2407,7 +2534,7 @@ def allowed_while_paused(root, cfg, tool, ti):
         return True
     if tool in ("Read", "Edit", "Write", "MultiEdit"):
         rel = rel_to_root(root, ti.get("file_path") or "")
-        return bool(rel and bookkeeping(cfg, rel))
+        return bool(rel and bookkeeping(root, cfg, rel))
     if tool in ("Bash", "PowerShell"):
         segments = [s for s in re.split(r"&&|\|\||;|\|", ti.get("command") or "") if s.strip()]
         return bool(segments) and all(SAFE_SEGMENT.match(s) for s in segments)
@@ -2423,13 +2550,13 @@ def context_check(root, cfg, data, items=None):
     c = cfg["context"]
     hard = pause_at(cfg)
     session = data.get("session_id", "")
-    if role_of(data) != "main":  # a subagent's own window: wrap up and report back, nothing to save
+    if role_of(data, root) != "main":  # a subagent's own window: wrap up and report back, nothing to save
         if pct >= hard:
-            return "deny", (f"Daedalus: your context is at {pct}%, over the {hard}% limit. Stop now and "
+            return "deny", (f"{DISPLAY_NAME}: your context is at {pct}%, over the {hard}% limit. Stop now and "
                             "report back to the orchestrator: what's done, what's left (files, state), and "
                             "how to verify it. Don't start anything else.")
         if pct >= c["warn_pct"]:
-            return "note", (f"Daedalus: your context is at {pct}% (limit {c['limit_pct']}%). Finish what you're "
+            return "note", (f"{DISPLAY_NAME}: your context is at {pct}% (limit {c['limit_pct']}%). Finish what you're "
                             "doing and report back; don't take on more.")
         return None, None
     if pct >= hard:
@@ -2441,8 +2568,8 @@ def context_check(root, cfg, data, items=None):
             return None, None
         why = (f"the context is at {pct}% ({tokens:,} tokens), over the {hard}% limit" if not compacting(cfg) else
                f"the context is at {pct}% ({tokens:,} tokens): it should have compacted itself at {c['limit_pct']}%, "
-               "but it didn't (auto-compaction off, or the host's compaction setting missing: `dd.py doctor` checks)")
-        return "deny", (f"Daedalus: {why}. Stop the work now and pause: run {cmd_name('pause')} (gates, commit "
+               "but it didn't (auto-compaction off, or the host's compaction setting missing: `regista.py doctor` checks)")
+        return "deny", (f"{DISPLAY_NAME}: {why}. Stop the work now and pause: run {cmd_name('pause')} (gates, commit "
                         "if green, status, handoff, board). Until the handoff is written, only saving is allowed. "
                         f"Then tell the user to {clear_hint()} and then `{cmd_name('start')} continue`.")
     if pct >= c["warn_pct"]:
@@ -2451,11 +2578,11 @@ def context_check(root, cfg, data, items=None):
             st["warned_pct"] = pct
             save_json(ctx_state_path(root), st)
             if compacting(cfg):
-                return "note", (f"Daedalus: the context is at {pct}%. At {c['limit_pct']}% it compacts itself and "
+                return "note", (f"{DISPLAY_NAME}: the context is at {pct}%. At {c['limit_pct']}% it compacts itself and "
                                 "you carry on from the saved state, so make that state complete now: finish the "
                                 "current step (don't start a new one), commit it if the gates pass, and write a "
                                 f"handoff with {cmd_name('save')}. Then continue with the next step.")
-            return "note", (f"Daedalus: the context is at {pct}% (limit {c['limit_pct']}%). Finish the current "
+            return "note", (f"{DISPLAY_NAME}: the context is at {pct}% (limit {c['limit_pct']}%). Finish the current "
                             f"step, don't start a new one, and run {cmd_name('pause')} before the limit.")
     return None, None
 
@@ -2466,18 +2593,36 @@ ROLES = ("builder", "test-writer", "reviewer", "researcher")
 EDIT_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
 
 
-def role_of(data):
-    """'main' for the main session, the Daedalus role for our plugin agents (agent_type
-    'daedalus:<role>'; agent names can't contain ':', so nothing else can claim it), else 'other'."""
+def old_project_run(root=None):
+    """Whether this run works on an old project: the one at `root`, or without it the active one."""
+    return is_old_project(root) if root else ACTIVE["dir"] == OLD_PROJECT_DIR
+
+
+def role_of(data, root=None):
+    """'main' for the main session, the harness role for our plugin agents (agent_type
+    '<SLUG>:<role>'; agent names can't contain ':', so nothing else can claim it), else 'other'."""
     at = data.get("agent_type") or ""
     if not data.get("agent_id") and not at:
         return "main"
-    # Claude Code: plugin agents are 'daedalus:<role>'. Codex: agent roles from .codex/agents/ are
-    # 'daedalus-<role>' (Codex role names allow letters, digits, '-' and '_').
-    prefix = "daedalus:" if HOST["name"] == "claude" else "daedalus-"
-    if at.startswith(prefix) and at[len(prefix):] in ROLES:
-        return at[len(prefix):]
+    # Claude Code: plugin agents are '<SLUG>:<role>'. Codex: agent roles from .codex/agents/ are
+    # '<SLUG>-<role>' (Codex role names allow letters, digits, '-' and '_'). An old project keeps the
+    # old name's agents until it moves: '<OLD_SLUG>:<role>' and .codex/agents/<OLD_SLUG>-<role>.toml.
+    sep = ":" if HOST["name"] == "claude" else "-"
+    for slug in (SLUG, OLD_SLUG) if old_project_run(root) else (SLUG,):
+        prefix = slug + sep
+        if at.startswith(prefix) and at[len(prefix):] in ROLES:
+            return at[len(prefix):]
     return "other"
+
+
+def codex_agent_prefix(root):
+    """The prefix of the project's Codex agents (.codex/agents/<prefix><role>.toml): the old name's in an old
+    project that has only those, else this name's."""
+    def has(slug):
+        return any(os.path.exists(os.path.join(root, ".codex", "agents", f"{slug}-{r}.toml")) for r in ROLES)
+    if is_old_project(root) and has(OLD_SLUG) and not has(SLUG):
+        return f"{OLD_SLUG}-"
+    return f"{SLUG}-"
 
 
 def tool_path(root, ti):
@@ -2510,65 +2655,68 @@ def is_transcript(tdir, path):
 def integrity_check(root, cfg, data):
     """Rules for everyone, the orchestrator included: the gates and their results are the harness's.
     Returns ("deny" | "ask", reason) or (None, None)."""
-    role = role_of(data)
+    role = role_of(data, root)
     tool = data.get("tool_name", "")
     ti = data.get("tool_input") or {}
     rel = tool_path(root, ti) if tool in EDIT_TOOLS else None
     eff = effects_of(root, data)
     writes = eff["writes"] if eff else []
-    if (eff and (runs_dd(eff, "verify-manual") or runs_dd(eff, "try", "--ask"))) or (
+    if (eff and (runs_cli(eff, "verify-manual") or runs_cli(eff, "try", "--ask"))) or (
             tool == "Skill" and re.search(r"(^|:)verify$", str(ti.get("skill") or ti.get("name") or ""))):
-        return "deny", ("Daedalus: manual checks are the user's call. Show them the steps "
-                        f"(`dd.py try`) and ask them to record what they saw: `{cmd_name('verify')} <ID> ok` "
-                        "or `fail <what happened>`, or `dd.py try --ask` in their own terminal.")
-    if (eff and runs_dd(eff, "change", "add")) or (
+        return "deny", (f"{DISPLAY_NAME}: manual checks are the user's call. Show them the steps "
+                        f"(`regista.py try`) and ask them to record what they saw: `{cmd_name('verify')} <ID> ok` "
+                        "or `fail <what happened>`, or `regista.py try --ask` in their own terminal.")
+    if (eff and runs_cli(eff, "change", "add")) or (
             tool == "Skill" and re.search(r"(^|:)change$", str(ti.get("skill") or ti.get("name") or ""))):
-        return "deny", ("Daedalus: what gets built is the user's call. If you think the plan needs a change, ask them; "
+        return "deny", (f"{DISPLAY_NAME}: what gets built is the user's call. If you think the plan needs a change, ask them; "
                         f"they record it with `{cmd_name('change')} <what they want>`.")
     if eff and nested_agent(eff):
-        return "deny", ("Daedalus: agents don't start Claude Code or Codex sessions from the shell: a nested session "
+        return "deny", (f"{DISPLAY_NAME}: agents don't start Claude Code or Codex sessions from the shell: a nested session "
                         "would run outside its role. The orchestrator starts agents "
-                        + ("with the Agent tool." if HOST["name"] == "claude" else "with spawn_agent (daedalus-<role>)."))
+                        + ("with the Agent tool." if HOST["name"] == "claude"
+                           else f"with spawn_agent ({codex_agent_prefix(root)}<role>)."))
     tdir = transcripts_dir(data)
     if tdir:
         target = ti.get("file_path") or ti.get("notebook_path") or ""
         if any(is_transcript(tdir, x) for x in ([target] if tool in EDIT_TOOLS and target else []) + writes):
-            return "deny", ("Daedalus: the session transcripts are the host's record of what the user typed; "
+            return "deny", (f"{DISPLAY_NAME}: the session transcripts are the host's record of what the user typed; "
                             "nobody writes them.")
-    fleet_files = [".daedalus/fleet/**", ".daedalus/worker.json"]
+    fleet_files = [harness_rel("fleet", "**", root=root), harness_rel("worker.json", root=root)]
     if (rel and matches(rel, fleet_files)) or under(root, writes, fleet_files):
-        return "deny", "Daedalus: the overseer's and workers' records are written only by the harness."
-    if (rel and rel.startswith(".daedalus/worktrees/")) or under(root, writes, [".daedalus/worktrees/**"]):
-        return "deny", ("Daedalus: that's a worker's worktree. Send the worker what to change (SendMessage), or take "
-                        "it over: `dd.py fleet stop <name>`.")
+        return "deny", f"{DISPLAY_NAME}: the overseer's and workers' records are written only by the harness."
+    worktrees = harness_rel("worktrees", root=root)
+    if (rel and rel.startswith(worktrees + "/")) or under(root, writes, [worktrees + "/**"]):
+        return "deny", (f"{DISPLAY_NAME}: that's a worker's worktree. Send the worker what to change (SendMessage), or take "
+                        "it over: `regista.py fleet stop <name>`.")
     home = overseer_root(root)
     if home:  # a worker writes in its own worktree, not in the overseer's project folder
         target = ti.get("file_path") or ti.get("notebook_path") or ""
         outside = [x for x in ([os.path.abspath(target)] if tool in EDIT_TOOLS and target else []) + writes
                    if rel_to_root(root, x) is None and rel_to_root(home, x) is not None]
         if outside:
-            return "deny", (f"Daedalus: {outside[0]} is in the overseer's project folder. You work in your own "
+            return "deny", (f"{DISPLAY_NAME}: {outside[0]} is in the overseer's project folder. You work in your own "
                             "worktree; send the overseer what it should change there.")
-    if (rel and rel.startswith(".daedalus/gates/")) or under(root, writes, [".daedalus/gates/**"]):
-        return "deny", ("Daedalus: .daedalus/gates/ (baseline, requirement results, run logs) is written only by "
-                        "the gates. Run `dd.py gate` instead.")
-    if (rel == ".daedalus/config.json") or under(root, writes, [".daedalus/config.json"]):
+    gates, config = harness_rel("gates", root=root), harness_rel("config.json", root=root)
+    if (rel and rel.startswith(gates + "/")) or under(root, writes, [gates + "/**"]):
+        return "deny", (f"{DISPLAY_NAME}: {gates}/ (baseline, requirement results, run logs) is written only by "
+                        "the gates. Run `regista.py gate` instead.")
+    if (rel == config) or under(root, writes, [config]):
         if role == "main":
-            return "ask", "Daedalus: changing the harness config (gates, thresholds, roles) needs the user's OK."
-        return "deny", "Daedalus: agents don't change the harness config. Report what you'd change and why."
+            return "ask", f"{DISPLAY_NAME}: changing the harness config (gates, thresholds, roles) needs the user's OK."
+        return "deny", f"{DISPLAY_NAME}: agents don't change the harness config. Report what you'd change and why."
     # The hosts' own settings decide whether the hooks, the agents and compaction run at all.
     host_files = [".codex/**", ".claude/settings.json", ".claude/settings.local.json"]
     if (rel and matches(rel, host_files)) or under(root, writes, host_files):
         if role == "main":
-            return "ask", ("Daedalus: this changes the agent host's settings (hooks, agents, compaction), which needs "
-                           "the user's OK. `dd.py setup` writes the ones Daedalus needs.")
-        return "deny", "Daedalus: agents don't change the agent host's settings. Report what you'd change and why."
+            return "ask", (f"{DISPLAY_NAME}: this changes the agent host's settings (hooks, agents, compaction), which needs "
+                           f"the user's OK. `regista.py setup` writes the ones {DISPLAY_NAME} needs.")
+        return "deny", f"{DISPLAY_NAME}: agents don't change the agent host's settings. Report what you'd change and why."
     return None, None
 
 
 def role_check(root, cfg, data):
     """Per-role permissions. Returns a refusal reason or None."""
-    role = role_of(data)
+    role = role_of(data, root)
     tool = data.get("tool_name", "")
     ti = data.get("tool_input") or {}
     src = cfg["roles"]["source"]
@@ -2581,44 +2729,44 @@ def role_check(root, cfg, data):
 
     # The verdict file and its recorder belong to the reviewer alone.
     if role != "reviewer":
-        if tool in EDIT_TOOLS and rel and rel.startswith(".daedalus/reviews/"):
-            return f"Daedalus: only the reviewer agent writes reviews. Spawn {agent_name('reviewer')}."
-        if eff and (runs_dd(eff, "review-record") or under(root, writes, [".daedalus/reviews/**"])):
-            return f"Daedalus: only the reviewer agent records reviews. Spawn {agent_name('reviewer')}."
+        if tool in EDIT_TOOLS and rel and rel.startswith(harness_rel("reviews", root=root) + "/"):
+            return f"{DISPLAY_NAME}: only the reviewer agent writes reviews. Spawn {agent_name('reviewer', root)}."
+        if eff and (runs_cli(eff, "review-record") or under(root, writes, [harness_rel("reviews", "**", root=root)])):
+            return f"{DISPLAY_NAME}: only the reviewer agent records reviews. Spawn {agent_name('reviewer', root)}."
 
     if role == "main":
         if tool == "Agent" or tool == "Task":
             return None
         if cfg["mode"] == "orchestrated" and tool in EDIT_TOOLS and (is_src or is_test):
             kind = "tests" if is_test else "source"
-            agent = agent_name("test-writer" if is_test else "builder")
-            return (f"Daedalus (orchestrated mode): the orchestrator doesn't edit {kind} ({rel}). "
+            agent = agent_name("test-writer" if is_test else "builder", root)
+            return (f"{DISPLAY_NAME} (orchestrated mode): the orchestrator doesn't edit {kind} ({rel}). "
                     f"Spawn {agent} with the step, the spec and what it needs to know.")
         return None
 
     # Every subagent: no nested agents, no commits or pushes (the orchestrator commits after review).
     if tool in ("Agent", "Task"):
-        return "Daedalus: subagents don't start other agents. Report back; the orchestrator decides who works next."
+        return f"{DISPLAY_NAME}: subagents don't start other agents. Report back; the orchestrator decides who works next."
     if eff and any(g["sub"] in ("commit", "push") for g in eff["git"]):
-        return "Daedalus: only the orchestrator commits, after the review. Report back instead."
-    if eff and (runs_dd(eff, "run", "start") or runs_dd(eff, "run", "end") or runs_dd(eff, "change", "done")
-                or runs_dd(eff, "deploy")):
-        return ("Daedalus: only the orchestrator starts or ends a build-all run, deploys, or marks a change as "
+        return f"{DISPLAY_NAME}: only the orchestrator commits, after the review. Report back instead."
+    if eff and (runs_cli(eff, "run", "start") or runs_cli(eff, "run", "end") or runs_cli(eff, "change", "done")
+                or runs_cli(eff, "deploy")):
+        return (f"{DISPLAY_NAME}: only the orchestrator starts or ends a build-all run, deploys, or marks a change as "
                 "planned. Report back instead.")
 
     if role == "builder":
         if tool in EDIT_TOOLS and is_test:
-            return (f"Daedalus: the builder doesn't edit tests or test config ({rel}). If a test is wrong or the "
+            return (f"{DISPLAY_NAME}: the builder doesn't edit tests or test config ({rel}). If a test is wrong or the "
                     "spec can't be met, stop and report BLOCKED with the reason; the orchestrator decides.")
         hits = under(root, writes, tests)
         if hits:
-            return (f"Daedalus: the builder doesn't change tests or test config from the shell either "
+            return (f"{DISPLAY_NAME}: the builder doesn't change tests or test config from the shell either "
                     f"({', '.join(hits[:5])}). Report BLOCKED with the reason instead.")
         return None
     if role == "test-writer":
         if tool in EDIT_TOOLS and rel and not is_test:
-            return f"Daedalus: the test writer writes only test files ({', '.join(tests)}); {rel} isn't one."
-        blind = (f"Daedalus: the test writer works from the spec and the interface, not the implementation "
+            return f"{DISPLAY_NAME}: the test writer writes only test files ({', '.join(tests)}); {rel} isn't one."
+        blind = (f"{DISPLAY_NAME}: the test writer works from the spec and the interface, not the implementation "
                  f"({rel or 'the whole project'}). Ask the orchestrator for any interface detail you need.")
         if tool == "Read" and is_src:
             return blind
@@ -2631,32 +2779,32 @@ def role_check(root, cfg, data):
             seen = [x for x in under(root, eff["reads"], src) if not matches(x, tests)]
             changed = [x for x in under(root, writes, src) if not matches(x, tests)]
             if changed:
-                return (f"Daedalus: the test writer doesn't change implementation files from the shell either "
+                return (f"{DISPLAY_NAME}: the test writer doesn't change implementation files from the shell either "
                         f"({', '.join(changed[:5])}).")
             if seen:
-                return (f"Daedalus: the test writer doesn't read implementation files from the shell either "
+                return (f"{DISPLAY_NAME}: the test writer doesn't read implementation files from the shell either "
                         f"({', '.join(seen[:5])}). Running the tests is fine; ask the orchestrator for interface details.")
         return None
     if role == "reviewer":
-        if tool in EDIT_TOOLS and rel is not None and rel != REVIEW_DRAFT:
-            return f"Daedalus: the reviewer reports, it doesn't fix. Write only {REVIEW_DRAFT} in the project."
-        inside = in_project(root, writes, [REVIEW_DRAFT]) if eff else []
+        if tool in EDIT_TOOLS and rel is not None and rel != review_draft(root):
+            return f"{DISPLAY_NAME}: the reviewer reports, it doesn't fix. Write only {review_draft(root)} in the project."
+        inside = in_project(root, writes, [review_draft(root)]) if eff else []
         if inside:
-            return (f"Daedalus: the reviewer doesn't change project files from the shell ({', '.join(inside[:5])}). "
+            return (f"{DISPLAY_NAME}: the reviewer doesn't change project files from the shell ({', '.join(inside[:5])}). "
                     "Scratch files outside the project (/tmp, $TMPDIR, the scratchpad) are fine.")
         return None
     if role == "researcher":
-        if tool in EDIT_TOOLS and rel is not None and not rel.startswith(".daedalus/research/"):
-            return "Daedalus: the researcher writes only notes under .daedalus/research/ in the project."
-        inside = in_project(root, writes, [".daedalus/research/**"]) if eff else []
+        if tool in EDIT_TOOLS and rel is not None and not rel.startswith(harness_rel("research", root=root) + "/"):
+            return f"{DISPLAY_NAME}: the researcher writes only notes under {harness_rel('research', root=root)}/ in the project."
+        inside = in_project(root, writes, [harness_rel("research", "**", root=root)]) if eff else []
         if inside:
-            return (f"Daedalus: the researcher doesn't change project files from the shell ({', '.join(inside[:5])}). "
-                    "Notes go under .daedalus/research/; scratch files outside the project are fine.")
+            return (f"{DISPLAY_NAME}: the researcher doesn't change project files from the shell ({', '.join(inside[:5])}). "
+                    f"Notes go under {harness_rel('research', root=root)}/; scratch files outside the project are fine.")
         return None
     # Other subagents (Explore, general-purpose, ...) in orchestrated mode: no source or test edits.
     if cfg["mode"] == "orchestrated" and tool in EDIT_TOOLS and (is_src or is_test):
-        return (f"Daedalus (orchestrated mode): only {agent_name('builder')} edits source and only {agent_name('test-writer')} "
-                f"edits tests ({rel}).")
+        return (f"{DISPLAY_NAME} (orchestrated mode): only {agent_name('builder', root)} edits source and only "
+                f"{agent_name('test-writer', root)} edits tests ({rel}).")
     return None
 
 
@@ -2666,11 +2814,11 @@ def agent_note(root, cfg, role):
         "builder": "You may edit source but not tests; you never commit; the orchestrator commits after review.",
         "test-writer": f"You may write only test files ({', '.join(cfg['roles']['tests'])}) and may not read "
                        f"implementation files ({', '.join(cfg['roles']['source'])}).",
-        "reviewer": f"You may write only {REVIEW_DRAFT}; record it with `review-record`.",
-        "researcher": "You may write only notes under .daedalus/research/.",
+        "reviewer": f"You may write only {review_draft(root)}; record it with `review-record`.",
+        "researcher": f"You may write only notes under {harness_rel('research', root=root)}/.",
     }[role]
-    return (f"Daedalus project: {cfg['project'] or os.path.basename(root)} at {root}\n"
-            f"Daedalus CLI: {PY} \"{DD}\" (gate, review-record, status)\n"
+    return (f"{DISPLAY_NAME} project: {cfg['project'] or os.path.basename(root)} at {root}\n"
+            f"{DISPLAY_NAME} CLI: {PY} \"{DD}\" (gate, review-record, status)\n"
             f"Your role: {role}. {rules} You can't start other agents. Context limit {cfg['context']['limit_pct']}% "
             "of your own window: past it, report back.")
 
@@ -2682,12 +2830,12 @@ HOST = {"name": "claude"}  # which agent runs the hook: claude (Claude Code) or 
 
 def cmd_name(skill):
     """How the user (or the agent) invokes one of our skills on this host."""
-    return f"/daedalus:{skill}" if HOST["name"] == "claude" else f"$daedalus:{skill}"
+    return f"/{SLUG}:{skill}" if HOST["name"] == "claude" else f"${SLUG}:{skill}"
 
 
-def agent_name(role):
-    """Our agent for a role, as this host names it."""
-    return f"daedalus:{role}" if HOST["name"] == "claude" else f"daedalus-{role}"
+def agent_name(role, root=None):
+    """Our agent for a role, as this host names it (in Codex, as the project's agent files name it)."""
+    return f"{SLUG}:{role}" if HOST["name"] == "claude" else f"{codex_agent_prefix(root) if root else SLUG + '-'}{role}"
 
 
 def clear_hint():
@@ -2712,7 +2860,7 @@ def log_refusal(reason):
     if not root:
         return
     try:
-        with open(p(root, ".daedalus/hooks.log"), "a", encoding="utf-8") as f:
+        with open(harness_path(root, "hooks.log"), "a", encoding="utf-8") as f:
             f.write(json.dumps({"at": dt.datetime.now().isoformat(timespec="seconds"), "tool": data.get("tool_name"),
                                 "input": {k: str(v)[:2000] for k, v in (data.get("tool_input") or {}).items()},
                                 "reason": reason[:300]}, ensure_ascii=False) + "\n")
@@ -2729,7 +2877,7 @@ def deny(reason):
 
 
 def approvals_path(root):
-    return p(root, ".daedalus/approvals.json")
+    return harness_path(root, "approvals.json")
 
 
 def ask(reason, item=None):
@@ -2771,11 +2919,11 @@ def user_reply_to_ask(root, data):
         st["granted"] = {"key": pend["key"], "session": pend["session"], "at": time.time()}
         st.pop("pending")
         save_json(approvals_path(root), st)
-        return f"Daedalus: the user approved ({pend['reason']}). Run that exact action again now; it's allowed once."
+        return f"{DISPLAY_NAME}: the user approved ({pend['reason']}). Run that exact action again now; it's allowed once."
     if NO.match(prompt):
         st.pop("pending")
         save_json(approvals_path(root), st)
-        return f"Daedalus: the user said no to: {pend['reason']} Don't retry it."
+        return f"{DISPLAY_NAME}: the user said no to: {pend['reason']} Don't retry it."
     return None
 
 
@@ -3046,7 +3194,8 @@ def agent_script(path, cwd):
     ap = os.path.abspath(path).replace("\\", "/")
     if ap.startswith(plug + "/") or (root and rel_to_root(root, ap) is not None):
         return False
-    if os.path.basename(ap) == "dd.py" and '"""Daedalus core' in read(ap, 300):  # another copy of the harness
+    head = read(ap, 300) if os.path.basename(ap) in ("regista.py", "dd.py") else ""  # dd.py: the old name
+    if '"""Core of the harness' in head or f'"""{OLD_DISPLAY_NAME} core' in head:  # another copy (old name: 0.8's first line)
         return False
     return os.path.isfile(ap) and os.path.getsize(ap) < 300_000
 
@@ -3280,13 +3429,13 @@ def in_project(root, paths, allowed=()):
     return out
 
 
-def runs_dd(eff, *subcommand):
-    """Does the command run `dd.py <subcommand…>`, from the shell or from inline code?"""
+def runs_cli(eff, *subcommand):
+    """Does the command run `regista.py <subcommand…>`, from the shell or from inline code?"""
     for words in eff["runs"]:
         for k, w in enumerate(words):
-            if w.replace("\\", "/").endswith(("dd.py", "scripts/dd")) and all(s in words[k + 1:] for s in subcommand):
+            if w.replace("\\", "/").endswith(("regista.py", "scripts/regista")) and all(s in words[k + 1:] for s in subcommand):
                 return True
-    return any(SPAWN_API.search(c) and "dd.py" in c and all(s in c for s in subcommand) for c in eff["code"])
+    return any(SPAWN_API.search(c) and "regista.py" in c and all(s in c for s in subcommand) for c in eff["code"])
 
 
 def nested_agent(eff):
@@ -3369,18 +3518,18 @@ def fleet_guard(root, cfg, data):
     eff = effects_of(root, data)
     if not eff:
         return
-    role, w = role_of(data), worker_info(root)
-    if runs_dd(eff, "fleet"):
-        if (w or role != "main") and any(runs_dd(eff, "fleet", x) for x in FLEET_WRITES):
-            deny("Daedalus: only the overseer starts, merges and stops workers." +
+    role, w = role_of(data, root), worker_info(root)
+    if runs_cli(eff, "fleet"):
+        if (w or role != "main") and any(runs_cli(eff, "fleet", x) for x in FLEET_WRITES):
+            deny(f"{DISPLAY_NAME}: only the overseer starts, merges and stops workers." +
                  (" Tell it what you need (SendMessage)." if w else " Report what you need to the orchestrator."))
         if role == "main" and not w:
             os.makedirs(fleet_dir(root), exist_ok=True)
             save_json(os.path.join(fleet_dir(root), "overseer.json"),
                       {"session_id": data.get("session_id", ""), "permission_mode": data.get("permission_mode", ""),
                        "at": now_iso()})
-    if w and (runs_dd(eff, "deploy") or any(g["sub"] == "push" for g in eff["git"])):
-        deny("Daedalus: a worker doesn't push or deploy: the overseer does, after merging your branch. Tell it when "
+    if w and (runs_cli(eff, "deploy") or any(g["sub"] == "push" for g in eff["git"])):
+        deny(f"{DISPLAY_NAME}: a worker doesn't push or deploy: the overseer does, after merging your branch. Tell it when "
              "your work is ready.")
 
 
@@ -3389,23 +3538,23 @@ def hook_pre_bash(root, cfg, data):
     if cfg["protected"]:
         hits = protected_hits(root, cfg, eff["writes"])
         if hits:
-            deny(f"Daedalus: this command writes to a protected path ({', '.join(hits[:5])}). "
+            deny(f"{DISPLAY_NAME}: this command writes to a protected path ({', '.join(hits[:5])}). "
                  "Protected paths are the user's deliverables: never write, move or delete them.")
     if runs_deploy_command(cfg, effects_of(root, data)):
-        deny(f"Daedalus: deploy with `{PY} \"{DD}\" deploy`: it ships the commit and then runs the live checks, "
+        deny(f"{DISPLAY_NAME}: deploy with `{PY} \"{DD}\" deploy`: it ships the commit and then runs the live checks, "
              "so a deploy that serves something else than the repository gets caught.")
     for g in eff["git"]:
         if g["sub"] == "commit":
             if rel_to_root(root, g["cwd"]) is None or find_root(g["cwd"]) not in (None, root):
                 continue  # another repo's commit: its own config (if any) decides
             if commit_no_verify(g["args"]):
-                deny("Daedalus: commits must run the gates; --no-verify / -n is not allowed.")
+                deny(f"{DISPLAY_NAME}: commits must run the gates; --no-verify / -n is not allowed.")
             commit_check(root, cfg)
         elif g["sub"] == "push":
             if cfg["push"] == "block":
-                deny("Daedalus: pushing is disabled for this project (config push=block). Ask the user to push.")
+                deny(f"{DISPLAY_NAME}: pushing is disabled for this project (config push=block). Ask the user to push.")
             if cfg["push"] == "ask":
-                ask("Daedalus: pushes need the user's go-ahead.")
+                ask(f"{DISPLAY_NAME}: pushes need the user's go-ahead.")
 
 
 def commit_check(root, cfg):
@@ -3413,7 +3562,7 @@ def commit_check(root, cfg):
     then the requirement results, which describe the commit. A loosened config needs the user."""
     problems = coverage_problems(root, cfg)
     if problems:
-        deny("Daedalus blocked this commit: requirements in .daedalus/specs/ aren't covered or aren't valid.\n- "
+        deny(f"{DISPLAY_NAME} blocked this commit: requirements in {harness_rel('specs', root=root)}/ aren't covered or aren't valid.\n- "
              + "\n- ".join(problems[:15]) + "\nSend the missing tests to the test writer (it adds "
              "`covers: <ID>`), or mark a spec not started yet as \"state\": \"planned\".")
     files = changed_files(root)
@@ -3424,7 +3573,7 @@ def commit_check(root, cfg):
         failed = [r for r in results if r["status"] == "fail"]
         if failed:
             tails = "\n\n".join(f"[{r['name']}]\n{r.get('tail', '')}" for r in failed)
-            deny("Daedalus blocked this commit: a gate failed.\n" + format_results(results) +
+            deny(f"{DISPLAY_NAME} blocked this commit: a gate failed.\n" + format_results(results) +
                  "\n\nFix the cause (or revert the change) and commit again. Never weaken a gate to pass it.\n\n" + tails)
     why = review_status(root, cfg)
     if why:
@@ -3433,7 +3582,7 @@ def commit_check(root, cfg):
         record_requirements(root, cfg, results)
     loose = config_loosened(root, cfg)
     if loose:
-        ask("Daedalus: this commit loosens the harness's checks compared with the last commit: " + "; ".join(loose)
+        ask(f"{DISPLAY_NAME}: this commit loosens the harness's checks compared with the last commit: " + "; ".join(loose)
             + ". That needs the user's OK, whichever way the config was changed.")
 
 
@@ -3443,10 +3592,10 @@ def hook_pre_edit(root, cfg, data):
     rel = rel_to_root(root, path) if path else None
     hits = protected_hits(root, cfg, [os.path.abspath(path).replace("\\", "/")]) if path and cfg["protected"] else []
     if hits:
-        deny(f"Daedalus: {rel or path} is protected. "
+        deny(f"{DISPLAY_NAME}: {rel or path} is protected. "
              "Protected paths are the user's deliverables: never write or edit them. Ask the user instead.")
-    if rel == ".daedalus/gates/baseline.json":
-        deny("Daedalus: the gate baseline changes only through `dd.py gate --accept` after a passing run.")
+    if rel == harness_rel("gates", "baseline.json", root=root):
+        deny(f"{DISPLAY_NAME}: the gate baseline changes only through `regista.py gate --accept` after a passing run.")
 
 
 PATCH_FILE = re.compile(r"^\*\*\* (?:Add File|Update File|Delete File|Move to): *(.+?)\s*$", re.M)
@@ -3474,10 +3623,10 @@ def hook_pre_tool(root, cfg, data):
     """Every tool call: the context budget first, then the tool's own rules."""
     items = tool_calls(data)
     if not items:
-        deny("Daedalus: couldn't tell which files this patch changes, so it's blocked. Use the standard "
+        deny(f"{DISPLAY_NAME}: couldn't tell which files this patch changes, so it's blocked. Use the standard "
              "`*** Add File:` / `*** Update File:` / `*** Delete File:` headers.")
     typed = queued_typed(root, cfg, data)
-    if role_of(data) == "main":
+    if role_of(data, root) == "main":
         news = fleet_news(root) if not worker_info(root) else ""
         typed += [news] if news else []
         HOOK_CTX["notes"] = typed
@@ -3499,14 +3648,14 @@ def hook_pre_tool(root, cfg, data):
             hook_pre_bash(root, cfg, d)
         elif tool in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
             hook_pre_edit(root, cfg, d)
-    notes = (typed if role_of(data) == "main" else []) + ([msg] if verdict == "note" else [])
+    notes = (typed if role_of(data, root) == "main" else []) + ([msg] if verdict == "note" else [])
     if notes:
         emit_context("PreToolUse", "\n".join(notes))
 
 
 def pause_pending(root, cfg, data):
     """Over the hard limit and no handoff written since: the pause isn't finished."""
-    if role_of(data) != "main":
+    if role_of(data, root) != "main":
         return None
     pct, _ = context_pct(cfg, data)
     if pct is None or pct < pause_at(cfg):
@@ -3519,7 +3668,7 @@ def pause_pending(root, cfg, data):
 
 
 def hook_user_prompt(root, cfg, data):
-    if role_of(data) != "main":
+    if role_of(data, root) != "main":
         return
     worker_heard_user(root, data)
     notes = queued_typed(root, cfg, data)
@@ -3530,8 +3679,9 @@ def hook_user_prompt(root, cfg, data):
         # In Codex this hook fires only for a person's input (agents talk to each other through tool
         # calls, and a subagent's turn carries its agent_id), so typed checks, changes and approvals count.
         prompt = data.get("prompt") or ""
-        if re.match(r"\s*[$/]?daedalus:(verify|change)\b", prompt, re.I):
-            notes += record_typed(root, cfg, re.sub(r"^\s*daedalus:", "$daedalus:", prompt), "user (typed in Codex)")
+        if re.match(r"\s*[$/]?" + TYPED_SLUG + r":(verify|change)\b", prompt, re.I):
+            notes += record_typed(root, cfg, re.sub(r"^\s*(" + TYPED_SLUG + ":)", r"$\1", prompt, flags=re.I),
+                                  "user (typed in Codex)")
         reply = user_reply_to_ask(root, data)
         if reply:
             notes.append(reply)
@@ -3540,10 +3690,10 @@ def hook_user_prompt(root, cfg, data):
         st = ctx_state(root, data.get("session_id", ""))
         resume = f"{cmd_name('start')} continue"
         if pause_done(root, cfg, st):
-            notes.append(f"Daedalus: the context is at {pct}%, over the {pause_at(cfg)}% limit, and the work "
+            notes.append(f"{DISPLAY_NAME}: the context is at {pct}%, over the {pause_at(cfg)}% limit, and the work "
                          f"is saved. Don't start new work: ask the user to {clear_hint()} and then `{resume}`.")
         else:
-            notes.append(f"Daedalus: the context is at {pct}%, over the {pause_at(cfg)}% limit. Don't start new "
+            notes.append(f"{DISPLAY_NAME}: the context is at {pct}%, over the {pause_at(cfg)}% limit. Don't start new "
                          f"work: run {cmd_name('pause')} now, then ask the user to {clear_hint()} and then `{resume}`.")
     if notes:
         emit_context("UserPromptSubmit", "\n".join(notes))
@@ -3551,15 +3701,16 @@ def hook_user_prompt(root, cfg, data):
 
 def hook_prompt_expansion(root, cfg, data):
     """Claude Code's UserPromptExpansion fires only for a command the user typed, so it's where a
-    manual check gets recorded: `/daedalus:verify UI-3 ok`. (UserPromptSubmit also fires for subagent
+    manual check gets recorded: `/<SLUG>:verify UI-3 ok`. (UserPromptSubmit also fires for subagent
     reports and scheduled prompts, so it can't tell a person from an agent.)"""
-    if role_of(data) != "main":
+    if role_of(data, root) != "main":
         return
     name = (data.get("command_name") or "").lower().lstrip("/")
     prompt = data.get("prompt") or ""
-    if name not in ("daedalus:verify", "daedalus:change") and not re.match(r"\s*/daedalus:(verify|change)\b", prompt, re.I):
+    typed = r"\s*/" + TYPED_SLUG + r":(verify|change)\b"
+    if not re.fullmatch(TYPED_SLUG + r":(verify|change)", name) and not re.match(typed, prompt, re.I):
         return
-    if not re.match(r"\s*/daedalus:(verify|change)\b", prompt, re.I):
+    if not re.match(typed, prompt, re.I):
         args = data.get("command_args")
         prompt = f"/{name} {args if isinstance(args, str) else ''}"
     notes = record_typed(root, cfg, prompt, "user (typed the command)")
@@ -3568,7 +3719,7 @@ def hook_prompt_expansion(root, cfg, data):
 
 
 def hook_stop(root, cfg, data):
-    if role_of(data) != "main":
+    if role_of(data, root) != "main":
         return
     typed = queued_typed(root, cfg, data)
     if worker_info(root):
@@ -3582,7 +3733,7 @@ def hook_stop(root, cfg, data):
     pct = None if again else pause_pending(root, cfg, data)
     if pct is not None:
         emit({"decision": "block", "reason":
-              f"Daedalus: the context is at {pct}%, over the {pause_at(cfg)}% limit, and the work "
+              f"{DISPLAY_NAME}: the context is at {pct}%, over the {pause_at(cfg)}% limit, and the work "
               f"isn't saved yet. Run {cmd_name('pause')}: gates, commit if green, status file, handoff (with the "
               f"resume prompt), board. Then end with: \"{clear_hint().capitalize()}, then: {cmd_name('start')} continue\"."})
     # A build-all run nudges even when `again` is set: it loops only while new commits keep coming,
@@ -3606,7 +3757,7 @@ def hook_stop(root, cfg, data):
     unsaved = unsaved_commits(root, cfg)
     if not unsaved:
         return
-    msg = (f"Daedalus: {len(unsaved)} commit(s) since the last handoff ({'; '.join(unsaved[:3])}). "
+    msg = (f"{DISPLAY_NAME}: {len(unsaved)} commit(s) since the last handoff ({'; '.join(unsaved[:3])}). "
            f"Run the save step ({cmd_name('save')}) before stopping, so no progress lives only in this conversation.")
     if cfg["stop"] == "block":
         emit({"decision": "block", "reason": msg})
@@ -3615,54 +3766,61 @@ def hook_stop(root, cfg, data):
 
 def hook_session_start(root, cfg, data):
     ensure_gitignore(root)
-    seen = load_json(hosts_seen_path(root), {})  # for `dd.py doctor`: proof the hooks run on this host
+    seen = load_json(hosts_seen_path(root), {})  # for `regista.py doctor`: proof the hooks run on this host
     seen[HOST["name"]] = dt.datetime.now().isoformat(timespec="seconds")
     save_json(hosts_seen_path(root), seen)
     text = resume_text(root, cfg)
     src = data.get("source", "startup")
     if src == "compact":
-        lead = (f"Daedalus: the context was compacted to stay under {cfg['context']['limit_pct']}% of the window. "
+        lead = (f"{DISPLAY_NAME}: the context was compacted to stay under {cfg['context']['limit_pct']}% of the window. "
                 "Re-read the saved state below, check it against git, and carry on with the task you were doing. "
                 "The user doesn't need to clear or resume anything.\n\n")
     else:
-        lead = ("This project runs on the Daedalus harness. Before other work, reply with three lines: "
+        lead = (f"This project runs on the {DISPLAY_NAME} harness. Before other work, reply with three lines: "
                 "Where we are / Next / Blocked on, from the state below (verify against git if they disagree), "
                 "unless the user already gave a command.\n\n")
     if worker_info(root):
         lead = worker_note(root, cfg) + "\n\n" + lead
     elif load_workers(root):
-        text += "\n\nThe overseer's workers (`dd.py fleet`):\n" + fleet_text(root, cfg)
+        text += "\n\nThe overseer's workers (`regista.py fleet`):\n" + fleet_text(root, cfg)
+    if is_old_project(root) and not worker_info(root):  # a worker's copy moves with the main project
+        lead = (f"{DISPLAY_NAME}: this project still uses the old folder {OLD_PROJECT_DIR}/. {cmd_name('start')} can move "
+                f"it to {PROJECT_DIR}/, once the user says yes.\n\n") + lead
+    warning = old_plugin_warning(root)
+    if warning:
+        lead = f"{DISPLAY_NAME}: {warning}\n\n" + lead
     if HOST["name"] == "codex":
-        lead += ("Daedalus in Codex: the skills are written for both hosts. Where they say `/daedalus:<skill>`, "
-                 "the command here is `$daedalus:<skill>`. Where they say to spawn `daedalus:<role>` (subagent_type), "
-                 "spawn the Codex agent `daedalus-<role>`: daedalus-builder, daedalus-test-writer, "
-                 "daedalus-reviewer, daedalus-researcher. AskUserQuestion means: ask in the chat.\n\n")
+        agent = codex_agent_prefix(root)  # the agents this project has: an old project may keep the old name's
+        lead += (f"{DISPLAY_NAME} in Codex: the skills are written for both hosts. Where they say `/{SLUG}:<skill>`, "
+                 f"the command here is `${SLUG}:<skill>`. Where they say to spawn `{SLUG}:<role>` (subagent_type), "
+                 f"spawn the Codex agent `{agent}<role>`: {agent}builder, {agent}test-writer, "
+                 f"{agent}reviewer, {agent}researcher. AskUserQuestion means: ask in the chat.\n\n")
     emit_context("SessionStart", lead + text)
 
 
 def hook_pre_compact(root, cfg, data):
-    if role_of(data) == "main":  # evidence for `dd.py doctor` that compaction really happens
+    if role_of(data, root) == "main":  # evidence for `regista.py doctor` that compaction really happens
         pct, _ = context_pct(cfg, data)
-        with open(p(root, ".daedalus/compactions.jsonl"), "a", encoding="utf-8") as f:
+        with open(harness_path(root, "compactions.jsonl"), "a", encoding="utf-8") as f:
             f.write(json.dumps({"at": dt.datetime.now().isoformat(timespec="seconds"), "host": HOST["name"],
                                 "trigger": data.get("trigger", ""), "pct": pct}) + "\n")
     hook_snapshot(root, cfg, data, "before context compaction")
 
 
 def hook_snapshot(root, cfg, data, reason):
-    if role_of(data) != "main":
+    if role_of(data, root) != "main":
         return
     if cfg["auto_snapshot"] and needs_snapshot(root, cfg):
         path = snapshot(root, cfg, reason)
-        print(f"Daedalus: wrote {os.path.relpath(path, root)}", file=sys.stderr)
+        print(f"{DISPLAY_NAME}: wrote {os.path.relpath(path, root)}", file=sys.stderr)
 
 
 def agents_dir(root):
-    return p(root, ".daedalus/agents")
+    return harness_path(root, "agents")
 
 
 def hook_subagent_start(root, cfg, data):
-    role = role_of(data)
+    role = role_of(data, root)
     if role not in ROLES:
         return
     save_json(os.path.join(agents_dir(root), f"{data.get('agent_id', 'unknown')}.json"),
@@ -3672,14 +3830,14 @@ def hook_subagent_start(root, cfg, data):
 
 def hook_subagent_stop(root, cfg, data):
     """A reviewer can't finish without recording a verdict (once: stop_hook_active ends the loop)."""
-    if role_of(data) != "reviewer" or data.get("stop_hook_active"):
+    if role_of(data, root) != "reviewer" or data.get("stop_hook_active"):
         return
     st = load_json(os.path.join(agents_dir(root), f"{data.get('agent_id', 'unknown')}.json"), {})
     started = st.get("started", 0)
-    recorded = [f for f in glob.glob(p(root, ".daedalus/reviews/*.json"))
+    recorded = [f for f in glob.glob(harness_path(root, "reviews", "*.json"))
                 if os.path.basename(f) != "draft.json" and os.path.getmtime(f) > started]
     if not recorded:
-        emit({"decision": "block", "reason": f"Daedalus: record your verdict before finishing: write {REVIEW_DRAFT} "
+        emit({"decision": "block", "reason": f"{DISPLAY_NAME}: record your verdict before finishing: write {review_draft(root)} "
                                               f"and run `{PY} \"{DD}\" review-record`."})
 
 
@@ -3690,17 +3848,18 @@ def hook(event):
         data = {}
     root = find_root(data.get("cwd"))
     if not root:
-        return  # not a Daedalus project: stay out of the way
+        return  # not a project set up with the harness: stay out of the way
+    use_project(root)
     HOOK_CTX.update(root=root, data=data)
     try:
         run_hook(event, root, data)
     except SystemExit:
         raise
     except Exception as e:  # noqa: BLE001 — any failure inside a guard must not let the action through
-        msg = f"Daedalus hook error in {event}: {type(e).__name__}: {e}"
-        if event in ("pre-tool", "pre-bash", "pre-edit") and os.environ.get("DAEDALUS_FAIL_OPEN") != "1":
+        msg = f"{DISPLAY_NAME} hook error in {event}: {type(e).__name__}: {e}"
+        if event in ("pre-tool", "pre-bash", "pre-edit") and env_value("FAIL_OPEN") != "1":
             deny(msg + ". Failing closed: the action is blocked until the harness works again. Check "
-                 ".daedalus/config.json; set DAEDALUS_FAIL_OPEN=1 to bypass while you fix it.")
+                 f"{harness_rel('config.json', root=root)}; set {ENV_PREFIX}FAIL_OPEN=1 to bypass while you fix it.")
         print(msg, file=sys.stderr)  # other events never trap the session
 
 
@@ -3718,7 +3877,7 @@ def run_hook(event, root, data):
 # --- detect: what the project is, so setup can propose everything --------------------------
 
 SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "env", "__pycache__", "dist", "build", ".next", "target",
-             ".daedalus", ".pytest_cache", ".mypy_cache", ".ruff_cache", "coverage", ".tox", ".idea", ".vscode"}
+             PROJECT_DIR, OLD_PROJECT_DIR, ".pytest_cache", ".mypy_cache", ".ruff_cache", "coverage", ".tox", ".idea", ".vscode"}
 WEB_DEPS = ("next", "react", "vue", "svelte", "@sveltejs/kit", "vite", "express", "fastify", "nuxt", "astro",
             "@remix-run/react", "hono", "koa", "@angular/core")
 PY_WEB = ("fastapi", "flask", "django", "starlette", "streamlit", "gradio")
@@ -3898,6 +4057,112 @@ def codex_home():
     return os.environ.get("CODEX_HOME") or os.path.join(os.path.expanduser("~"), ".codex")
 
 
+def old_plugin_enabled(root):
+    """The old plugin's names where it's still enabled: an enabledPlugins key "<OLD_SLUG>@…" whose winning value
+    is true in Claude Code's settings (as in Claude Code, the most specific file that names it wins: the project's
+    .claude/settings.local.json, then its .claude/settings.json, then the user's), or a [plugins."<OLD_SLUG>@…"]
+    table in Codex's config.toml without enabled = false. Returns [(host, name)]."""
+    claude = {}
+    for path in (os.path.join(os.path.expanduser("~"), ".claude", "settings.json"),
+                 os.path.join(root, ".claude", "settings.json"), os.path.join(root, ".claude", "settings.local.json")):
+        settings = load_json(path, {})
+        plugins = settings.get("enabledPlugins") if isinstance(settings, dict) else None
+        if isinstance(plugins, dict):
+            claude.update((k, v) for k, v in plugins.items() if k.startswith(OLD_SLUG + "@"))
+    found = [("claude", k) for k, v in claude.items() if v is True]
+    for name, enabled in codex_plugins(read(os.path.join(codex_home(), "config.toml")), OLD_SLUG).items():
+        if enabled != "false":
+            found.append(("codex", name))
+    return list(dict.fromkeys(found))
+
+
+def toml_scan(s, depth, ml):
+    """One line (or the rest of one) of a TOML value: (bracket depth after it, the multi-line string delimiter
+    still open after it or None, the text without its comment)."""
+    out, i = [], 0
+    while i < len(s):
+        if ml:
+            j = s.find(ml, i)
+            if j < 0:
+                return depth, ml, "".join(out + [s[i:]])
+            out.append(s[i:j + 3])
+            i, ml = j + 3, None
+            continue
+        c = s[i]
+        if c == "#":
+            break
+        if s.startswith('"""', i) or s.startswith("'''", i):
+            ml = s[i:i + 3]
+            out.append(ml)
+            i += 3
+            continue
+        if c in "\"'":
+            j = i + 1
+            while j < len(s) and s[j] != c:
+                j += 2 if c == '"' and s[j] == "\\" else 1
+            out.append(s[i:j + 1])
+            i = j + 1
+            continue
+        if c in "[{":
+            depth += 1
+        elif c in "]}":
+            depth = max(0, depth - 1)
+        out.append(c)
+        i += 1
+    return depth, ml, "".join(out)
+
+
+def toml_tables(text):
+    """The tables of a TOML text and their keys' raw values, {"table": {"key": "value"}}, with the top level
+    under "". A value spread over several lines (an array, an inline table, a multi-line string) stays one
+    value and doesn't hide the keys after it. Enough to read a setting; not a full TOML parser (Python 3.10
+    has none)."""
+    tables, current, key, depth, ml = {"": {}}, "", None, 0, None
+    for line in text.splitlines():
+        if ml is None and depth == 0:
+            s = line.strip()
+            if s.startswith("["):
+                m = re.match(r"\[\[?(.*?)\]\]?\s*(#.*)?$", s)
+                current, key = re.sub(r"\s*\.\s*", ".", m.group(1).strip()) if m else s, None
+                tables.setdefault(current, {})
+                continue
+            m = re.match(r"\s*([^=#\s][^=#]*?)\s*=(.*)$", line)
+            if not m:
+                key = None
+                continue
+            key, rest = m.group(1), m.group(2)
+            tables[current][key] = ""
+        else:
+            rest = line
+        depth, ml, value = toml_scan(rest, depth, ml)
+        if key is not None:
+            tables[current][key] = (tables[current][key] + "\n" + value).strip()
+    return tables
+
+
+def codex_plugins(text, slug):
+    """The [plugins."<slug>@…"] tables in Codex's config.toml: {"<slug>@…": raw value of enabled, "" if unset}."""
+    found = {}
+    for name, keys in toml_tables(text).items():
+        m = re.fullmatch(r'plugins\.(["\'])(' + re.escape(slug) + r'@[^"\']*)\1', name)
+        if m:
+            found[m.group(2)] = keys.get("enabled", "")
+    return found
+
+
+def old_plugin_warning(root):
+    """One line when the old plugin is still enabled next to this one in a new project, else "". In an old
+    project the old plugin is expected until the move."""
+    found = [] if is_old_project(root) else old_plugin_enabled(root)
+    if not found:
+        return ""
+    fixes = [f"`claude plugin uninstall {name}`" for host, name in found if host == "claude"]
+    fixes += [f"in Codex, remove its [plugins.\"{name}\"] table from {os.path.join(codex_home(), 'config.toml')}"
+              for host, name in found if host == "codex"]
+    return (f"both {DISPLAY_NAME} and {OLD_DISPLAY_NAME} (its old name) are enabled; uninstall {OLD_DISPLAY_NAME}: "
+            + "; ".join(fixes) + ".")
+
+
 def codex_wanted(root):
     return bool(shutil.which("codex")) or os.path.isdir(os.path.join(root, ".codex"))
 
@@ -3965,23 +4230,35 @@ def codex_window():
     return model or "unknown", 272_000
 
 
-def codex_agent_toml(role):
+def codex_agent_toml(role, prefix=SLUG + "-"):
     """A Codex agent role from the plugin's agent file: same instructions, Codex's format."""
     text = read(os.path.join(PLUGIN_ROOT, "agents", f"{role}.md"))
     m = re.match(r"---\n(.*?)\n---\n(.*)", text, re.S)
     meta, body = (m.group(1), m.group(2)) if m else ("", text)
     desc = re.search(r'^description:\s*"?(.*?)"?\s*$', meta, re.M)
-    body = ("You run as a Codex subagent started by the Daedalus orchestrator. The Daedalus CLI path and your "
+    body = (f"You run as a Codex subagent started by the {DISPLAY_NAME} orchestrator. The {DISPLAY_NAME} CLI path and your "
             "role's rules are in your start context. Your report back is your final message.\n\n" + body.strip())
-    lines = [f'# Written by Daedalus (`dd.py setup`) from agents/{role}.md. Run setup again to update it.',
-             f'name = "daedalus-{role}"',
+    lines = [f'# Written by {DISPLAY_NAME} (`regista.py setup`) from agents/{role}.md. Run setup again to update it.',
+             f'name = "{prefix}{role}"',
              f"description = {json.dumps(desc.group(1) if desc else role)}",
              'model_reasoning_effort = "high"' if role == "reviewer" else 'model_reasoning_effort = "medium"',
              "developer_instructions = '''", body.replace("'''", "'' '"), "'''", ""]
     return "\n".join(lines)
 
 
-AGENTS_MARK = ("<!-- daedalus:start -->", "<!-- daedalus:end -->")
+AGENTS_MARK = (f"<!-- {SLUG}:start -->", f"<!-- {SLUG}:end -->")
+
+
+def agents_md_block():
+    """The block setup keeps in the project's AGENTS.md, between the AGENTS_MARK lines."""
+    return (f"{AGENTS_MARK[0]}\n## {DISPLAY_NAME} harness\n\n"
+            f"This project runs on the {DISPLAY_NAME} build harness; hooks enforce its rules.\n\n"
+            f"- Every session starts with a {DISPLAY_NAME} hook adding the project state (`# {DISPLAY_NAME}: …`) to your "
+            "context. **If you don't see it, the hooks aren't running.** Before anything else, tell the user: "
+            f"in Codex, trust this project folder and the {DISPLAY_NAME} hooks (`/hooks`); in Claude Code, enable the "
+            f"{SLUG} plugin. Then `python <{SLUG}>/scripts/regista.py doctor` checks the setup.\n"
+            f"- Start with `${SLUG}:start` in Codex, `/{SLUG}:start` in Claude Code.\n"
+            f"{AGENTS_MARK[1]}\n")
 
 
 def setup_codex_project(root, cfg):
@@ -3996,8 +4273,8 @@ def setup_codex_project(root, cfg):
         pct = cfg["context"]["limit_pct"]
         limit = int(window * 0.95 * pct / 100)  # Codex counts the usable 95% of the window
         text = toml_set_top(text, "model_auto_compact_token_limit", str(limit),
-                            f"Daedalus: {pct}% of {model} ({window:,} tokens); dd.py setup")
-        text = toml_set_top(text, "model_post_turn_compact_threshold_percent", str(pct), "Daedalus")
+                            f"{DISPLAY_NAME}: {pct}% of {model} ({window:,} tokens); regista.py setup")
+        text = toml_set_top(text, "model_post_turn_compact_threshold_percent", str(pct), DISPLAY_NAME)
         out.append(f"Codex compacts at {limit:,} tokens ({pct}% of {model}) and after a turn past {pct}% "
                    "(.codex/config.toml).")
     if os.name == "nt":
@@ -4013,21 +4290,15 @@ def setup_codex_project(root, cfg):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         f.write(text)
+    agent = codex_agent_prefix(root)  # an old project with the old name's agents keeps them until it moves
     for role in ROLES:
-        ap = os.path.join(root, ".codex", "agents", f"daedalus-{role}.toml")
+        ap = os.path.join(root, ".codex", "agents", f"{agent}{role}.toml")
         os.makedirs(os.path.dirname(ap), exist_ok=True)
         with open(ap, "w", encoding="utf-8") as f:
-            f.write(codex_agent_toml(role))
-    out.append("Codex agents: daedalus-builder, -test-writer, -reviewer, -researcher (.codex/agents/).")
+            f.write(codex_agent_toml(role, agent))
+    out.append(f"Codex agents: {agent}builder, -test-writer, -reviewer, -researcher (.codex/agents/).")
     md = os.path.join(root, "AGENTS.md")
-    block = (f"{AGENTS_MARK[0]}\n## Daedalus harness\n\n"
-             "This project runs on the Daedalus build harness; hooks enforce its rules.\n\n"
-             "- Every session starts with a Daedalus hook adding the project state (`# Daedalus: …`) to your "
-             "context. **If you don't see it, the hooks aren't running.** Before anything else, tell the user: "
-             "in Codex, trust this project folder and the Daedalus hooks (`/hooks`); in Claude Code, enable the "
-             "daedalus plugin. Then `python <daedalus>/scripts/dd.py doctor` checks the setup.\n"
-             "- Start with `$daedalus:start` in Codex, `/daedalus:start` in Claude Code.\n"
-             f"{AGENTS_MARK[1]}\n")
+    block = agents_md_block()
     old = read(md)
     if AGENTS_MARK[0] in old:
         new = re.sub(re.escape(AGENTS_MARK[0]) + r".*?" + re.escape(AGENTS_MARK[1]) + r"\n?", block, old, flags=re.S)
@@ -4035,12 +4306,12 @@ def setup_codex_project(root, cfg):
         new = (old.rstrip() + "\n\n" if old.strip() else "") + block
     with open(md, "w", encoding="utf-8") as f:
         f.write(new)
-    out.append("AGENTS.md tells Codex what to do if the Daedalus hooks aren't running.")
+    out.append(f"AGENTS.md tells Codex what to do if the {DISPLAY_NAME} hooks aren't running.")
     return out
 
 
 def hosts_seen_path(root):
-    return p(root, ".daedalus/hosts.json")
+    return harness_path(root, "hosts.json")
 
 
 def doctor_codex(root, cfg):
@@ -4055,9 +4326,10 @@ def doctor_codex(root, cfg):
                                         f"Codex won't compact at {cfg['context']['limit_pct']}% → run "
                                         f"`{PY} \"{DD}\" setup`")
     if not shutil.which("python"):
-        bad.append("Codex starts the Daedalus hooks with `python`, which isn't on PATH → on Debian or Ubuntu "
+        bad.append(f"Codex starts the {DISPLAY_NAME} hooks with `python`, which isn't on PATH → on Debian or Ubuntu "
                    "`sudo apt install python-is-python3`; elsewhere add a `python` command for Python 3.10+")
-    missing = [r for r in ROLES if not os.path.exists(os.path.join(root, ".codex", "agents", f"daedalus-{r}.toml"))]
+    agent = codex_agent_prefix(root)  # an old project may keep the old name's agents until it moves
+    missing = [r for r in ROLES if not os.path.exists(os.path.join(root, ".codex", "agents", f"{agent}{r}.toml"))]
     (bad if missing else good).append(f"Codex agents missing: {', '.join(missing)} → run `{PY} \"{DD}\" setup`"
                                       if missing else "Codex agents: builder, test writer, reviewer, researcher")
     user = read(os.path.join(codex_home(), "config.toml"))
@@ -4068,18 +4340,17 @@ def doctor_codex(root, cfg):
     else:
         bad.append("Codex doesn't trust this folder yet → open Codex here and answer yes when it asks to trust it "
                    "(without that, .codex/ is ignored)")
-    plugin = re.search(r'\[plugins\."daedalus@[^"]*"\][^\[]*enabled\s*=\s*true', user)
-    if plugin:
-        good.append("Daedalus plugin enabled in Codex")
+    if "true" in codex_plugins(user, SLUG).values():
+        good.append(f"{DISPLAY_NAME} plugin enabled in Codex")
     else:
-        bad.append("the Daedalus plugin isn't enabled in Codex → `codex plugin marketplace add <daedalus folder>` "
-                   "then `codex plugin add daedalus@daedalus`")
+        bad.append(f"the {DISPLAY_NAME} plugin isn't enabled in Codex → `codex plugin marketplace add <{SLUG} folder>` "
+                   f"then `codex plugin add {SLUG}@{SLUG}`")
     seen = load_json(hosts_seen_path(root), {}).get("codex")
     if seen:
         info.append(f"Codex hooks last ran here {seen}")
     else:
         info.append("Codex hooks haven't run here yet. Start Codex in this folder: if it doesn't greet you with "
-                    "the Daedalus state, open /hooks and trust the Daedalus hooks (Codex skips hooks you haven't "
+                    f"the {DISPLAY_NAME} state, open /hooks and trust the {DISPLAY_NAME} hooks (Codex skips hooks you haven't "
                     "trusted, and again after they change)")
     return good, bad, info
 
@@ -4091,7 +4362,7 @@ def doctor(root, cfg):
     (good if v >= (3, 10) else bad).append(f"Python {v.major}.{v.minor}" + ("" if v >= (3, 10) else
                                                                            " is too old → install Python 3.10 or newer"))
     if os.name != "nt" and not shutil.which("sh"):
-        bad.append("no `sh` on PATH: Claude Code starts the Daedalus hooks with it → install a POSIX shell")
+        bad.append(f"no `sh` on PATH: Claude Code starts the {DISPLAY_NAME} hooks with it → install a POSIX shell")
     if git(root, "rev-parse", "--is-inside-work-tree") == "true":
         good.append("git repository")
     else:
@@ -4103,7 +4374,7 @@ def doctor(root, cfg):
         bad.append("no bash found → install Git for Windows (it brings Git Bash)" if os.name == "nt" else
                    "no bash found → install bash")
     if not cfg["gates"]:
-        bad.append("no checks configured → run setup again, or add a gate to .daedalus/config.json")
+        bad.append(f"no checks configured → run setup again, or add a gate to {harness_rel('config.json', root=root)}")
     for g in cfg["gates"]:
         run = g.get("run", "")
         if "replace with your test command" in run:
@@ -4129,13 +4400,16 @@ def doctor(root, cfg):
             bad.append(f"Claude Code won't compact at {want}% → run `{PY} \"{DD}\" setup`")
     if HOST["name"] == "claude" or load_workers(root):
         if not tool_exe("claude"):
-            info.append("no `claude` command on PATH: the overseer can't start workers (/daedalus:oversee)")
+            info.append(f"no `claude` command on PATH: the overseer can't start workers (/{SLUG}:oversee)")
         elif not tool_exe("tmux") and os.name != "nt":
             info.append("no tmux: workers run as background sessions, which Remote Control doesn't reach "
                         "(`claude attach` does) → install tmux to open workers from the Claude app")
+    warning = old_plugin_warning(root)
+    if warning:
+        bad.append(warning[0].upper() + warning[1:])
     g2, b2, i2 = doctor_codex(root, cfg) or ([], [], [])
     good, bad, info = good + g2, bad + b2, info + i2
-    log = p(root, ".daedalus/compactions.jsonl")
+    log = harness_path(root, "compactions.jsonl")
     if os.path.exists(log):
         last = read(log).strip().splitlines()[-1:]
         if last:
@@ -4155,9 +4429,9 @@ LOCAL_STATE = ["gates/last.json", "gates/history.jsonl", "gates/passed.json", "g
 
 
 def ensure_gitignore(root):
-    """.daedalus/.gitignore lists the local run state (the gate baseline and results are committed);
+    """The harness folder's .gitignore lists the local run state (the gate baseline and results are committed);
     entries added by newer versions are appended, the rest is left alone."""
-    gi = p(root, ".daedalus/.gitignore")
+    gi = harness_path(root, ".gitignore")
     text = read(gi) or "# Local run state; the gate baseline is committed.\n"
     missing = [x for x in LOCAL_STATE if x not in text.splitlines()]
     if missing:
@@ -4168,9 +4442,23 @@ def ensure_gitignore(root):
 
 # --- init -----------------------------------------------------------------------------------
 
+def template_config(text):
+    """The template config.json with its paths into the harness folder (the plan, status, board, state,
+    memory and knowledge files) set from harness_rel, so they follow PROJECT_DIR. Text that isn't valid
+    JSON (a project name with a quote in it) is left as it is."""
+    try:
+        cfg = json.loads(text)
+    except ValueError:
+        return text
+    paths = {k: DEFAULTS[k] for k in ("status_file", "board_file", "state_dir", "memory_dir", "knowledge_file")}
+    paths["plan"] = harness_rel("plan.md")
+    cfg.update({k: v for k, v in paths.items() if k in cfg})  # same keys, so the template's order stays
+    return json.dumps(cfg, indent=2, ensure_ascii=False) + "\n"
+
+
 def init(name, auto=False):
     root = os.path.abspath(os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
-    target = os.path.join(root, ".daedalus")
+    target = harness_path(root)
     if os.path.exists(os.path.join(target, "config.json")):
         sys.exit(f"{target} already has a config.json; edit it instead.")
     tpl = os.path.join(PLUGIN_ROOT, "templates")
@@ -4183,6 +4471,8 @@ def init(name, auto=False):
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             with open(src, encoding="utf-8") as f:
                 text = f.read().replace("{{PROJECT}}", name or os.path.basename(root))
+            if src == os.path.join(tpl, "config.json"):
+                text = template_config(text)
             with open(dst, "w", encoding="utf-8") as f:
                 f.write(text)
     ensure_gitignore(root)
@@ -4201,6 +4491,610 @@ def init(name, auto=False):
     print(json.dumps({"created": target, "detected": found, "hosts": lines}, indent=2, ensure_ascii=False))
 
 
+# --- migrate: move a project set up under the old name to the new folder ---------------------
+#
+# The one place that rewrites what the old name (0.8) left in a project, all of it named through the OLD_*
+# constants: the harness folder and the paths into it (config values and the live documents; history keeps its
+# old paths), the Codex agents, the AGENTS.md block, the fleet's block in git's exclude file, the plugin entry
+# in the project's Claude Code settings and the .gitignore entries. `migrate --check` lists the changes and
+# changes nothing; `migrate` refuses while a worker, a gate run or uncommitted work is in the way, and otherwise
+# makes the move as one commit. The commit hook knows such a move (folder_move).
+
+MOVE_MESSAGE = f"chore: move the harness folder to {PROJECT_DIR}"
+LIVE_DOCS = ("plan", "status_file", "board_file", "knowledge_file")  # and the memory index, MEMORY.md
+OLD_AGENTS_MARK = (f"<!-- {OLD_SLUG}:start -->", f"<!-- {OLD_SLUG}:end -->")
+OLD_ENTRY = re.compile(r"(?<![^\s/!])" + re.escape(OLD_PROJECT_DIR) + r"(?![^\s/])")  # a .gitignore entry's folder
+
+
+def moved_path(value):
+    """`value` as it reads after the move: a string starting with OLD_PROJECT_DIR/ starts with PROJECT_DIR/."""
+    old = OLD_PROJECT_DIR + "/"
+    return PROJECT_DIR + "/" + value[len(old):] if isinstance(value, str) and value.startswith(old) else value
+
+
+def moved_values(value):
+    """(`value` with every string in it, at any depth, moved by moved_path; how many changed). Dicts keep their
+    key order; other values stay as they are."""
+    if isinstance(value, str):
+        new = moved_path(value)
+        return new, int(new != value)
+    if isinstance(value, list):
+        pairs = [moved_values(v) for v in value]
+        return [v for v, _ in pairs], sum(n for _, n in pairs)
+    if isinstance(value, dict):
+        pairs = {k: moved_values(v) for k, v in value.items()}
+        return {k: v for k, (v, _) in pairs.items()}, sum(n for _, n in pairs.values())
+    return value, 0
+
+
+JSON_STRING = re.compile(r'"(?:[^"\\]|\\.)*"(\s*:)?', re.S)
+
+
+def config_text_moved(text, data):
+    """(the config's text with its values moved by moved_path; how many changed). Only the values' text changes,
+    so the file keeps its layout and git sees the move as a rename. If that can't be done exactly, the moved
+    values are written out afresh."""
+    old, n = '"' + OLD_PROJECT_DIR + "/", 0
+
+    def swap(m):
+        nonlocal n
+        if m.group(1) is not None or not m.group(0).startswith(old):  # a key, or a value that doesn't move
+            return m.group(0)
+        n += 1
+        return '"' + PROJECT_DIR + "/" + m.group(0)[len(old):]
+    new_text = JSON_STRING.sub(swap, text)
+    moved, count = moved_values(data)
+    try:
+        if n == count and json.loads(new_text) == moved:
+            return new_text, n
+    except ValueError:
+        pass
+    return json.dumps(moved, indent=2, ensure_ascii=False) + "\n", count
+
+
+def read_exact(path):
+    """A text file exactly as it is (line endings included), or None."""
+    try:
+        with open(path, encoding="utf-8", newline="") as f:
+            return f.read()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def write_exact(path, text):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        f.write(text)
+
+
+def plural(n, word):
+    return f"{n} {word}{'' if n == 1 else 's'}"
+
+
+def git_or_fail(root, *args):
+    r = subprocess.run(["git", "-C", root, *args], capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if r.returncode != 0:
+        said = "\n".join(x.strip() for x in (r.stderr, r.stdout) if x and x.strip())
+        raise RuntimeError(f"`git {' '.join(args)}` failed" + (f":\n{said}" if said else "."))
+    return r.stdout
+
+
+def tracked(root, rel):
+    return bool(git(root, "ls-files", "--", rel))
+
+
+def lock_held(path):
+    """Does another process hold the gate lock at `path`? Only looks: a missing file isn't created."""
+    if not os.path.isfile(path):
+        return False
+    try:
+        fh = open(path, "r+" if os.name == "nt" else "r")
+    except OSError:
+        return False
+    try:
+        if os.name == "nt":
+            import msvcrt
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        return False
+    except OSError:
+        return True
+    finally:
+        fh.close()
+
+
+def gitignore_moved(text):
+    """(.gitignore text with the entries that name OLD_PROJECT_DIR naming PROJECT_DIR; [(old entry, new)])."""
+    out, changed = [], []
+    for ln in text.splitlines(keepends=True):
+        new = ln if ln.lstrip().startswith("#") else OLD_ENTRY.sub(PROJECT_DIR, ln)
+        if new != ln:
+            changed.append((ln.strip(), new.strip()))
+        out.append(new)
+    return "".join(out), changed
+
+
+def exclude_moved(text):
+    """git's exclude file with the fleet's workers block for the old folder (its heading line and the folder
+    lines under it) replaced by the block the fleet writes today; None when there's no such block."""
+    heads = (f"# {OLD_DISPLAY_NAME} workers", f"# {DISPLAY_NAME} workers")
+    folders = (OLD_PROJECT_DIR + "/", PROJECT_DIR + "/")
+    lines, out, found, placed, i = text.splitlines(keepends=True), [], False, False, 0
+    while i < len(lines):
+        if lines[i].strip() not in heads:
+            out.append(lines[i])
+            i += 1
+            continue
+        j = i + 1
+        while j < len(lines) and lines[j].strip().startswith(folders):
+            j += 1
+        found = found or lines[i].strip() == heads[0] or any(x.strip().startswith(folders[0]) for x in lines[i:j])
+        if not placed:  # every workers block becomes one, where the first was
+            if out and not out[-1].endswith("\n"):
+                out[-1] += "\n"
+            out.append(exclude_block(fleet_local(None, PROJECT_DIR)))
+            placed = True
+        i = j
+    return "".join(out) if found else None
+
+
+def settings_moved(text):
+    """(Claude Code settings text with each enabledPlugins key "<OLD_SLUG>@…" switched to this plugin, keeping
+    its value and place; the old keys), or (None, []) when there's none."""
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return None, []
+    plugins = data.get("enabledPlugins") if isinstance(data, dict) else None
+    old = [k for k in plugins if k.startswith(OLD_SLUG + "@")] if isinstance(plugins, dict) else []
+    if not old:
+        return None, []
+    key, out = f"{SLUG}@{SLUG}", {}
+    for k, v in plugins.items():
+        if k in old or k == key:
+            out.setdefault(key, plugins.get(key, v))
+        else:
+            out[k] = v
+    data["enabledPlugins"] = out
+    new_text = settings_key_swapped(text, old, key)
+    try:
+        if new_text and (json.loads(new_text, object_pairs_hook=list)
+                         == json.loads(json.dumps(data), object_pairs_hook=list)):
+            return new_text, old
+    except ValueError:
+        pass
+    return json.dumps(data, indent=2, ensure_ascii=False) + "\n", old
+
+
+def settings_key_swapped(text, old_keys, key):
+    """The settings text with the top-level enabledPlugins keys in `old_keys` renamed to `key`, nothing else
+    touched (None if the text can't be read that way). settings_moved checks the result."""
+    out, stack, last_key, i = [], [], None, 0
+    while i < len(text):
+        c = text[i]
+        if c == '"':
+            m = JSON_STRING.match(text, i)
+            if not m:
+                return None
+            if m.group(1) is not None:  # a key
+                last_key = json.loads(m.group(0)[:len(m.group(0)) - len(m.group(1))])
+                if stack == [None, "enabledPlugins"] and last_key in old_keys:
+                    out.append(json.dumps(key) + m.group(1))
+                    i = m.end()
+                    continue
+            out.append(m.group(0))
+            i = m.end()
+            continue
+        if c == "{":
+            stack.append(last_key)
+        elif c == "[":
+            stack.append("[")
+            last_key = None
+        elif c in "}]":
+            if not stack:
+                return None
+            stack.pop()
+            last_key = None
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def migration_blockers(root):
+    """Why `migrate` can't run yet in the old project at `root`, in plain words (empty: it can)."""
+    w = worker_info(root)
+    if w:
+        return [f"This folder is a worker's copy of the project (the worker {w.get('name') or 'here'}). The move is "
+                f"made in the main project{' (' + w['overseer_root'] + ')' if w.get('overseer_root') else ''}, after "
+                "this worker is merged: run it there."]
+    if not git(root, "rev-parse", "--verify", "-q", "HEAD"):
+        return ["The project has no commit yet: commit it first, so the move can be one commit on top of it."]
+    workers = {}  # worker -> what still ties it to the project
+
+    def note(name, fact):
+        workers.setdefault(name, []).append(fact)
+    wt_rel = OLD_PROJECT_DIR + "/worktrees"
+    wt_dir = os.path.join(root, *wt_rel.split("/"))
+    names = {n for n in os.listdir(wt_dir) if os.path.isdir(os.path.join(wt_dir, n))} if os.path.isdir(wt_dir) else set()
+    base = os.path.realpath(wt_dir)
+    for ln in git(root, "worktree", "list", "--porcelain").splitlines():
+        if ln.startswith("worktree "):
+            rel = os.path.relpath(os.path.realpath(ln[len("worktree "):]), base)
+            if rel != "." and not rel.startswith(".."):
+                names.add(rel.split(os.sep)[0])
+    for name in sorted(names):
+        note(name, f"it still has a worktree in {wt_rel}/{name}")
+    fleet = load_workers(root)
+    for name, rec in sorted(fleet.items() if isinstance(fleet, dict) else []):
+        state = rec.get("state", "") if isinstance(rec, dict) else ""
+        if state != "removed":
+            note(name, f"the fleet still lists it ({state or 'no state'})")
+    here = git(root, "rev-parse", "--abbrev-ref", "HEAD") or "HEAD"
+    for ref in git(root, "for-each-ref", "--no-merged", "HEAD", "--format=%(refname)",
+                   "refs/heads/" + OLD_BRANCH_PREFIX.rstrip("/")).splitlines():
+        branch = ref[len("refs/heads/"):]
+        if not branch.startswith(OLD_BRANCH_PREFIX) or branch == OLD_BRANCH_PREFIX:
+            continue
+        note(branch[len(OLD_BRANCH_PREFIX):], f"its branch {branch} isn't merged into {here}")
+    out = [f"The worker {name} is still part of the project: {'; '.join(facts)}. Merge it "
+           f"(`regista.py fleet merge {name}`) or remove it (`regista.py fleet remove {name}`) first."
+           for name, facts in workers.items()]
+    common = git(root, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    locks = [harness_path(root, "gates", ".lock")]
+    locks += [os.path.join(common, OLD_GATE_LOCK), os.path.join(common, GATE_LOCK)] if common else []
+    if any(lock_held(x) for x in locks):
+        out.append("A gate run is going: wait until it finishes, then run the move again.")
+    dirty = [ln[3:] for ln in git(root, "status", "--porcelain", "--untracked-files=no", strip=False).splitlines()
+             if len(ln) > 3]
+    if dirty:
+        out.append(f"There are uncommitted changes to tracked files ({', '.join(dirty[:5])}"
+                   f"{', …' if len(dirty) > 5 else ''}): commit them or set them aside (`git stash`) first.")
+    return out
+
+
+MID_TEXT_OLD = re.compile(r"(?<![\w./\\-])" + re.escape(OLD_PROJECT_DIR + "/"))  # the folder named mid-value
+
+
+def config_hand_fixes(value, where=""):
+    """Config values migrate leaves alone though they name the old folder after their start (a gate command,
+    a note): [(the setting, as config.json key.key[index], the value)]."""
+    if isinstance(value, dict):
+        return [x for k, v in value.items() for x in config_hand_fixes(v, f"{where}.{k}" if where else str(k))]
+    if isinstance(value, list):
+        return [x for i, v in enumerate(value) for x in config_hand_fixes(v, f"{where}[{i}]")]
+    if isinstance(value, str) and MID_TEXT_OLD.search(moved_path(value)):
+        return [(f"config.json {where}".rstrip(), value)]
+    return []
+
+
+def migration_changes(root, touched=None):
+    """What `migrate` does in the old project at `root`: [(line, action)]. Each line names the file it moves,
+    changes or rewrites; each action makes the change (after the ones before it) and returns the paths to
+    commit. `touched` (if given) collects the paths outside the folder move that the actions write, as they
+    are before the move, so a failed move can put them back."""
+    old, new = OLD_PROJECT_DIR, PROJECT_DIR
+    changes, touched = [], touched if touched is not None else []
+    n = len(git(root, "ls-files", "--", old).splitlines())
+
+    def move_action():
+        git_or_fail(root, "mv", old, new)  # renames the folder itself, so everything in it moves
+        return []
+    changes.append((f"Move the folder {old}/ to {new}/ with `git mv` ({plural(n, 'tracked file')}; "
+                    "`git log --follow` keeps their history). Its untracked and ignored files (logs, run state) "
+                    "move with it.", move_action))
+
+    raw_text = read_exact(os.path.join(root, old, "config.json")) or "{}"
+    raw = json.loads(raw_text)
+    config_text, n = config_text_moved(raw_text, raw)
+    if n:
+        def config_action():
+            write_exact(os.path.join(root, new, "config.json"), config_text)
+            return [f"{new}/config.json"]
+        changes.append((f"{new}/config.json: change {plural(n, 'setting')} that start with {old}/ to start with "
+                        f"{new}/.", config_action))
+
+    cfg = with_defaults(root, raw)
+    docs = [cfg.get(k) for k in LIVE_DOCS]
+    docs.append(cfg["memory_dir"].rstrip("/") + "/MEMORY.md" if isinstance(cfg.get("memory_dir"), str) else "")
+    for rel in dict.fromkeys(d for d in docs if isinstance(d, str) and d):
+        text = read_exact(p(root, rel))
+        if not text or old + "/" not in text:
+            continue
+
+        def doc_action(rel=moved_path(rel), text=text.replace(old + "/", new + "/")):
+            write_exact(p(root, rel), text)
+            return [rel]
+        touched.append(p(root, rel))
+        changes.append((f"{moved_path(rel)}: change {plural(text.count(old + '/'), 'path')} starting with {old}/ to "
+                        f"{new}/.", doc_action))
+
+    agents = os.path.join(root, ".codex", "agents")
+    for name in sorted(os.listdir(agents)) if os.path.isdir(agents) else []:
+        m = re.fullmatch(re.escape(OLD_SLUG) + r"-(.+)\.toml", name)
+        if not m or m.group(1) not in ROLES:
+            continue
+
+        def agent_action(src=f".codex/agents/{name}", role=m.group(1)):
+            dst = f".codex/agents/{SLUG}-{role}.toml"
+            if os.path.exists(p(root, dst)):
+                git_or_fail(root, "rm", "-q", "--", src) if tracked(root, src) else os.remove(p(root, src))
+            elif tracked(root, src):
+                git_or_fail(root, "mv", src, dst)
+            else:
+                os.replace(p(root, src), p(root, dst))
+            write_exact(p(root, dst), codex_agent_toml(role))
+            return [dst]
+        touched += [os.path.join(agents, name), os.path.join(agents, f"{SLUG}-{m.group(1)}.toml")]
+        changes.append((f".codex/agents/{name}: rename it to {SLUG}-{m.group(1)}.toml and rewrite it as "
+                        "`regista.py setup` writes it today.", agent_action))
+
+    md = read_exact(os.path.join(root, "AGENTS.md"))
+    if md and OLD_AGENTS_MARK[0] in md:
+        block = re.compile(re.escape(OLD_AGENTS_MARK[0]) + r".*?" + re.escape(OLD_AGENTS_MARK[1]) + r"\r?\n?", re.S)
+        new_md = block.sub(lambda _: "" if AGENTS_MARK[0] in md else agents_md_block(), md, count=1)
+        new_md = block.sub("", new_md)
+        if new_md != md:
+            touched.append(os.path.join(root, "AGENTS.md"))
+            changes.append((f"AGENTS.md: replace the {OLD_DISPLAY_NAME} block with the {DISPLAY_NAME} block "
+                            "`regista.py setup` writes today; the rest of the file stays as it is.",
+                            lambda: write_exact(os.path.join(root, "AGENTS.md"), new_md) or ["AGENTS.md"]))
+
+    common = git(root, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    exclude = os.path.join(common, "info", "exclude") if common else ""
+    text = read_exact(exclude) if exclude else None
+    new_exclude = exclude_moved(text) if text else None
+    if new_exclude is not None:
+        touched.append(exclude)
+        changes.append((f"{rel_to_root(root, exclude) or exclude}: replace the workers block that names {old}/ with "
+                        f"the '# {DISPLAY_NAME} workers' block the fleet writes today (git doesn't track this file, "
+                        "so it isn't part of the commit).", lambda: write_exact(exclude, new_exclude) or []))
+
+    for rel in (".claude/settings.json", ".claude/settings.local.json"):
+        text = read_exact(p(root, rel))
+        new_text, keys = settings_moved(text) if text else (None, [])
+        if new_text:
+            touched.append(p(root, rel))
+            changes.append((f"{rel}: switch the plugin {', '.join(keys)} to {SLUG}@{SLUG}, keeping its setting.",
+                            lambda rel=rel, new_text=new_text: write_exact(p(root, rel), new_text) or [rel]))
+
+    text = read_exact(os.path.join(root, ".gitignore"))
+    ignore_text, entries = gitignore_moved(text) if text else (None, [])
+    if entries:
+        touched.append(os.path.join(root, ".gitignore"))
+        changes.append((".gitignore: change " + ", ".join(f"{a} to {b}" for a, b in entries[:5])
+                        + (", …" if len(entries) > 5 else "") + ".",
+                        lambda: write_exact(os.path.join(root, ".gitignore"), ignore_text) or [".gitignore"]))
+    changes.append((f"Commit all of it as one commit, \"{MOVE_MESSAGE}\".", lambda: []))
+    return changes
+
+
+def half_moved(root):
+    """Was a move started and not committed? The new folder is there while the last commit has the old
+    folder's config and not the new one's."""
+    return (bool(root) and os.path.isdir(os.path.join(root, PROJECT_DIR))
+            and bool(git(root, "rev-parse", "--verify", "-q", f"HEAD:{OLD_PROJECT_DIR}/config.json"))
+            and not git(root, "rev-parse", "--verify", "-q", f"HEAD:{PROJECT_DIR}/config.json"))
+
+
+def half_moved_text(root):
+    """What to do about a move started and not committed in the project at `root`: finish it, or undo every
+    change migrate makes (the folder, AGENTS.md, .gitignore, the settings, the Codex agent files, the exclude
+    file), so that a new `regista.py migrate` isn't refused for uncommitted changes."""
+    old, new = OLD_PROJECT_DIR, PROJECT_DIR
+    hosts = ["AGENTS.md", ".gitignore", ".claude/settings.json", ".codex/agents"]
+    in_head = git(root, "ls-tree", "-r", "--name-only", "HEAD", "--", *hosts).splitlines()
+    restore = [x for x in in_head if not x.startswith(".codex/")
+               or re.fullmatch(r"\.codex/agents/" + re.escape(OLD_SLUG) + r"-[^/]+\.toml", x)]
+    added = [f".codex/agents/{SLUG}-{role}.toml" for role in ROLES
+             if f".codex/agents/{SLUG}-{role}.toml" not in in_head
+             and os.path.isfile(p(root, f".codex/agents/{SLUG}-{role}.toml"))]
+    common = git(root, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    exclude = rel_to_root(root, os.path.join(common, "info", "exclude")) if common else None
+    exclude = exclude or (os.path.join(common, "info", "exclude") if common else ".git/info/exclude")
+    steps = [f"git reset -q -- {old} {new} {' '.join(hosts)}",
+             f"mv {new} {old}   # if a {old}/ folder is also there, move what's in {new}/ into it, then remove {new}/"]
+    if added:
+        steps.append("rm -f " + " ".join(added))
+    steps.append("git checkout HEAD -- " + " ".join([old] + restore))
+    return (f"A move from {old}/ to {new}/ was started and not committed: the last commit still has {old}/config.json "
+            f"and not {new}/config.json, but the {new}/ folder is here. Finish it or undo it before anything else:\n"
+            f"- to finish it, check `git status`, then commit the move: `git add -A -- {old} {new}` and "
+            f"`git commit -m \"{MOVE_MESSAGE}\"`;\n"
+            f"- to undo it, run these commands in the project folder. They unstage the move, put the folder back, "
+            f"and restore from the last commit the files a move changes (the folder's tracked files, AGENTS.md, "
+            f".gitignore, .claude/settings.json and the Codex agent files in .codex/agents/), dropping their "
+            f"uncommitted changes:\n"
+            + "".join(f"    {s}\n" for s in steps)
+            + f"  Then fix by hand the two files git doesn't track: in .claude/settings.local.json (if you have one), "
+              f"switch the plugin key {SLUG}@{SLUG} back to the {OLD_SLUG}@... key it had; and in git's exclude file "
+              f"({exclude}), change the '# {DISPLAY_NAME} workers' line back to '# {OLD_DISPLAY_NAME} workers' and the "
+              f"{new}/ lines under it back to {old}/. Then run `regista.py migrate` again.")
+
+
+def snapshot_files(paths):
+    """{path: (bytes, mode) or None when there's no file} for the files a failed move puts back."""
+    out = {}
+    for path in dict.fromkeys(paths):
+        try:
+            with open(path, "rb") as f:
+                out[path] = (f.read(), os.stat(path).st_mode)
+        except OSError:
+            out[path] = None
+    return out
+
+
+def merge_back(src, dst):
+    """Move everything in the folder `src` into the folder `dst` (files, symlinks as they are, empty folders),
+    then remove `src`. A folder missing from `dst` moves whole."""
+    for name in os.listdir(src):
+        s, d = os.path.join(src, name), os.path.join(dst, name)
+        if os.path.isdir(s) and not os.path.islink(s) and os.path.isdir(d) and not os.path.islink(d):
+            merge_back(s, d)
+        else:
+            os.replace(s, d)
+    os.rmdir(src)
+
+
+def untracked_fingerprints(root):
+    """{path: (size, mtime_ns)} for the untracked files in the project and the ignored ones in the old folder:
+    migrate doesn't save their contents, so a failed move can only tell which of them changed meanwhile."""
+    tracked_files = set(git(root, "ls-files", "-z", "--", OLD_PROJECT_DIR, strip=False).split("\0"))
+    rels = [x for x in git(root, "ls-files", "--others", "--exclude-standard", "-z", strip=False).split("\0") if x]
+    for dirpath, _, names in os.walk(os.path.join(root, OLD_PROJECT_DIR)):
+        rels += [os.path.relpath(os.path.join(dirpath, n), root).replace(os.sep, "/") for n in names]
+    out = {}
+    for rel in dict.fromkeys(rels):
+        if rel in tracked_files:
+            continue
+        try:
+            st = os.lstat(p(root, rel))
+        except OSError:
+            continue
+        out[rel] = (st.st_size, st.st_mtime_ns)
+    return out
+
+
+def undo_move(root, head, index_path, index, files, untracked=None):
+    """Put an old project back as it was before a failed `migrate`: the folder (every file in it, ignored ones
+    included), the files the move rewrote, the index and HEAD. The tracked files in the folder go back to the
+    last commit (migrate only runs when they match it), so an edit made meanwhile (say by the project's
+    pre-commit hook) is undone too. Returns what couldn't be put back, in plain words (empty: everything was)."""
+    old_dir, new_dir = os.path.join(root, OLD_PROJECT_DIR), os.path.join(root, PROJECT_DIR)
+    if os.path.isdir(new_dir):
+        if not os.path.exists(old_dir):
+            os.rename(new_dir, old_dir)
+        else:  # the folder only partly moved: bring everything back, symlinks and empty folders included
+            merge_back(new_dir, old_dir)
+    for path, saved in files.items():
+        if saved is None:
+            if os.path.isfile(path):
+                os.remove(path)
+            continue
+        data, mode = saved
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(data)
+        os.chmod(path, mode & 0o7777)
+    if git(root, "rev-parse", "--verify", "-q", "HEAD") != head:
+        git_or_fail(root, "reset", "-q", "--soft", head)
+    if index is None:
+        if os.path.isfile(index_path):
+            os.remove(index_path)
+    else:
+        with open(index_path, "wb") as f:
+            f.write(index)
+    changed = git(root, "diff", "--name-only", "-z", "--", OLD_PROJECT_DIR, strip=False).split("\0")
+    changed = [x for x in changed if x]
+    if changed:
+        git_or_fail(root, "checkout", "-q", "--", *changed)
+    left = []
+    saved = {os.path.normcase(os.path.abspath(x)) for x in files}
+    others = [x for x in git(root, "diff", "--name-only", "-z", strip=False).split("\0")
+              if x and os.path.normcase(os.path.abspath(p(root, x))) not in saved]
+    if others:
+        left.append("these tracked files changed while the move ran and were left as they are now: "
+                    + ", ".join(others[:10]) + (", …" if len(others) > 10 else ""))
+    if untracked is None:
+        return left
+    now = {k: v for k, v in untracked_fingerprints(root).items()
+           if os.path.normcase(os.path.abspath(p(root, k))) not in saved}  # those were put back from their copies
+    before = {k: v for k, v in untracked.items() if os.path.normcase(os.path.abspath(p(root, k))) not in saved}
+    for label, names in (("changed while the move ran (migrate doesn't keep a copy of them)",
+                          [x for x in before if x in now and now[x] != before[x]]),
+                         ("were deleted while the move ran", [x for x in before if x not in now]),
+                         ("were added while the move ran and were left there", [x for x in now if x not in before])):
+        if names:
+            left.append(f"these untracked files {label}: "
+                        + ", ".join(sorted(names)[:10]) + (", …" if len(names) > 10 else ""))
+    return left
+
+
+def migrate(check=False):
+    """`regista.py migrate [--check]`: 0 when the move was made (or could be), 1 when it can't be."""
+    root = find_root()
+    if not root or not is_old_project(root):
+        top = root or git(os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd(), "rev-parse", "--show-toplevel")
+        if top and half_moved(top):
+            print(half_moved_text(top))
+            return 1
+    if not root:
+        print(f"This folder isn't a {DISPLAY_NAME} project: there's no {PROJECT_DIR}/ or {OLD_PROJECT_DIR}/ folder "
+              "with a config.json here or above.")
+        return 1
+    if not is_old_project(root):
+        print(f"This project already uses {PROJECT_DIR}/: nothing to do.")
+        return 0
+    use_project(root)
+    blockers = migration_blockers(root)
+    if worker_info(root):
+        print("\n".join(blockers))
+        return 1
+    touched = []
+    changes = migration_changes(root, touched)
+    try:
+        fixes = config_hand_fixes(json.loads(read_exact(os.path.join(root, OLD_PROJECT_DIR, "config.json")) or "{}"))
+    except ValueError:
+        fixes = []
+    by_hand = ("" if not fixes else
+               f"\nThese settings name {OLD_PROJECT_DIR}/ after their start, so the move leaves them as they are; "
+               f"change them by hand afterwards:\n" + "\n".join(f"- {where}: {value}" for where, value in fixes))
+    history = ("History keeps its old paths: handoffs, research notes, reviews, gate logs and specs aren't "
+               "changed.")
+    if check:
+        print(f"Moving this project from {OLD_PROJECT_DIR}/ to {PROJECT_DIR}/ makes these changes:")
+        print("\n".join("- " + line for line, _ in changes))
+        print(history + by_hand)
+        if blockers:
+            print("\nThe move can't be made yet:\n" + "\n".join("- " + b for b in blockers))
+            return 1
+        print("\nNothing is in the way: `regista.py migrate` makes the move.")
+        return 0
+    if blockers:
+        print(f"The project stays in {OLD_PROJECT_DIR}/ for now; nothing was changed:\n"
+              + "\n".join("- " + b for b in blockers))
+        return 1
+    head = git(root, "rev-parse", "--verify", "-q", "HEAD")
+    index_path = os.path.join(root, git(root, "rev-parse", "--git-path", "index"))
+    index = snapshot_files([index_path])[index_path]
+    saved = snapshot_files(touched + [os.path.join(root, OLD_PROJECT_DIR, "config.json")])
+    untracked = untracked_fingerprints(root)
+    staged = []
+    try:
+        for _, action in changes:
+            staged += action() or []
+        paths = [x for x in dict.fromkeys(staged) if tracked(root, x)]
+        if paths:
+            git_or_fail(root, "add", "--", *paths)
+        git_or_fail(root, "commit", "-q", "-m", MOVE_MESSAGE)
+    except (Exception, KeyboardInterrupt) as e:  # noqa: BLE001 — whatever stopped it, put everything back
+        what = str(e) or type(e).__name__
+        try:
+            left = undo_move(root, head, index_path, index[0] if index else None, saved, untracked)
+        except Exception as undo_error:  # noqa: BLE001
+            print(f"The move failed: {what}\nPutting the project back as it was failed too: {undo_error}\n"
+                  + half_moved_text(root))
+            return 1
+        if left:
+            print(f"The move failed, so the project was put back in {OLD_PROJECT_DIR}/ (the folder, the index, the "
+                  "last commit, git's exclude file and the files the move rewrote are as before), except for what "
+                  "changed while the move ran:\n" + "\n".join("- " + x for x in left)
+                  + f"\nCheck those files. What failed:\n{what}\nFix that, then run `regista.py migrate` again.")
+            return 1
+        print(f"The move failed, so the project was put back as it was, still in {OLD_PROJECT_DIR}/ (its files, "
+              f"the index, the last commit and git's exclude file are as before). What failed:\n{what}\n"
+              f"Fix that, then run `regista.py migrate` again.")
+        return 1
+    print(f"This project now uses {PROJECT_DIR}/. One commit, \"{MOVE_MESSAGE}\", holds the move:\n"
+          + "\n".join("- " + line for line, _ in changes[:-1]) + by_hand)
+    return 0
+
+
 # --- main -----------------------------------------------------------------------------------
 
 def main():
@@ -4212,6 +5106,8 @@ def main():
     sub.add_parser("detect", help="propose gates, roles and protected paths from the project files (JSON)")
     sub.add_parser("setup", help="write the agent hosts' settings for this project (compaction)")
     sub.add_parser("doctor", help="check that the harness works here, in plain language")
+    mg = sub.add_parser("migrate", help=f"move a project from {OLD_PROJECT_DIR}/ to {PROJECT_DIR}/ in one commit")
+    mg.add_argument("--check", action="store_true", help="list the changes and what's in the way; change nothing")
     sub.add_parser("resume")
     sub.add_parser("status")
     g = sub.add_parser("gate")
@@ -4221,7 +5117,7 @@ def main():
     g.add_argument("--fresh", action="store_true", help="run every gate even if it passed on exactly these files")
     s = sub.add_parser("snapshot")
     s.add_argument("--reason", default="manual")
-    sub.add_parser("review-record", help="the reviewer agent: validate and stamp .daedalus/reviews/draft.json")
+    sub.add_parser("review-record", help=f"the reviewer agent: validate and stamp {review_draft()}")
     sub.add_parser("requirements", help="every requirement: verify kind, coverage, pass/fail (from the gates)")
     ms = sub.add_parser("milestone", help="is this milestone's gate met? (exit 0 = done)")
     ms.add_argument("name")
@@ -4260,7 +5156,7 @@ def main():
     k.add_argument("event", choices=["session-start", "pre-tool", "pre-bash", "pre-edit", "user-prompt", "stop",
                                          "user-prompt-expansion", "subagent-start", "subagent-stop", "pre-compact",
                                          "session-end"])
-    k.add_argument("--host", choices=["claude", "codex"], default=os.environ.get("DAEDALUS_HOST") or "claude",
+    k.add_argument("--host", choices=["claude", "codex"], default=env_value("HOST") or "claude",
                    help="the agent running the hook (default claude)")
     a = ap.parse_args()
 
@@ -4271,6 +5167,8 @@ def main():
     if a.cmd == "init":
         init(a.name, a.auto)
         return
+    if a.cmd == "migrate":
+        sys.exit(migrate(a.check))
     if a.cmd == "detect":
         print(json.dumps(detect(find_root() or os.path.abspath(os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())),
                          indent=2, ensure_ascii=False))
@@ -4288,14 +5186,15 @@ def main():
         return
     root = find_root()
     if not root:
-        sys.exit("No .daedalus/config.json here or above. Run `/daedalus:init` (or `dd.py init`) first.")
+        sys.exit(f"No {harness_rel('config.json')} here or above. Run `/{SLUG}:init` (or `regista.py init`) first.")
+    use_project(root)
     cfg = load_config(root)
     if a.cmd in ("resume", "status"):
         print(resume_text(root, cfg, detailed=a.cmd == "status"))
     elif a.cmd == "gate":
         gates = select_gates(cfg, names=a.names or None, include_manual=a.all)
         if not gates:
-            sys.exit("No gates selected. Configure them in .daedalus/config.json → gates.")
+            sys.exit(f"No gates selected. Configure them in {harness_rel('config.json', root=root)} → gates.")
         results = run_gates(root, cfg, gates, accept=a.accept, reuse=not a.fresh)
         print(format_results(results))
         pending = work_changes(root, cfg)
@@ -4320,7 +5219,7 @@ def main():
                 if r.get("verify") == "manual":
                     where = (f"checked by the user on {st.get('at', '')[:10]}" if st.get("passes") else
                              f"the user reported a problem on {st.get('at', '')[:10]}" if st.get("by") else
-                             "waits for the user (`dd.py try`)")
+                             "waits for the user (`regista.py try`)")
                 else:
                     where = ", ".join(c.get("tests", []) + c.get("e2e", [])) or "not covered by any test yet"
                 print(f"  {'PASS' if st.get('passes') else 'open'}  {r['id']:<14} {r.get('verify', 'test'):<6} {where}")
@@ -4353,7 +5252,7 @@ def main():
             items = load_json(changes_path(root), [])
             hit = next((c for c in items if a.what and str(c.get("n")) == a.what[0]), None)
             if not hit:
-                sys.exit(f"No change {' '.join(a.what)}. `dd.py change` lists them.")
+                sys.exit(f"No change {' '.join(a.what)}. `regista.py change` lists them.")
             hit.update(state="planned", where=a.where, planned=dt.datetime.now().isoformat(timespec="minutes"))
             save_json(changes_path(root), items)
             print(f"Change {hit['n']} is in the plan" + (f" ({a.where})." if a.where else "."))
@@ -4380,7 +5279,7 @@ def main():
             print(fleet_show(root, a.target))
             return
         if a.action != "spawn" and not a.target:
-            sys.exit(f"Name the worker: `dd.py fleet {a.action} <name>` (`dd.py fleet` lists them).")
+            sys.exit(f"Name the worker: `regista.py fleet {a.action} <name>` (`regista.py fleet` lists them).")
         if a.action == "spawn":
             is_m = bool(re.fullmatch(r"M\d+[a-z]?", a.target or "", re.I))
             ok, lines = fleet_spawn(root, cfg, milestone=a.target if is_m else "",
@@ -4399,7 +5298,7 @@ def main():
         specs, _ = load_specs(root)
         req = next((r for s in specs for r in s.get("requirements") or [] if r.get("id") == a.id), None)
         if not req or req.get("verify") != "manual":
-            sys.exit(f"{a.id} isn't a manual requirement in .daedalus/specs/.")
+            sys.exit(f"{a.id} isn't a manual requirement in {harness_rel('specs', root=root)}/.")
         record_manual(root, a.id, not a.fail, a.note, "user")
         print(f"{a.id}: recorded as {'failing' if a.fail else 'verified'}.")
     elif a.cmd == "try":

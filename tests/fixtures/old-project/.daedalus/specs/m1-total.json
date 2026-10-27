@@ -1,0 +1,14 @@
+{
+  "step": "m1-total",
+  "milestone": "M1",
+  "title": "Add up the numbers",
+  "state": "active",
+  "interface": "tally.total(numbers) -> int; python3 tally.py 2 3 4 prints 9. Plan: .daedalus/plan.md, M1.",
+  "requirements": [
+    {
+      "id": "TALLY-1",
+      "text": "WHEN tally.total gets a list of whole numbers, it SHALL return their sum, and 0 for an empty list.",
+      "verify": "test"
+    }
+  ]
+}

@@ -1,5 +1,6 @@
 """End-to-end tests: each hook is driven the way Claude Code drives it (JSON on stdin), against a
 throwaway git repo. Run: python -m unittest discover -s tests -v"""
+import atexit
 import json
 import os
 import shutil
@@ -8,10 +9,17 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
-DD = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scripts", "dd.py"))
-sys.path.insert(0, os.path.dirname(DD))
-import dd  # noqa: E402
+# Never read this machine's home folder: its ~/.claude/settings.json may enable the old plugin, and the warning
+# about that would show up in unrelated hook answers. Every tool run these tests start inherits this home.
+TEST_HOME = tempfile.mkdtemp(prefix="regista-home-")
+atexit.register(shutil.rmtree, TEST_HOME, True)
+os.environ.update(HOME=TEST_HOME, CODEX_HOME=os.path.join(TEST_HOME, ".codex"))
+
+TOOL = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scripts", "regista.py"))
+sys.path.insert(0, os.path.dirname(TOOL))
+import regista  # noqa: E402
 
 PY = sys.executable
 
@@ -22,13 +30,13 @@ def sh(cwd, *args):
 
 class Project:
     def __init__(self, gates=None, protected=None, **cfg):
-        self.root = tempfile.mkdtemp(prefix="dd-test-")
+        self.root = tempfile.mkdtemp(prefix="regista-test-")
         sh(self.root, "git", "init", "-q", "-b", "main")
         sh(self.root, "git", "config", "user.email", "t@example.com")
         sh(self.root, "git", "config", "user.name", "T")
         env = {**os.environ, "CLAUDE_PROJECT_DIR": self.root}
-        subprocess.run([PY, DD, "init", "--name", "Demo"], cwd=self.root, env=env, check=True, capture_output=True)
-        path = os.path.join(self.root, ".daedalus", "config.json")
+        subprocess.run([PY, TOOL, "init", "--name", "Demo"], cwd=self.root, env=env, check=True, capture_output=True)
+        path = os.path.join(self.root, ".regista", "config.json")
         with open(path, encoding="utf-8") as f:
             c = json.load(f)
         c.update(gates=gates or [], protected=protected or [], **cfg)
@@ -53,12 +61,13 @@ class Project:
         data = {"cwd": self.root, **(payload or {})}
         env = {k: v for k, v in os.environ.items() if k != "CLAUDE_PROJECT_DIR"}
         env.update(extra_env or {})
-        r = subprocess.run([PY, DD, "hook", event, *(["--host", host] if host else [])], input=json.dumps(data),
-                           capture_output=True, text=True, encoding="utf-8", env=env)
+        cwd = data["cwd"] if os.path.isdir(str(data["cwd"])) else self.root  # never the repository itself
+        r = subprocess.run([PY, TOOL, "hook", event, *(["--host", host] if host else [])], input=json.dumps(data),
+                           capture_output=True, text=True, encoding="utf-8", env=env, cwd=cwd)
         return json.loads(r.stdout) if r.stdout.strip() else None
 
     def cli(self, *args):
-        return subprocess.run([PY, DD, *args], cwd=self.root, capture_output=True, text=True, encoding="utf-8")
+        return subprocess.run([PY, TOOL, *args], cwd=self.root, capture_output=True, text=True, encoding="utf-8")
 
     def cleanup(self):
         shutil.rmtree(self.root, ignore_errors=True)
@@ -72,23 +81,44 @@ def decision(out):
     return (out or {}).get("hookSpecificOutput", {}).get("permissionDecision")
 
 
+def clean_env(**extra):
+    """A subprocess environment without CLAUDE_PROJECT_DIR or any harness variable (new or old name), with the
+    test home folder instead of the real one, plus extra."""
+    env = {k: v for k, v in os.environ.items()
+           if k != "CLAUDE_PROJECT_DIR" and not k.startswith(("REGISTA_", "DAEDALUS_"))}
+    env.update(HOME=TEST_HOME, CODEX_HOME=os.path.join(TEST_HOME, ".codex"))
+    env.update(extra)
+    return env
+
+
+def clean_environ(**extra):
+    """This process's environment cleaned the same way, so helpers that copy os.environ start clean too."""
+    return mock.patch.dict(os.environ, clean_env(**extra), clear=True)
+
+
+def env_gate(out):
+    """A gate that writes the worker and slot it sees, under the new and the old names, to the file out."""
+    return {"name": "env", "run": 'printf "W=%s S=%s OW=%s OS=%s" "${REGISTA_WORKER-unset}" "${REGISTA_SLOT-unset}" '
+                                  f'"${{DAEDALUS_WORKER-unset}}" "${{DAEDALUS_SLOT-unset}}" > "{out}"'}
+
+
 class Globs(unittest.TestCase):
     def test_patterns(self):
-        self.assertTrue(dd.matches("accuracy/truth/a.json", ["accuracy/truth/**"]))
-        self.assertTrue(dd.matches("accuracy/truth/x/y.json", ["accuracy/truth/"]))
-        self.assertFalse(dd.matches("accuracy/results/a.json", ["accuracy/truth/**"]))
-        self.assertTrue(dd.matches("deep/dir/.env", [".env"]))
-        self.assertTrue(dd.matches(".env", [".env"]))  # a root dotfile keeps its dot
-        self.assertTrue(dd.matches("./.env", [".env"]))
-        self.assertFalse(dd.matches(".env", ["env"]))
-        self.assertTrue(dd.matches("src/geo/a.py", ["src/**/*.py"]))
-        self.assertFalse(dd.matches("src/geo/a.txt", ["src/**/*.py"]))
-        self.assertTrue(dd.matches("eval/labels/1.csv", ["eval/labels/*"]))
+        self.assertTrue(regista.matches("accuracy/truth/a.json", ["accuracy/truth/**"]))
+        self.assertTrue(regista.matches("accuracy/truth/x/y.json", ["accuracy/truth/"]))
+        self.assertFalse(regista.matches("accuracy/results/a.json", ["accuracy/truth/**"]))
+        self.assertTrue(regista.matches("deep/dir/.env", [".env"]))
+        self.assertTrue(regista.matches(".env", [".env"]))  # a root dotfile keeps its dot
+        self.assertTrue(regista.matches("./.env", [".env"]))
+        self.assertFalse(regista.matches(".env", ["env"]))
+        self.assertTrue(regista.matches("src/geo/a.py", ["src/**/*.py"]))
+        self.assertFalse(regista.matches("src/geo/a.txt", ["src/**/*.py"]))
+        self.assertTrue(regista.matches("eval/labels/1.csv", ["eval/labels/*"]))
 
     def test_last_json(self):
-        self.assertEqual(dd.last_json('noise\n{"a": 1}\n'), {"a": 1})
-        self.assertEqual(dd.last_json('x\n{"a": 2, "b": 3}'), {"a": 2, "b": 3})
-        self.assertIsNone(dd.last_json("no json here"))
+        self.assertEqual(regista.last_json('noise\n{"a": 1}\n'), {"a": 1})
+        self.assertEqual(regista.last_json('x\n{"a": 2, "b": 3}'), {"a": 2, "b": 3})
+        self.assertIsNone(regista.last_json("no json here"))
 
 
 class Hooks(unittest.TestCase):
@@ -99,8 +129,8 @@ class Hooks(unittest.TestCase):
     def test_outside_project_is_silent(self):
         empty = tempfile.mkdtemp()
         try:
-            r = subprocess.run([PY, DD, "hook", "pre-bash"], input=json.dumps({"cwd": empty, **bash("git commit -m x")}),
-                               capture_output=True, text=True, env={k: v for k, v in os.environ.items() if k != "CLAUDE_PROJECT_DIR"})
+            r = subprocess.run([PY, TOOL, "hook", "pre-bash"], input=json.dumps({"cwd": empty, **bash("git commit -m x")}),
+                               capture_output=True, text=True, cwd=empty, env={k: v for k, v in os.environ.items() if k != "CLAUDE_PROJECT_DIR"})
             self.assertEqual(r.returncode, 0)
             self.assertEqual(r.stdout.strip(), "")
         finally:
@@ -131,9 +161,11 @@ class Hooks(unittest.TestCase):
         finally:
             shutil.rmtree(other)
 
-    def test_push_asks(self):
+    def test_push_asks(self):  # covers: CODE-3
         self.p = Project()
-        self.assertEqual(decision(self.p.hook("pre-bash", bash("git push origin main"))), "ask")
+        out = self.p.hook("pre-bash", bash("git push origin main"))
+        self.assertEqual(decision(out), "ask")
+        self.assertTrue(out["hookSpecificOutput"]["permissionDecisionReason"].startswith("Regista: "), out)
 
     def test_push_block(self):
         self.p = Project(push="block")
@@ -144,10 +176,12 @@ class Hooks(unittest.TestCase):
         out = self.p.hook("pre-bash", {"tool_name": "PowerShell", "tool_input": {"command": "git commit -m x"}})
         self.assertEqual(decision(out), "deny")
 
-    def test_protected_edit_denied(self):
+    def test_protected_edit_denied(self):  # covers: CODE-3
         self.p = Project(protected=["accuracy/truth/**"])
         path = os.path.join(self.p.root, "accuracy", "truth", "a.json")
-        self.assertEqual(decision(self.p.hook("pre-edit", {"tool_name": "Write", "tool_input": {"file_path": path}})), "deny")
+        out = self.p.hook("pre-edit", {"tool_name": "Write", "tool_input": {"file_path": path}})
+        self.assertEqual(decision(out), "deny")
+        self.assertTrue(out["hookSpecificOutput"]["permissionDecisionReason"].startswith("Regista: "), out)
         ok = os.path.join(self.p.root, "src", "a.py")
         self.assertIsNone(self.p.hook("pre-edit", {"tool_name": "Edit", "tool_input": {"file_path": ok}}))
 
@@ -159,7 +193,7 @@ class Hooks(unittest.TestCase):
 
     def test_baseline_edit_denied(self):
         self.p = Project()
-        path = os.path.join(self.p.root, ".daedalus", "gates", "baseline.json")
+        path = os.path.join(self.p.root, ".regista", "gates", "baseline.json")
         self.assertEqual(decision(self.p.hook("pre-edit", {"tool_name": "Write", "tool_input": {"file_path": path}})), "deny")
 
     def test_metric_gate_thresholds_and_no_regression(self):
@@ -192,7 +226,7 @@ class Hooks(unittest.TestCase):
 
     def test_stop_blocks_unsaved_commits_once(self):
         self.p = Project()
-        self.p.write(".daedalus/state/2026-01-01-first.md", "# h\n## Resume point\nstart\n")
+        self.p.write(".regista/state/2026-01-01-first.md", "# h\n## Resume point\nstart\n")
         time.sleep(1.1)
         self.p.commit("src/a.py", "x = 1", "feat: a")
         out = self.p.hook("stop", {"stop_hook_active": False})
@@ -204,10 +238,10 @@ class Hooks(unittest.TestCase):
         self.p = Project()
         self.p.commit("src/a.py", "x = 1", "feat: a")
         time.sleep(1.1)
-        self.p.write(".daedalus/state/2026-01-02-save.md", "# h\n## Resume point\nnext\n")
+        self.p.write(".regista/state/2026-01-02-save.md", "# h\n## Resume point\nnext\n")
         self.assertIsNone(self.p.hook("stop", {}))
         time.sleep(1.1)
-        self.p.commit(".daedalus/status.md", "updated", "docs: save")  # committing the save itself
+        self.p.commit(".regista/status.md", "updated", "docs: save")  # committing the save itself
         self.assertIsNone(self.p.hook("stop", {}))
 
     def test_stop_remind_mode(self):
@@ -217,32 +251,37 @@ class Hooks(unittest.TestCase):
         self.assertNotIn("decision", out)
         self.assertIn("systemMessage", out)
 
-    def test_session_start_context(self):
+    def test_session_start_context(self):  # covers: CODE-3
         self.p = Project()
-        self.p.write(".daedalus/state/2026-01-03-x.md", "# h\n## Resume point\nWire the exporter.\n## Blocked on\n- nothing\n")
+        self.p.write(".regista/state/2026-01-03-x.md", "# h\n## Resume point\nWire the exporter.\n## Blocked on\n- nothing\n")
         out = self.p.hook("session-start", {"source": "startup"})
         ctx = out["hookSpecificOutput"]["additionalContext"]
         self.assertIn("Wire the exporter.", ctx)
-        self.assertIn("dd.py", ctx)
+        self.assertIn("regista.py", ctx)
+        self.assertIn("runs on the Regista harness", ctx)
+        self.assertIn("Regista CLI", ctx)
+        self.assertNotIn("Daedalus", ctx)
+        self.assertNotIn("/daedalus:", ctx)
+        self.assertNotIn("dd.py", ctx)
         self.assertLess(len(ctx), 10000)
         out = self.p.hook("session-start", {"source": "compact"})
         self.assertIn("compacted", out["hookSpecificOutput"]["additionalContext"])
 
     def test_snapshot_at_session_end(self):
         self.p = Project()
-        self.p.write(".daedalus/state/2026-01-04-x.md", "# h\n")
+        self.p.write(".regista/state/2026-01-04-x.md", "# h\n")
         time.sleep(1.1)
         self.p.commit("src/b.py", "y = 2", "feat: b")
         self.p.hook("session-end", {"reason": "exit"})
-        autos = [f for f in os.listdir(os.path.join(self.p.root, ".daedalus", "state")) if "-auto-" in f]
+        autos = [f for f in os.listdir(os.path.join(self.p.root, ".regista", "state")) if "-auto-" in f]
         self.assertEqual(len(autos), 1)
         self.p.hook("session-end", {"reason": "exit"})  # nothing new: no second snapshot
-        autos = [f for f in os.listdir(os.path.join(self.p.root, ".daedalus", "state")) if "-auto-" in f]
+        autos = [f for f in os.listdir(os.path.join(self.p.root, ".regista", "state")) if "-auto-" in f]
         self.assertEqual(len(autos), 1)
 
     def test_state_readme_is_not_a_handoff(self):
         self.p = Project()
-        self.assertIsNone(dd.newest_handoff(self.p.root, dd.load_config(self.p.root)))
+        self.assertIsNone(regista.newest_handoff(self.p.root, regista.load_config(self.p.root)))
 
 
 def transcript(path, tokens, model="claude-sonnet-4-6"):
@@ -286,20 +325,20 @@ class ContextBudget(unittest.TestCase):
         return self.call("pre-tool", tokens, tool_name=name, tool_input=ti)
 
     def test_window_from_model(self):
-        cfg = dd.load_config(self.p.root)
-        self.assertEqual(dd.context_window(cfg, 1000, "claude-opus-5-5"), 1_000_000)
-        self.assertEqual(dd.context_window(cfg, 1000, "claude-sonnet-5-5"), 1_000_000)
-        self.assertEqual(dd.context_window(cfg, 1000, "claude-fable-5-1"), 1_000_000)
-        self.assertEqual(dd.context_window(cfg, 1000, "claude-opus-4-7"), 1_000_000)
-        self.assertEqual(dd.context_window(cfg, 1000, "claude-opus-4-6"), 200_000)
-        self.assertEqual(dd.context_window(cfg, 1000, "claude-opus-4-6[1m]"), 1_000_000)
-        self.assertEqual(dd.context_window(cfg, 250_000, "unknown-model"), 1_000_000)
+        cfg = regista.load_config(self.p.root)
+        self.assertEqual(regista.context_window(cfg, 1000, "claude-opus-5-5"), 1_000_000)
+        self.assertEqual(regista.context_window(cfg, 1000, "claude-sonnet-5-5"), 1_000_000)
+        self.assertEqual(regista.context_window(cfg, 1000, "claude-fable-5-1"), 1_000_000)
+        self.assertEqual(regista.context_window(cfg, 1000, "claude-opus-4-7"), 1_000_000)
+        self.assertEqual(regista.context_window(cfg, 1000, "claude-opus-4-6"), 200_000)
+        self.assertEqual(regista.context_window(cfg, 1000, "claude-opus-4-6[1m]"), 1_000_000)
+        self.assertEqual(regista.context_window(cfg, 250_000, "unknown-model"), 1_000_000)
         cfg["context"]["window"] = 400_000
-        self.assertEqual(dd.context_window(cfg, 1000, "claude-opus-5-5"), 400_000)
+        self.assertEqual(regista.context_window(cfg, 1000, "claude-opus-5-5"), 400_000)
 
     def test_tokens_ignore_output_and_subagents(self):
         transcript(self.t, 120_000)
-        self.assertEqual(dd.context_tokens(self.t), (120_000, "claude-sonnet-4-6"))
+        self.assertEqual(regista.context_tokens(self.t), (120_000, "claude-sonnet-4-6"))
 
     def test_below_warn_is_silent(self):
         self.assertIsNone(self.tool(60_000, "Read", file_path=os.path.join(self.p.root, "README.md")))
@@ -317,32 +356,32 @@ class ContextBudget(unittest.TestCase):
         self.assertEqual(decision(self.tool(over, "Bash", command="pytest -q")), "deny")
         self.assertEqual(decision(self.tool(over, "Agent", prompt="x")), "deny")
         self.assertEqual(decision(self.tool(over, "WebFetch", url="https://example.com")), "deny")
-        self.assertIsNone(self.tool(over, "Skill", skill="daedalus:pause"))
-        self.assertIsNone(self.tool(over, "Write", file_path=os.path.join(self.p.root, ".daedalus", "state", "2026-10-09-pause.md")))
-        self.assertIsNone(self.tool(over, "Edit", file_path=os.path.join(self.p.root, ".daedalus", "status.md")))
+        self.assertIsNone(self.tool(over, "Skill", skill="regista:pause"))
+        self.assertIsNone(self.tool(over, "Write", file_path=os.path.join(self.p.root, ".regista", "state", "2026-10-09-pause.md")))
+        self.assertIsNone(self.tool(over, "Edit", file_path=os.path.join(self.p.root, ".regista", "status.md")))
         self.assertIsNone(self.tool(over, "Bash", command="git status --short && git add -A && git commit -m wip"))
-        self.assertIsNone(self.tool(over, "Bash", command=f'python "{DD}" gate'))
+        self.assertIsNone(self.tool(over, "Bash", command=f'python "{TOOL}" gate'))
         self.assertEqual(decision(self.tool(over, "Bash", command="git status && rm -rf src")), "deny")
 
     def test_gates_still_apply_while_paused(self):
         self.p = Project(gates=[{"name": "tests", "run": "exit 1"}], context=PAUSE)
         self.assertEqual(decision(self.tool(132_000, "Bash", command="git commit -am wip")), "deny")
 
-    def test_stop_blocked_until_pause_handoff_written(self):
+    def test_stop_blocked_until_pause_handoff_written(self):  # covers: CODE-3
         self.tool(132_000, "Read", file_path="x")  # crossing the limit records the moment
         out = self.call("stop", 132_000)
         self.assertEqual(out.get("decision"), "block")
-        self.assertIn("/daedalus:pause", out["reason"])
+        self.assertIn("/regista:pause", out["reason"])
         time.sleep(1.1)
-        self.p.write(".daedalus/state/2026-10-09-pause-x.md", "# h\n## Resume prompt\n/daedalus:start continue\n")
+        self.p.write(".regista/state/2026-10-09-pause-x.md", "# h\n## Resume prompt\n/regista:start continue\n")
         self.assertIsNone(self.call("stop", 132_000))
 
     def test_stop_hook_active_never_loops(self):
         self.assertIsNone(self.call("stop", 132_000, stop_hook_active=True))
 
-    def test_user_prompt_over_limit(self):
+    def test_user_prompt_over_limit(self):  # covers: CODE-3
         out = self.call("user-prompt", 140_000, prompt="next feature please")
-        self.assertIn("/daedalus:pause", out["hookSpecificOutput"]["additionalContext"])
+        self.assertIn("/regista:pause", out["hookSpecificOutput"]["additionalContext"])
 
     def test_new_session_starts_fresh(self):
         self.tool(132_000, "Read", file_path="x")
@@ -382,7 +421,7 @@ class CompactMode(unittest.TestCase):
     def test_warning_asks_for_a_checkpoint_not_a_pause(self):
         note = self.bash(112_000)["hookSpecificOutput"]["additionalContext"]  # 56 %
         self.assertIn("compacts itself", note)
-        self.assertIn("/daedalus:save", note)
+        self.assertIn("/regista:save", note)
         self.assertNotIn("/clear", note)
 
     def test_over_the_limit_work_continues(self):
@@ -404,11 +443,11 @@ class CompactMode(unittest.TestCase):
 
     def test_compaction_is_logged(self):
         self.call("pre-compact", 131_000, trigger="auto")
-        rows = dd.read(os.path.join(self.p.root, ".daedalus", "compactions.jsonl")).strip().splitlines()
+        rows = regista.read(os.path.join(self.p.root, ".regista", "compactions.jsonl")).strip().splitlines()
         self.assertEqual(json.loads(rows[-1])["trigger"], "auto")
 
     def test_subagent_backstop_too(self):
-        sub = {"agent_id": "a1", "agent_type": "daedalus:builder", "tool_name": "Bash", "tool_input": {"command": "ls"}}
+        sub = {"agent_id": "a1", "agent_type": "regista:builder", "tool_name": "Bash", "tool_input": {"command": "ls"}}
         transcript(self.t, 10_000)
         path = os.path.join(os.path.splitext(self.t)[0], "subagents", "agent-a1.jsonl")
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -427,7 +466,7 @@ class CompactMode(unittest.TestCase):
         self.p.write(".claude/settings.json", json.dumps({"permissions": {"allow": ["Bash(ls)"]}}))
         r = self.p.cli("setup")
         self.assertEqual(r.returncode, 0, r.stderr)
-        data = dd.load_json(os.path.join(self.p.root, ".claude", "settings.json"), {})
+        data = regista.load_json(os.path.join(self.p.root, ".claude", "settings.json"), {})
         self.assertEqual(data["env"]["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"], "65")
         self.assertEqual(data["permissions"], {"allow": ["Bash(ls)"]})  # the rest is kept
         r = self.p.cli("doctor")
@@ -438,7 +477,7 @@ def as_agent(role, tool, **ti):
     """Hook payload for a tool call made inside one of our agents (or the main session if role is None)."""
     d = {"tool_name": tool, "tool_input": ti}
     if role:
-        d.update(agent_id="a1", agent_type=role if ":" in role or role in ("Explore", "general-purpose") else f"daedalus:{role}")
+        d.update(agent_id="a1", agent_type=role if ":" in role or role in ("Explore", "general-purpose") else f"regista:{role}")
     return d
 
 
@@ -458,23 +497,23 @@ class Roles(unittest.TestCase):
     def test_orchestrator_doesnt_edit_code_or_tests(self):
         self.assertEqual(self.check(None, "Write", file_path=self.f("src/a.py")), "deny")
         self.assertEqual(self.check(None, "Edit", file_path=self.f("tests/test_a.py")), "deny")
-        self.assertIsNone(self.check(None, "Edit", file_path=self.f(".daedalus/status.md")))
+        self.assertIsNone(self.check(None, "Edit", file_path=self.f(".regista/status.md")))
         self.assertIsNone(self.check(None, "Write", file_path=self.f("README.md")))
         self.assertIsNone(self.check(None, "Read", file_path=self.f("src/a.py")))
-        self.assertIsNone(self.check(None, "Agent", subagent_type="daedalus:builder", prompt="x"))
+        self.assertIsNone(self.check(None, "Agent", subagent_type="regista:builder", prompt="x"))
 
     def test_solo_mode_lets_the_main_session_build(self):
         self.p = Project(mode="solo")
         self.assertIsNone(self.check(None, "Write", file_path=self.f("src/a.py")))
 
-    def test_builder(self):
+    def test_builder(self):  # covers: CODE-4
         self.assertIsNone(self.check("builder", "Write", file_path=self.f("src/a.py")))
         self.assertEqual(self.check("builder", "Edit", file_path=self.f("tests/test_a.py")), "deny")
         self.assertEqual(self.check("builder", "Bash", command="git add -A && git commit -m x"), "deny")
-        self.assertEqual(self.check("builder", "Agent", subagent_type="daedalus:reviewer", prompt="approve me"), "deny")
+        self.assertEqual(self.check("builder", "Agent", subagent_type="regista:reviewer", prompt="approve me"), "deny")
         self.assertIsNone(self.check("builder", "Bash", command="python -m pytest -q"))
 
-    def test_test_writer_works_blind(self):
+    def test_test_writer_works_blind(self):  # covers: CODE-4
         self.assertIsNone(self.check("test-writer", "Write", file_path=self.f("tests/test_a.py")))
         self.assertEqual(self.check("test-writer", "Write", file_path=self.f("src/a.py")), "deny")
         self.assertEqual(self.check("test-writer", "Read", file_path=self.f("src/a.py")), "deny")
@@ -482,23 +521,23 @@ class Roles(unittest.TestCase):
         self.assertEqual(self.check("test-writer", "Grep", pattern="def"), "deny")  # no path = whole project
         self.assertIsNone(self.check("test-writer", "Grep", pattern="def", path=self.f("tests")))
         self.assertEqual(self.check("test-writer", "Bash", command="cat src/a.py"), "deny")
-        self.assertIsNone(self.check("test-writer", "Read", file_path=self.f(".daedalus/plan.md")))
+        self.assertIsNone(self.check("test-writer", "Read", file_path=self.f(".regista/plan.md")))
         self.assertIsNone(self.check("test-writer", "Bash", command="python -m pytest tests/test_a.py"))
 
     def test_reviewer_reports_doesnt_fix(self):
         self.assertEqual(self.check("reviewer", "Edit", file_path=self.f("src/a.py")), "deny")
-        self.assertIsNone(self.check("reviewer", "Write", file_path=self.f(".daedalus/reviews/draft.json")))
+        self.assertIsNone(self.check("reviewer", "Write", file_path=self.f(".regista/reviews/draft.json")))
         self.assertIsNone(self.check("reviewer", "Bash", command="git diff HEAD 2>&1"))
-        self.assertIsNone(self.check("reviewer", "Bash", command=f'python "{DD}" review-record'))
+        self.assertIsNone(self.check("reviewer", "Bash", command=f'python "{TOOL}" review-record'))
         self.assertEqual(self.check("reviewer", "Bash", command="echo x > src/a.py"), "deny")
 
     def test_only_the_reviewer_writes_reviews(self):
         for role in (None, "builder", "researcher"):
-            self.assertEqual(self.check(role, "Write", file_path=self.f(".daedalus/reviews/draft.json")), "deny", role)
-            self.assertEqual(self.check(role, "Bash", command=f'python "{DD}" review-record'), "deny", role)
+            self.assertEqual(self.check(role, "Write", file_path=self.f(".regista/reviews/draft.json")), "deny", role)
+            self.assertEqual(self.check(role, "Bash", command=f'python "{TOOL}" review-record'), "deny", role)
 
     def test_researcher(self):
-        self.assertIsNone(self.check("researcher", "Write", file_path=self.f(".daedalus/research/q1.md")))
+        self.assertIsNone(self.check("researcher", "Write", file_path=self.f(".regista/research/q1.md")))
         self.assertEqual(self.check("researcher", "Write", file_path=self.f("src/a.py")), "deny")
         self.assertIsNone(self.check("researcher", "WebFetch", url="https://example.com"))
 
@@ -506,16 +545,16 @@ class Roles(unittest.TestCase):
         self.assertEqual(self.check("general-purpose", "Write", file_path=self.f("src/a.py")), "deny")
         self.assertIsNone(self.check("Explore", "Read", file_path=self.f("src/a.py")))
 
-    def test_spoofed_role_name_is_just_other(self):
-        self.assertEqual(dd.role_of({"agent_id": "x", "agent_type": "reviewer"}), "other")
-        self.assertEqual(dd.role_of({"agent_id": "x", "agent_type": "daedalus:reviewer"}), "reviewer")
-        self.assertEqual(dd.role_of({}), "main")
+    def test_spoofed_role_name_is_just_other(self):  # covers: CODE-4
+        self.assertEqual(regista.role_of({"agent_id": "x", "agent_type": "reviewer"}), "other")
+        self.assertEqual(regista.role_of({"agent_id": "x", "agent_type": "regista:reviewer"}), "reviewer")
+        self.assertEqual(regista.role_of({}), "main")
 
-    def test_subagent_start_injects_role(self):
-        out = self.p.hook("subagent-start", {"agent_id": "a9", "agent_type": "daedalus:test-writer"})
+    def test_subagent_start_injects_role(self):  # covers: CODE-4, CODE-3
+        out = self.p.hook("subagent-start", {"agent_id": "a9", "agent_type": "regista:test-writer"})
         ctx = out["hookSpecificOutput"]["additionalContext"]
         self.assertIn("test-writer", ctx)
-        self.assertIn("dd.py", ctx)
+        self.assertIn("regista.py", ctx)
         self.assertIsNone(self.p.hook("subagent-start", {"agent_id": "a8", "agent_type": "Explore"}))
 
 
@@ -533,7 +572,7 @@ class ReviewGate(unittest.TestCase):
         return self.p.hook("pre-tool", as_agent(None, "Bash", command="git add -A && git commit -m feat"))
 
     def draft(self, verdict="approve", findings=None, checked=("spec", "edge cases")):
-        self.p.write(".daedalus/reviews/draft.json", json.dumps(
+        self.p.write(".regista/reviews/draft.json", json.dumps(
             {"verdict": verdict, "summary": "s", "checked": list(checked), "findings": findings or []}))
 
     def test_small_change_needs_no_review(self):
@@ -562,12 +601,12 @@ class ReviewGate(unittest.TestCase):
     def test_compound_commands_checked_per_segment(self):
         # Seen live: `sed -i` on the plan + `git add` of the verdict + commit was refused as a review write.
         def reviews(cmd):
-            return dd.under(self.p.root, dd.shell_effects(cmd, self.p.root)["writes"], [".daedalus/reviews/**"])
-        self.assertEqual(reviews("sed -i 's/x/y/' .daedalus/plan.md && git add -A .daedalus/reviews/a.json && "
+            return regista.under(self.p.root, regista.shell_effects(cmd, self.p.root)["writes"], [".regista/reviews/**"])
+        self.assertEqual(reviews("sed -i 's/x/y/' .regista/plan.md && git add -A .regista/reviews/a.json && "
                                  "git commit -m x"), [])
-        self.assertEqual(reviews("git status && cp a.json .daedalus/reviews/b.json"), [".daedalus/reviews/b.json"])
+        self.assertEqual(reviews("git status && cp a.json .regista/reviews/b.json"), [".regista/reviews/b.json"])
         self.assertIsNone(self.p.hook("pre-tool", as_agent(None, "Bash", command=(
-            "sed -i 's/x/y/' .daedalus/plan.md && git add -A .daedalus/reviews/a.json && git commit -m x"))))
+            "sed -i 's/x/y/' .regista/plan.md && git add -A .regista/reviews/a.json && git commit -m x"))))
 
     def test_changes_verdict_blocks(self):
         self.p.write("src/a.py", BIG)
@@ -589,16 +628,16 @@ class ReviewGate(unittest.TestCase):
         self.assertNotEqual(self.p.cli("review-record").returncode, 0)  # finding without a line
 
     def test_reviewer_must_record_before_finishing(self):
-        self.p.hook("subagent-start", {"agent_id": "r1", "agent_type": "daedalus:reviewer"})
-        out = self.p.hook("subagent-stop", {"agent_id": "r1", "agent_type": "daedalus:reviewer"})
+        self.p.hook("subagent-start", {"agent_id": "r1", "agent_type": "regista:reviewer"})
+        out = self.p.hook("subagent-stop", {"agent_id": "r1", "agent_type": "regista:reviewer"})
         self.assertEqual(out.get("decision"), "block")
-        self.assertIsNone(self.p.hook("subagent-stop", {"agent_id": "r1", "agent_type": "daedalus:reviewer",
+        self.assertIsNone(self.p.hook("subagent-stop", {"agent_id": "r1", "agent_type": "regista:reviewer",
                                                        "stop_hook_active": True}))
         self.p.write("src/a.py", BIG)
         time.sleep(1.1)
         self.draft()
         self.assertEqual(self.p.cli("review-record").returncode, 0)
-        self.assertIsNone(self.p.hook("subagent-stop", {"agent_id": "r1", "agent_type": "daedalus:reviewer"}))
+        self.assertIsNone(self.p.hook("subagent-stop", {"agent_id": "r1", "agent_type": "regista:reviewer"}))
 
 
 class TestIntegrity(unittest.TestCase):
@@ -634,6 +673,28 @@ class TestIntegrity(unittest.TestCase):
         self.assertIsNone(self.check("reviewer", "Bash", command='echo hi > "$TMPDIR/probe.txt"'))
         self.assertEqual(self.check("reviewer", "Bash", command="echo hi > src/a.py"), "deny")
 
+    def test_another_copy_of_the_harness_isnt_a_scratch_probe(self):  # covers: CODE-7
+        with open(TOOL, encoding="utf-8") as f:
+            src = f.read()
+        marker = src[src.index('"""'):].splitlines()[0]  # the opening line of the tool's docstring
+        copy = marker + ("\n" if marker.count('"""') > 1 else '\n"""\n') + "import sys\nprint(sys.argv)\n"
+        scratch = tempfile.mkdtemp(prefix="regista-scratch-")
+
+        def probe(name, text):
+            path = os.path.join(scratch, name)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+            return regista.agent_script(path, self.p.root)
+
+        try:
+            self.assertFalse(probe("regista.py", copy))
+            self.assertFalse(probe("dd.py", copy))
+            self.assertFalse(probe("dd.py", '"""Daedalus core: hooks and commands.\n"""\nimport sys\n'))
+            self.assertTrue(probe("probe.py", "print('hello')\n"))
+            self.assertTrue(probe("regista.py", "print('hello')\n"))
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+
     def test_builder_cant_edit_test_config(self):
         for path in ("pytest.ini", "src/conftest.py", "web/vitest.config.ts", "src/__snapshots__/a.snap"):
             self.assertEqual(self.check("builder", "Write", file_path=os.path.join(self.p.root, path)), "deny", path)
@@ -642,16 +703,16 @@ class TestIntegrity(unittest.TestCase):
         self.assertIsNone(self.check("test-writer", "Write", file_path=os.path.join(self.p.root, "tests", "conftest.py")))
 
     def test_harness_files_belong_to_the_harness(self):
-        cfgfile = os.path.join(self.p.root, ".daedalus", "config.json")
+        cfgfile = os.path.join(self.p.root, ".regista", "config.json")
         self.assertEqual(self.check(None, "Edit", file_path=cfgfile), "ask")  # the user decides
         self.assertEqual(self.check("builder", "Edit", file_path=cfgfile), "deny")
-        self.assertEqual(self.check(None, "Bash", command="sed -i 's/65/95/' .daedalus/config.json"), "ask")
+        self.assertEqual(self.check(None, "Bash", command="sed -i 's/65/95/' .regista/config.json"), "ask")
         for role in (None, "builder", "reviewer"):
             self.assertEqual(self.check(role, "Write", file_path=os.path.join(
-                self.p.root, ".daedalus", "gates", "requirements.json")), "deny", role)
-        self.assertEqual(self.check(None, "Bash", command="echo {} > .daedalus/gates/baseline.json"), "deny")
-        self.assertEqual(self.check(None, "Bash", command=f'python "{DD}" verify-manual UI-1 --note ok'), "deny")
-        self.assertIsNone(self.check(None, "Bash", command=f'python "{DD}" gate'))
+                self.p.root, ".regista", "gates", "requirements.json")), "deny", role)
+        self.assertEqual(self.check(None, "Bash", command="echo {} > .regista/gates/baseline.json"), "deny")
+        self.assertEqual(self.check(None, "Bash", command=f'python "{TOOL}" verify-manual UI-1 --note ok'), "deny")
+        self.assertIsNone(self.check(None, "Bash", command=f'python "{TOOL}" gate'))
 
 
 class ShellReading(unittest.TestCase):
@@ -661,7 +722,7 @@ class ShellReading(unittest.TestCase):
 
     def setUp(self):
         self.p = Project(protected=[".env", ".env.*.local", "*.pem"])
-        self.tmp = tempfile.mkdtemp(prefix="dd-scratch-")
+        self.tmp = tempfile.mkdtemp(prefix="regista-scratch-")
 
     def tearDown(self):
         self.p.cleanup()
@@ -675,7 +736,7 @@ class ShellReading(unittest.TestCase):
         allowed = [
             ("researcher", 'node -e "console.log([1].map(x => x+1))"'),
             ("researcher", f"cd {t} && python3 -I -c \"\nimport json\nif len([1])>1: print('x')\n\""),
-            ("researcher", "cat > .daedalus/research/prices.md <<'EOF'\n# Notes\nprices > 0 and rm -rf x\nEOF"),
+            ("researcher", "cat > .regista/research/prices.md <<'EOF'\n# Notes\nprices > 0 and rm -rf x\nEOF"),
             ("reviewer", f"S={t}; mkdir -p $S/shot && cat > $S/mk.mjs <<'EOF'\n"
                          f"import {{ writeFileSync }} from 'node:fs';\nimport {{ f }} from '{self.p.root}/src/a.js';\n"
                          "writeFileSync(process.argv[2], JSON.stringify(f()));\nEOF\nnode $S/mk.mjs $S/out.json"),
@@ -696,7 +757,7 @@ class ShellReading(unittest.TestCase):
                    "cat > deploy/fpl.env.example <<'EOF'\nDATABASE_URL=x\nEOF"),
             (None, f"cat > {t}/list.py <<'EOF'\ncp = env_file('/x/.env')\nprint(cp)\nEOF\npython3 -I {t}/list.py"),
             (None, "grep -n 'ownership' docs/spec.md | head -3 && git add -A && git commit -qm 'docs: spec -n'"),
-            (None, "python3 - <<'EOF'\np='.daedalus/status.md'; t=open(p).read()\n"
+            (None, "python3 - <<'EOF'\np='.regista/status.md'; t=open(p).read()\n"
                    "t+='record it with verify-manual'\nopen(p,'w').write(t)\nEOF"),
         ]
         for role, cmd in allowed:
@@ -735,7 +796,7 @@ class ShellReading(unittest.TestCase):
         os.makedirs(os.path.join(self.p.root, "tests"), exist_ok=True)
         for role, cmd in denied:
             self.assertEqual(self.check(role, cmd), "deny", f"{role}: {cmd}")
-        self.assertEqual(self.check(None, "python3 - <<'EOF'\nimport json\np='.daedalus/config.json'\n"
+        self.assertEqual(self.check(None, "python3 - <<'EOF'\nimport json\np='.regista/config.json'\n"
                                           "c=json.load(open(p)); c['gates']=[]\njson.dump(c, open(p, 'w'))\nEOF"), "ask")
 
     def test_protected_paths_outside_the_project(self):
@@ -759,7 +820,7 @@ class GateRuns(unittest.TestCase):
     """Gates run once per state of the files, one run at a time, and the setup commit needs none."""
 
     def setUp(self):
-        self.count = tempfile.mktemp(prefix="dd-count-")
+        self.count = tempfile.mktemp(prefix="regista-count-")
         self.p = Project(gates=[{"name": "tests", "run": f"echo run >> {self.count}"}])
 
     def tearDown(self):
@@ -768,7 +829,7 @@ class GateRuns(unittest.TestCase):
             os.remove(self.count)
 
     def runs(self):
-        return len(dd.read(self.count).splitlines())
+        return len(regista.read(self.count).splitlines())
 
     def commit(self):
         return self.p.hook("pre-tool", as_agent(None, "Bash", command="git add -A && git commit -m x"))
@@ -777,7 +838,7 @@ class GateRuns(unittest.TestCase):
         self.p.write("src/a.py", "x = 1\n")
         self.assertEqual(self.p.cli("gate").returncode, 0)
         self.assertIn("reused", self.p.cli("gate").stdout)
-        self.p.write(".daedalus/status.md", "notes\n")  # the harness's own records don't void it
+        self.p.write(".regista/status.md", "notes\n")  # the harness's own records don't void it
         self.assertIsNone(decision(self.commit()))
         self.assertEqual(self.runs(), 1)
         self.p.cli("gate", "--fresh")
@@ -787,48 +848,66 @@ class GateRuns(unittest.TestCase):
         self.assertEqual(self.runs(), 3)
 
     def test_one_gate_run_at_a_time(self):
-        held = dd.gate_lock(self.p.root, 1)
+        held = regista.gate_lock(self.p.root, 1)
         self.assertIsNotNone(held)
-        self.assertIsNone(dd.gate_lock(self.p.root, 1))
+        self.assertIsNone(regista.gate_lock(self.p.root, 1))
         held.close()
-        again = dd.gate_lock(self.p.root, 1)
+        again = regista.gate_lock(self.p.root, 1)
         self.assertIsNotNone(again)
         again.close()
 
+    def test_gates_see_the_worker_and_slot_under_both_names(self):  # covers: CODE-5
+        with clean_environ():
+            env = regista.gate_env(self.p.root)
+        self.assertEqual((env["REGISTA_WORKER"], env["REGISTA_SLOT"]), ("", "0"))
+        self.assertEqual((env["DAEDALUS_WORKER"], env["DAEDALUS_SLOT"]), ("", "0"))
+        out = tempfile.mktemp(prefix="regista-env-")
+        p = Project(gates=[env_gate(out)])
+        try:
+            r = subprocess.run([PY, TOOL, "gate", "--fresh"], cwd=p.root, capture_output=True, text=True,
+                               encoding="utf-8", env=clean_env())
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            with open(out, encoding="utf-8") as f:
+                self.assertEqual(f.read(), "W= S=0 OW= OS=0")
+        finally:
+            p.cleanup()
+            if os.path.exists(out):
+                os.remove(out)
+
     def test_setup_and_record_commits_skip_the_gates(self):
-        fresh = tempfile.mkdtemp(prefix="dd-fresh-")
+        fresh = tempfile.mkdtemp(prefix="regista-fresh-")
         try:
             sh(fresh, "git", "init", "-q", "-b", "main")
-            subprocess.run([PY, DD, "init", "--name", "New"], cwd=fresh, check=True, capture_output=True,
+            subprocess.run([PY, TOOL, "init", "--name", "New"], cwd=fresh, check=True, capture_output=True,
                            env={**os.environ, "CLAUDE_PROJECT_DIR": fresh})
-            cfgfile = os.path.join(fresh, ".daedalus", "config.json")
-            c = dd.load_json(cfgfile, {})
+            cfgfile = os.path.join(fresh, ".regista", "config.json")
+            c = regista.load_json(cfgfile, {})
             c["gates"] = [{"name": "tests", "run": "npm test"}]  # no package.json yet: it can't pass
-            dd.save_json(cfgfile, c)
-            r = subprocess.run([PY, DD, "hook", "pre-tool"], capture_output=True, text=True, input=json.dumps(
-                {"cwd": fresh, **bash("git add -A && git commit -m 'chore: set up Daedalus'")}))
+            regista.save_json(cfgfile, c)
+            r = subprocess.run([PY, TOOL, "hook", "pre-tool"], capture_output=True, text=True, cwd=fresh, input=json.dumps(
+                {"cwd": fresh, **bash("git add -A && git commit -m 'chore: set up Regista'")}))
             self.assertEqual(r.stdout.strip(), "", r.stdout)
         finally:
             shutil.rmtree(fresh, ignore_errors=True)
         self.p = Project(gates=[{"name": "tests", "run": "exit 1"}], no_gates_for=["docs/**"])
-        self.p.write(".daedalus/status.md", "done\n")
+        self.p.write(".regista/status.md", "done\n")
         self.p.write("docs/spec.md", "spec\n")
         self.assertIsNone(decision(self.commit()))
         self.p.write("src/a.py", "x = 1\n")
         self.assertEqual(decision(self.commit()), "deny")
 
     def test_loosening_the_config_needs_the_user(self):
-        cfgfile = os.path.join(self.p.root, ".daedalus", "config.json")
-        c = dd.load_json(cfgfile, {})
+        cfgfile = os.path.join(self.p.root, ".regista", "config.json")
+        c = regista.load_json(cfgfile, {})
         c["gates"].append({"name": "lint", "run": "echo lint"})
         c["protected"] = ["data/**"]
-        dd.save_json(cfgfile, c)
+        regista.save_json(cfgfile, c)
         self.assertIsNone(decision(self.commit()))  # adding checks is fine
         sh(self.p.root, "git", "add", "-A")
         sh(self.p.root, "git", "commit", "-q", "-m", "more checks")
         c["gates"] = c["gates"][:1]
         c["protected"] = []
-        dd.save_json(cfgfile, c)
+        regista.save_json(cfgfile, c)
         out = self.commit()
         self.assertEqual(decision(out), "ask")
         reason = out["hookSpecificOutput"]["permissionDecisionReason"]
@@ -836,20 +915,20 @@ class GateRuns(unittest.TestCase):
         self.assertIn("data/**", reason)
 
     def test_requirement_results_describe_commits_and_dont_churn(self):
-        self.p.write(".daedalus/specs/stats.json", json.dumps({**SPEC, "requirements": [SPEC["requirements"][0]]}))
+        self.p.write(".regista/specs/stats.json", json.dumps({**SPEC, "requirements": [SPEC["requirements"][0]]}))
         self.p.write("tests/test_stats.py", "# covers: STATS-1\n")
         self.assertIsNone(decision(self.commit()))
-        state = dd.load_json(dd.requirements_path(self.p.root), {})
+        state = regista.load_json(regista.requirements_path(self.p.root), {})
         self.assertTrue(state["STATS-1"]["passes"])
         sh(self.p.root, "git", "add", "-A")
         sh(self.p.root, "git", "commit", "-q", "-m", "stats")
-        before = dd.read(dd.requirements_path(self.p.root))
+        before = regista.read(regista.requirements_path(self.p.root))
         self.p.write("src/a.py", "half finished\n")
         out = self.p.cli("gate")
         self.assertIn("not updated", out.stdout)
         self.p.write("src/a.py", "x = 1\n")
         self.assertIsNone(decision(self.commit()))
-        self.assertEqual(dd.read(dd.requirements_path(self.p.root)), before)  # same result: no rewrite
+        self.assertEqual(regista.read(regista.requirements_path(self.p.root)), before)  # same result: no rewrite
 
 
 class FailClosed(unittest.TestCase):
@@ -857,7 +936,7 @@ class FailClosed(unittest.TestCase):
 
     def setUp(self):
         self.p = Project()
-        self.p.write(".daedalus/config.json", "{ not json")
+        self.p.write(".regista/config.json", "{ not json")
 
     def tearDown(self):
         self.p.cleanup()
@@ -869,18 +948,49 @@ class FailClosed(unittest.TestCase):
 
     def test_escape_hatch(self):
         self.assertIsNone(self.p.hook("pre-tool", as_agent(None, "Bash", command="ls"),
-                                      extra_env={"DAEDALUS_FAIL_OPEN": "1"}))
+                                      extra_env={"REGISTA_FAIL_OPEN": "1"}))
+
+    def test_escape_hatch_under_the_old_name(self):  # covers: CODE-6
+        ls = as_agent(None, "Bash", command="ls")
+        with clean_environ():
+            self.assertEqual(decision(self.p.hook("pre-tool", ls)), "deny")
+            self.assertIsNone(self.p.hook("pre-tool", ls, extra_env={"DAEDALUS_FAIL_OPEN": "1"}))
 
     def test_other_events_dont_trap_the_session(self):
         self.assertIsNone(self.p.hook("stop", {}))
         self.assertIsNone(self.p.hook("session-start", {"source": "startup"}))
 
     def test_gate_budget(self):
-        self.p.write(".daedalus/config.json", "{}")
+        self.p.write(".regista/config.json", "{}")
         gates = [{"name": "slow", "run": "sleep 3", "timeout": 60}, {"name": "next", "run": "echo ok"}]
-        res = dd.run_gates(self.p.root, dd.load_config(self.p.root), gates, budget=2)
+        res = regista.run_gates(self.p.root, regista.load_config(self.p.root), gates, budget=2)
         self.assertEqual([r["status"] for r in res], ["fail", "fail"])  # cut at the budget, then no time left
         self.assertIn("no time left", res[1]["fails"][0])
+
+
+class OldEnvNames(unittest.TestCase):
+    """The harness's own variables are read as REGISTA_<x> first, then DAEDALUS_<x> (the old name)."""
+
+    NAMES = ("BASH", "CONTEXT_WINDOW", "FAIL_OPEN", "HOST", "CLAUDE", "TMUX", "LAUNCH_WAIT")
+
+    def test_prefixes(self):  # covers: CODE-6
+        self.assertEqual(regista.ENV_PREFIX, "REGISTA_")
+        self.assertEqual(regista.OLD_ENV_PREFIX, "DAEDALUS_")
+
+    def test_new_name_first_then_the_old_one(self):  # covers: CODE-6
+        for name in self.NAMES:
+            new, old = "REGISTA_" + name, "DAEDALUS_" + name
+            cases = [({}, "dflt"), ({new: "new"}, "new"), ({old: "old"}, "old"), ({new: "new", old: "old"}, "new"),
+                     ({new: "", old: ""}, "dflt"), ({new: "", old: "old"}, "old"), ({new: "new", old: ""}, "new"),
+                     ({new: ""}, "dflt"), ({old: ""}, "dflt")]
+            for env, want in cases:
+                with self.subTest(name=name, env=env), clean_environ(**env):
+                    self.assertEqual(regista.env_value(name, "dflt"), want)
+
+    def test_default_is_none(self):  # covers: CODE-6
+        with clean_environ():
+            for name in self.NAMES:
+                self.assertIsNone(regista.env_value(name), name)
 
 
 SPEC = {"step": "stats", "milestone": "M1", "title": "Statistics", "requirements": [
@@ -894,7 +1004,7 @@ class Requirements(unittest.TestCase):
 
     def setUp(self):
         self.p = Project(gates=[{"name": "tests", "run": "echo ok"}, E2E_GATE])
-        self.p.write(".daedalus/specs/stats.json", json.dumps(SPEC))
+        self.p.write(".regista/specs/stats.json", json.dumps(SPEC))
 
     def tearDown(self):
         self.p.cleanup()
@@ -903,7 +1013,7 @@ class Requirements(unittest.TestCase):
         return self.p.hook("pre-tool", as_agent(None, "Bash", command="git add -A && git commit -m feat"))
 
     def state(self):
-        return dd.load_json(dd.requirements_path(self.p.root), {})
+        return regista.load_json(regista.requirements_path(self.p.root), {})
 
     def test_uncovered_requirements_block_the_commit(self):
         out = self.commit()
@@ -918,7 +1028,7 @@ class Requirements(unittest.TestCase):
     def test_gates_flip_passes_and_the_milestone(self):
         self.p.write("tests/test_stats.py", "# covers: STATS-1\n")
         self.p.write("e2e/cli_test.sh", "# covers: STATS-2\n")
-        done, why = dd.milestone_status(self.p.root, dd.load_config(self.p.root), "M1")
+        done, why = regista.milestone_status(self.p.root, regista.load_config(self.p.root), "M1")
         self.assertFalse(done)
         self.assertIsNone(self.commit())
         self.assertTrue(self.state()["STATS-1"]["passes"])
@@ -927,7 +1037,7 @@ class Requirements(unittest.TestCase):
 
     def test_a_failing_gate_fails_its_requirements(self):
         self.p = Project(gates=[{"name": "tests", "run": "exit 1"}, E2E_GATE])
-        self.p.write(".daedalus/specs/stats.json", json.dumps(SPEC))
+        self.p.write(".regista/specs/stats.json", json.dumps(SPEC))
         self.p.write("tests/test_stats.py", "# covers: STATS-1\n")
         self.p.write("e2e/cli_test.sh", "# covers: STATS-2\n")
         self.assertEqual(decision(self.commit()), "deny")
@@ -940,22 +1050,22 @@ class Requirements(unittest.TestCase):
 
     def test_milestone_needs_end_to_end_evidence(self):
         spec = {**SPEC, "requirements": [SPEC["requirements"][0]]}  # unit-tested only
-        self.p.write(".daedalus/specs/stats.json", json.dumps(spec))
+        self.p.write(".regista/specs/stats.json", json.dumps(spec))
         self.p.write("tests/test_stats.py", "# covers: STATS-1\n")
         self.assertIsNone(self.commit())
-        done, why = dd.milestone_status(self.p.root, dd.load_config(self.p.root), "M1")
+        done, why = regista.milestone_status(self.p.root, regista.load_config(self.p.root), "M1")
         self.assertFalse(done)
         self.assertIn("end-to-end", " ".join(why))
 
     def test_planned_specs_dont_block(self):
-        self.p.write(".daedalus/specs/stats.json", json.dumps({**SPEC, "state": "planned"}))
+        self.p.write(".regista/specs/stats.json", json.dumps({**SPEC, "state": "planned"}))
         self.assertIsNone(self.commit())
 
     def test_bad_specs_are_reported(self):
         bad = {**SPEC, "requirements": [{"id": "stats one", "text": "", "verify": "vibes"}, SPEC["requirements"][0]]}
-        self.p.write(".daedalus/specs/stats.json", json.dumps(bad))
-        self.p.write(".daedalus/specs/dup.json", json.dumps({**SPEC, "step": "dup"}))
-        _, problems = dd.load_specs(self.p.root)
+        self.p.write(".regista/specs/stats.json", json.dumps(bad))
+        self.p.write(".regista/specs/dup.json", json.dumps({**SPEC, "step": "dup"}))
+        _, problems = regista.load_specs(self.p.root)
         text = " ".join(problems)
         self.assertIn("must look like NAME-1", text)
         self.assertIn("also defined", text)
@@ -963,12 +1073,12 @@ class Requirements(unittest.TestCase):
 
     def test_id_matching_is_exact(self):
         self.p.write("tests/test_stats.py", "# covers: STATS-10, XSTATS-1\n")
-        cov = dd.coverage(self.p.root, dd.load_config(self.p.root), [SPEC])
+        cov = regista.coverage(self.p.root, regista.load_config(self.p.root), [SPEC])
         self.assertEqual(cov["STATS-1"]["tests"], [])
 
     def test_manual_requirements_need_the_user(self):
         spec = {**SPEC, "requirements": [{"id": "UX-1", "text": "The page SHALL feel fast on a phone", "verify": "manual"}]}
-        self.p.write(".daedalus/specs/ux.json", json.dumps({**spec, "milestone": "M2"}))
+        self.p.write(".regista/specs/ux.json", json.dumps({**spec, "milestone": "M2"}))
         self.assertNotEqual(self.p.cli("milestone", "M2").returncode, 0)
         r = self.p.cli("verify-manual", "UX-1", "--note", "checked on an iPhone 16")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
@@ -1001,17 +1111,17 @@ Steps:
 
 
 class BuildAll(unittest.TestCase):
-    """`/daedalus:build all`: the run keeps the session going between milestones while it makes progress."""
+    """`/regista:build all`: the run keeps the session going between milestones while it makes progress."""
 
     def setUp(self):
         self.p = Project(gates=[{"name": "tests", "run": "echo ok"}])
-        self.p.commit(".daedalus/plan.md", PLAN, "docs: plan")
+        self.p.commit(".regista/plan.md", PLAN, "docs: plan")
 
     def tearDown(self):
         self.p.cleanup()
 
     def test_plan_milestones_in_order_with_open_steps(self):
-        ms = dd.plan_milestones(self.p.root, dd.load_config(self.p.root))
+        ms = regista.plan_milestones(self.p.root, regista.load_config(self.p.root))
         self.assertEqual([(m["id"], m["title"], m["open_steps"]) for m in ms], [("M1", "Stats", 1), ("M2", "CLI", 1)])
 
     def test_start_status_end(self):
@@ -1047,7 +1157,7 @@ class BuildAll(unittest.TestCase):
         self.assertIsNone(self.p.hook("stop", {"stop_hook_active": True}))
 
     def test_only_the_orchestrator_starts_or_ends_a_run(self):
-        for cmd in (f'python "{DD}" run start', f'python "{DD}" run end --reason done'):
+        for cmd in (f'python "{TOOL}" run start', f'python "{TOOL}" run end --reason done'):
             self.assertEqual(decision(self.p.hook("pre-tool", as_agent("builder", "Bash", command=cmd))), "deny")
             self.assertIsNone(decision(self.p.hook("pre-tool", as_agent(None, "Bash", command=cmd))))
 
@@ -1055,17 +1165,17 @@ class BuildAll(unittest.TestCase):
 class TryItYourself(unittest.TestCase):
     def setUp(self):
         self.p = Project(gates=[{"name": "tests", "run": "echo ok"}])
-        self.p.write(".daedalus/specs/signup.json", json.dumps(TRY_SPEC))
+        self.p.write(".regista/specs/signup.json", json.dumps(TRY_SPEC))
 
     def tearDown(self):
         self.p.cleanup()
 
     def state(self):
-        return dd.load_json(dd.requirements_path(self.p.root), {})
+        return regista.load_json(regista.requirements_path(self.p.root), {})
 
     def typed(self, args, **extra):
-        return self.p.hook("user-prompt-expansion", {"command_name": "daedalus:verify", "command_args": args,
-                                                     "prompt": f"/daedalus:verify {args}", **extra})
+        return self.p.hook("user-prompt-expansion", {"command_name": "regista:verify", "command_args": args,
+                                                     "prompt": f"/regista:verify {args}", **extra})
 
     def test_checklist(self):
         out = self.p.cli("try", "M1").stdout
@@ -1075,7 +1185,7 @@ class TryItYourself(unittest.TestCase):
         self.assertIn("You should see: No sideways scrolling", out)
         self.assertIn("optional: the gates already prove this one", out)
         self.assertIn("no steps written yet", out)  # UI-3 has no try steps
-        self.assertIn("/daedalus:verify UI-1 ok", out)
+        self.assertIn("/regista:verify UI-1 ok", out)
         self.assertIn("UI-1", self.p.cli("status").stdout)
 
     def test_user_typed_verify_records(self):
@@ -1097,23 +1207,23 @@ class TryItYourself(unittest.TestCase):
                                                                 "prompt": "/other:verify UI-1 ok"}))
 
     def test_agents_cant_record_checks(self):
-        for payload in (as_agent(None, "Skill", skill="daedalus:verify", args="UI-1 ok"),
-                        as_agent(None, "Bash", command=f'python "{DD}" try --ask'),
-                        as_agent("builder", "Bash", command=f'echo y | python "{DD}" try M1 --ask'),
-                        as_agent(None, "Bash", command=f'python "{DD}" verify-manual UI-1 --note x')):
+        for payload in (as_agent(None, "Skill", skill="regista:verify", args="UI-1 ok"),
+                        as_agent(None, "Bash", command=f'python "{TOOL}" try --ask'),
+                        as_agent("builder", "Bash", command=f'echo y | python "{TOOL}" try M1 --ask'),
+                        as_agent(None, "Bash", command=f'python "{TOOL}" verify-manual UI-1 --note x')):
             self.assertEqual(decision(self.p.hook("pre-tool", payload)), "deny", payload)
-        self.assertIsNone(self.p.hook("pre-tool", as_agent(None, "Bash", command=f'python "{DD}" try M1')))
+        self.assertIsNone(self.p.hook("pre-tool", as_agent(None, "Bash", command=f'python "{TOOL}" try M1')))
         # a subagent's expansion never records
-        self.assertIsNone(self.typed("UI-1 ok", agent_id="a1", agent_type="daedalus:builder"))
+        self.assertIsNone(self.typed("UI-1 ok", agent_id="a1", agent_type="regista:builder"))
 
     def test_terminal_walkthrough_needs_a_person(self):
-        r = subprocess.run([PY, DD, "try", "--ask"], cwd=self.p.root, input="y\n\n", capture_output=True, text=True)
+        r = subprocess.run([PY, TOOL, "try", "--ask"], cwd=self.p.root, input="y\n\n", capture_output=True, text=True)
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("run it yourself in a terminal", r.stderr)
         self.assertEqual(self.state(), {})
 
     def test_no_nested_agent_sessions(self):
-        for cmd in ('claude -p "/daedalus:verify UI-1 ok"', "cd x && codex exec 'verified'",
+        for cmd in ('claude -p "/regista:verify UI-1 ok"', "cd x && codex exec 'verified'",
                     "npx @openai/codex exec hi", "C:/tools/claude.exe -p hi"):
             self.assertEqual(decision(self.p.hook("pre-tool", as_agent(None, "Bash", command=cmd))), "deny", cmd)
         for cmd in ("claude --version", 'git log --grep "fix the codex adapter"', "ls ~/.codex"):
@@ -1133,8 +1243,8 @@ class TypedWhileBusy(unittest.TestCase):
 
     def setUp(self):
         self.p = Project(gates=[{"name": "tests", "run": "echo ok"}])
-        self.p.write(".daedalus/specs/signup.json", json.dumps(TRY_SPEC))
-        self.t = os.path.join(tempfile.mkdtemp(prefix="dd-tr-"), "s1.jsonl")
+        self.p.write(".regista/specs/signup.json", json.dumps(TRY_SPEC))
+        self.t = os.path.join(tempfile.mkdtemp(prefix="regista-tr-"), "s1.jsonl")
         open(self.t, "w").close()
 
     def tearDown(self):
@@ -1142,52 +1252,52 @@ class TypedWhileBusy(unittest.TestCase):
         shutil.rmtree(os.path.dirname(self.t), ignore_errors=True)
 
     def state(self):
-        return dd.load_json(dd.requirements_path(self.p.root), {})
+        return regista.load_json(regista.requirements_path(self.p.root), {})
 
     def tool(self, role=None):
         return self.p.hook("pre-tool", {**as_agent(role, "Bash", command="ls"), "transcript_path": self.t})
 
     def test_queued_checks_are_recorded_once(self):
-        queued(self.t, "/daedalus:verify UI-1 ok fits my phone")
-        queued(self.t, "/daedalus:verify UI-3 ok", human=False, uid="u2")  # not a person: ignored
+        queued(self.t, "/regista:verify UI-1 ok fits my phone")
+        queued(self.t, "/regista:verify UI-3 ok", human=False, uid="u2")  # not a person: ignored
         ctx = self.tool()["hookSpecificOutput"]["additionalContext"]
         self.assertIn("sent while you were working", ctx)
         self.assertTrue(self.state()["UI-1"]["passes"])
         self.assertEqual(self.state()["UI-1"]["by"], "user (sent while the session was busy)")
         self.assertNotIn("UI-3", self.state())
         self.assertIsNone(self.tool())  # once only
-        queued(self.t, "/daedalus:verify UI-3 ok", uid="u9")
+        queued(self.t, "/regista:verify UI-3 ok", uid="u9")
         out = self.p.hook("pre-tool", {**as_agent(None, "Write", file_path=os.path.join(
-            self.p.root, ".daedalus", "gates", "requirements.json")), "transcript_path": self.t})
+            self.p.root, ".regista", "gates", "requirements.json")), "transcript_path": self.t})
         self.assertIn("UI-3 as verified", out["hookSpecificOutput"]["permissionDecisionReason"])  # even when refused
 
     def test_stop_reports_a_queued_check(self):
-        queued(self.t, "/daedalus:verify UI-3 fail the logo is cut off", uid="u3")
+        queued(self.t, "/regista:verify UI-3 fail the logo is cut off", uid="u3")
         out = self.p.hook("stop", {"transcript_path": self.t})
         self.assertEqual(out.get("decision"), "block")
         self.assertIn("NOT working", out["reason"])
         self.assertFalse(self.state()["UI-3"]["passes"])
 
     def test_several_checks_in_one_message(self):
-        text = "/daedalus:verify UI-1 ok /daedalus:verify UI-3 ok\nUI-1 ok looks right"
-        self.assertEqual(dd.typed_items(text), [("verify", "UI-1 ok"), ("verify", "UI-3 ok"),
+        text = "/regista:verify UI-1 ok /regista:verify UI-3 ok\nUI-1 ok looks right"
+        self.assertEqual(regista.typed_items(text), [("verify", "UI-1 ok"), ("verify", "UI-3 ok"),
                                                 ("verify", "UI-1 ok looks right")])
-        self.assertEqual(dd.typed_items("/daedalus:verify UI-3 fail the button\nis purple"),
+        self.assertEqual(regista.typed_items("/regista:verify UI-3 fail the button\nis purple"),
                          [("verify", "UI-3 fail the button is purple")])
-        out = self.p.hook("user-prompt-expansion", {"command_name": "daedalus:verify", "command_args": "UI-1 ok",
-                                                    "prompt": "/daedalus:verify UI-1 ok\n/daedalus:verify UI-3 ok"})
+        out = self.p.hook("user-prompt-expansion", {"command_name": "regista:verify", "command_args": "UI-1 ok",
+                                                    "prompt": "/regista:verify UI-1 ok\n/regista:verify UI-3 ok"})
         self.assertIn("UI-3", out["hookSpecificOutput"]["additionalContext"])
         self.assertTrue(self.state()["UI-1"]["passes"] and self.state()["UI-3"]["passes"])
 
     def test_all_ok_records_every_waiting_check(self):
-        queued(self.t, "/daedalus:verify UI-3 fail colours off", uid="a")
-        queued(self.t, "/daedalus:verify all ok", uid="b")
+        queued(self.t, "/regista:verify UI-3 fail colours off", uid="a")
+        queued(self.t, "/regista:verify all ok", uid="b")
         ctx = self.tool()["hookSpecificOutput"]["additionalContext"]
         self.assertIn("UI-1 as verified by the user (they typed `all ok`)", ctx)
         self.assertTrue(self.state()["UI-1"]["passes"])
         self.assertFalse(self.state()["UI-3"]["passes"])  # a reported problem isn't swept up by "all ok"
-        out = self.p.hook("user-prompt-expansion", {"command_name": "daedalus:verify", "command_args": "all fail",
-                                                    "prompt": "/daedalus:verify all fail"})
+        out = self.p.hook("user-prompt-expansion", {"command_name": "regista:verify", "command_args": "all fail",
+                                                    "prompt": "/regista:verify all fail"})
         self.assertIn("doesn't say which check failed", out["hookSpecificOutput"]["additionalContext"])
 
     def test_manual_requirements_read_as_waiting_not_uncovered(self):
@@ -1201,7 +1311,7 @@ class Changes(unittest.TestCase):
 
     def setUp(self):
         self.p = Project(gates=[{"name": "tests", "run": "echo ok"}])
-        self.t = os.path.join(tempfile.mkdtemp(prefix="dd-tr-"), "s1.jsonl")
+        self.t = os.path.join(tempfile.mkdtemp(prefix="regista-tr-"), "s1.jsonl")
         open(self.t, "w").close()
 
     def tearDown(self):
@@ -1209,11 +1319,11 @@ class Changes(unittest.TestCase):
         shutil.rmtree(os.path.dirname(self.t), ignore_errors=True)
 
     def test_typed_and_queued_changes_are_recorded_and_shown(self):
-        out = self.p.hook("user-prompt-expansion", {"command_name": "daedalus:change",
+        out = self.p.hook("user-prompt-expansion", {"command_name": "regista:change",
                                                     "command_args": "add club crests, build it last",
-                                                    "prompt": "/daedalus:change add club crests, build it last"})
+                                                    "prompt": "/regista:change add club crests, build it last"})
         self.assertIn("recorded change 1", out["hookSpecificOutput"]["additionalContext"])
-        queued(self.t, "/daedalus:change the bottom bar gets five slots")
+        queued(self.t, "/regista:change the bottom bar gets five slots")
         self.p.hook("pre-tool", {**as_agent(None, "Bash", command="ls"), "transcript_path": self.t})
         start = self.p.hook("session-start", {})["hookSpecificOutput"]["additionalContext"]
         self.assertIn("club crests", start)
@@ -1226,18 +1336,18 @@ class Changes(unittest.TestCase):
     def test_only_the_user_adds_changes(self):
         for role in (None, "builder"):
             self.assertEqual(decision(self.p.hook("pre-tool", as_agent(role, "Bash",
-                                                                       command=f'python "{DD}" change add more pages'))),
+                                                                       command=f'python "{TOOL}" change add more pages'))),
                              "deny", role)
-        self.assertEqual(decision(self.p.hook("pre-tool", as_agent(None, "Skill", skill="daedalus:change"))), "deny")
+        self.assertEqual(decision(self.p.hook("pre-tool", as_agent(None, "Skill", skill="regista:change"))), "deny")
         self.assertEqual(decision(self.p.hook("pre-tool", as_agent("builder", "Bash",
-                                                                   command=f'python "{DD}" change done 1'))), "deny")
+                                                                   command=f'python "{TOOL}" change done 1'))), "deny")
         self.assertEqual(self.p.cli("change", "add", "a", "price", "page").returncode, 0)  # the user's own terminal
         self.assertIn("price page", self.p.cli("change").stdout)
 
     def test_after_rules_set_the_build_order(self):
         plan = ("# Plan\n\n## M1 — Engine\n- [x] core\n\n## M9 — Crests\nAfter: all\n- [ ] tiles\n\n"
                 "## M2 — Prices\nAfter: M3\n- [ ] page\n\n## M3 — What-if\n- [ ] toggles\n")
-        self.p.commit(".daedalus/plan.md", plan, "plan")
+        self.p.commit(".regista/plan.md", plan, "plan")
         out = self.p.cli("run").stdout
         order = [ln.split(" ")[1] for ln in out.splitlines() if ln.startswith("- M")]
         self.assertEqual(order, ["M1", "M3", "M2", "M9"])
@@ -1249,8 +1359,8 @@ class RunOutcome(unittest.TestCase):
     def test_a_run_that_only_waits_on_the_user_says_so(self):
         p = Project(gates=[{"name": "tests", "run": "echo ok"}, E2E_GATE])
         try:
-            p.commit(".daedalus/plan.md", "# Plan\n\n## M1 — Sign-up\n- [x] form\n", "plan")
-            p.write(".daedalus/specs/signup.json", json.dumps(TRY_SPEC))
+            p.commit(".regista/plan.md", "# Plan\n\n## M1 — Sign-up\n- [x] form\n", "plan")
+            p.write(".regista/specs/signup.json", json.dumps(TRY_SPEC))
             p.write("e2e/signup_test.sh", "# covers: UI-2\n")
             self.assertIsNone(decision(p.hook("pre-tool", as_agent(None, "Bash", command="git add -A && git commit -m x"))))
             self.assertIn("waits only on the user's checks", p.cli("run").stdout)
@@ -1265,7 +1375,7 @@ class Deploy(unittest.TestCase):
     """Two FPL bugs were live while the repository was right: deploys run the live checks."""
 
     def setUp(self):
-        self.live = tempfile.mktemp(prefix="dd-live-")
+        self.live = tempfile.mktemp(prefix="regista-live-")
         self.p = Project(gates=[{"name": "tests", "run": "echo ok"},
                                 {"name": "live", "run": f"grep -q fresh {self.live}", "when": ["deploy"]}],
                          deploy={"run": f"cat version.txt > {self.live}"})
@@ -1295,16 +1405,16 @@ class Deploy(unittest.TestCase):
         self.assertIn("Commit first", r.stdout)
         out = self.p.hook("pre-tool", as_agent(None, "Bash", command=f"cat version.txt > {self.live}"))
         self.assertEqual(decision(out), "deny")
-        self.assertIn("dd.py", out["hookSpecificOutput"]["permissionDecisionReason"])
-        self.assertEqual(decision(self.p.hook("pre-tool", as_agent("builder", "Bash", command=f'python "{DD}" deploy'))),
+        self.assertIn("regista.py", out["hookSpecificOutput"]["permissionDecisionReason"])
+        self.assertEqual(decision(self.p.hook("pre-tool", as_agent("builder", "Bash", command=f'python "{TOOL}" deploy'))),
                          "deny")
-        self.assertIsNone(decision(self.p.hook("pre-tool", as_agent(None, "Bash", command=f'python "{DD}" deploy'))))
+        self.assertIsNone(decision(self.p.hook("pre-tool", as_agent(None, "Bash", command=f'python "{TOOL}" deploy'))))
 
     def test_plain_gate_runs_skip_live_checks(self):
         self.assertNotIn("live", self.p.cli("gate").stdout)
 
 
-LAUNCHER = os.path.join(os.path.dirname(DD), "dd")
+LAUNCHER = os.path.join(os.path.dirname(TOOL), "regista")
 
 
 FAKE = r'''#!PYTHON
@@ -1375,15 +1485,15 @@ class Fleet(unittest.TestCase):
         self.p = Project(gates=[{"name": "tests", "run": "test ! -f broken.txt", "when": ["commit"]}],
                          review={"required_for": []}, requirements={"enforce_coverage": False,
                                                                      "milestone_needs_e2e": False})
-        self.p.commit(".daedalus/plan.md", FLEET_PLAN, "plan")
-        self.fake = tempfile.mkdtemp(prefix="dd-fake-")
+        self.p.commit(".regista/plan.md", FLEET_PLAN, "plan")
+        self.fake = tempfile.mkdtemp(prefix="regista-fake-")
         for tool in ("claude", "tmux"):
             path = os.path.join(self.fake, tool)
             with open(path, "w", encoding="utf-8") as f:
                 f.write(FAKE.replace("PYTHON", sys.executable))
             os.chmod(path, 0o755)
-        self.env = {"DAEDALUS_CLAUDE": os.path.join(self.fake, "claude"), "DAEDALUS_TMUX": os.path.join(self.fake, "tmux"),
-                    "FAKE_DIR": self.fake, "DAEDALUS_LAUNCH_WAIT": "3", "CLAUDE_CODE_SESSION_ID": "overseer-1"}
+        self.env = {"REGISTA_CLAUDE": os.path.join(self.fake, "claude"), "REGISTA_TMUX": os.path.join(self.fake, "tmux"),
+                    "FAKE_DIR": self.fake, "REGISTA_LAUNCH_WAIT": "3", "CLAUDE_CODE_SESSION_ID": "overseer-1"}
 
     def tearDown(self):
         sh(self.p.root, "git", "worktree", "prune")
@@ -1393,7 +1503,7 @@ class Fleet(unittest.TestCase):
     def fleet(self, *args, cwd=None):
         env = {k: v for k, v in os.environ.items() if k != "CLAUDE_PROJECT_DIR"}
         env.update(self.env)
-        return subprocess.run([PY, DD, "fleet", *args], cwd=cwd or self.p.root, capture_output=True, text=True,
+        return subprocess.run([PY, TOOL, "fleet", *args], cwd=cwd or self.p.root, capture_output=True, text=True,
                               encoding="utf-8", env=env)
 
     def hook(self, event, payload, cwd=None):
@@ -1404,36 +1514,60 @@ class Fleet(unittest.TestCase):
             return [c for c in map(json.loads, f) if c["tool"] == tool]
 
     def wt(self, name="m2"):
-        return os.path.join(self.p.root, ".daedalus", "worktrees", name)
+        return os.path.join(self.p.root, ".regista", "worktrees", name)
 
     def spawn(self, target="M2", *extra):
-        # the overseer's hook sees it run `dd.py fleet` and notes its session and permission mode
-        self.hook("pre-tool", {**bash(f'python3 "{DD}" fleet spawn {target}'), "session_id": "overseer-1",
+        # the overseer's hook sees it run `regista.py fleet` and notes its session and permission mode
+        self.hook("pre-tool", {**bash(f'python3 "{TOOL}" fleet spawn {target}'), "session_id": "overseer-1",
                                "permission_mode": "acceptEdits"})
         return self.fleet("spawn", target, *extra)
 
-    def test_spawn_starts_a_worker_in_its_own_worktree(self):
+    def test_spawn_starts_a_worker_in_its_own_worktree(self):  # covers: CODE-2, CODE-3
         r = self.spawn()
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("https://claude.ai/code/session_TEST123", r.stdout)
         self.assertTrue(os.path.isfile(os.path.join(self.wt(), "README.md")))
-        self.assertEqual(sh(self.wt(), "git", "rev-parse", "--abbrev-ref", "HEAD").strip(), "daedalus/m2")
-        info = jload(os.path.join(self.wt(), ".daedalus", "worker.json"))
+        self.assertEqual(sh(self.wt(), "git", "rev-parse", "--abbrev-ref", "HEAD").strip(), "regista/m2")
+        info = jload(os.path.join(self.wt(), ".regista", "worker.json"))
         self.assertEqual((info["milestone"], info["slot"], info["overseer_root"]), ("M2", 1, self.p.root))
-        self.assertTrue(jload(os.path.join(self.wt(), ".daedalus", "run.json"))["active"])
+        self.assertTrue(jload(os.path.join(self.wt(), ".regista", "run.json"))["active"])
         new = self.calls("tmux")[0]["args"]
         self.assertEqual(new[:2], ["new-session", "-d"])
         self.assertIn("--remote-control", new[-1])
         self.assertIn("--permission-mode acceptEdits", new[-1])  # the overseer's mode, so messages flow
-        self.assertIn("/daedalus:build M2", new[-1])
+        self.assertIn("/regista:build M2", new[-1])
         self.assertEqual(sh(self.p.root, "git", "status", "--porcelain").strip(), "")  # the overseer's tree stays clean
-        w = jload(os.path.join(self.p.root, ".daedalus", "fleet", "workers.json"))["m2"]
+        with open(os.path.join(self.p.root, ".git", "info", "exclude"), encoding="utf-8") as f:
+            exclude = f.read()
+        self.assertIn("# Regista workers", exclude)  # the ignore entry for the worktrees, under the new name
+        self.assertIn(".regista/", exclude)
+        self.assertNotIn("aedalus", exclude)
+        w = jload(os.path.join(self.p.root, ".regista", "fleet", "workers.json"))["m2"]
         self.assertEqual((w["state"], w["session_name"]), ("running", "demo-m2"))
         self.assertTrue(w["session_id"])
         status = self.fleet().stdout
         self.assertIn("m2: M2 — Pages", status)
         self.assertIn("M3 (Charts)", status)  # ready: nothing holds it back
         self.assertNotIn("M4 (", status)  # After: M2, which isn't merged yet
+
+    def test_spawn_with_the_old_variable_names(self):  # covers: CODE-6
+        # stand-ins on PATH that do nothing, so a missed fallback can't start the real tools
+        tools = sorted(os.listdir(self.fake))  # the two fake tools
+        decoy = os.path.join(self.fake, "decoy")
+        os.makedirs(decoy)
+        for tool in tools:
+            path = os.path.join(decoy, tool)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("#!/bin/sh\nexit 97\n")
+            os.chmod(path, 0o755)
+        self.env = {k.replace("REGISTA_", "DAEDALUS_"): v for k, v in self.env.items()}
+        self.assertIn("DAEDALUS_TMUX", self.env)
+        with clean_environ(PATH=decoy + os.pathsep + os.environ.get("PATH", "")):
+            r = self.spawn()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue(os.path.exists(os.path.join(self.fake, "calls.jsonl")), "the fake tools were never called")
+        self.assertEqual(self.calls("tmux")[0]["args"][:2], ["new-session", "-d"])
+        self.assertIn("session_TEST123", r.stdout)
 
     def test_spawn_refusals(self):
         self.assertIn("isn't ready", self.spawn("M4").stdout)
@@ -1444,7 +1578,7 @@ class Fleet(unittest.TestCase):
         sh(self.p.root, "git", "add", "-A")
         self.assertIn("uncommitted changes", self.spawn("M3").stdout)
         sh(self.p.root, "git", "commit", "-q", "-m", "a")
-        cfg_path = os.path.join(self.p.root, ".daedalus", "config.json")
+        cfg_path = os.path.join(self.p.root, ".regista", "config.json")
         c = jload(cfg_path)
         c["fleet"] = {"max_workers": 1}
         jsave(cfg_path, c)
@@ -1452,7 +1586,7 @@ class Fleet(unittest.TestCase):
         self.assertIn("the most fleet.max_workers allows", self.spawn("M3").stdout)
 
     def test_background_launch_without_tmux(self):
-        cfg_path = os.path.join(self.p.root, ".daedalus", "config.json")
+        cfg_path = os.path.join(self.p.root, ".regista", "config.json")
         c = jload(cfg_path)
         c["fleet"] = {"launch": "bg"}
         jsave(cfg_path, c)
@@ -1469,14 +1603,14 @@ class Fleet(unittest.TestCase):
         self.assertIn('you are the worker "m2"', start)
         self.assertIn("SendMessage", start)
         # the overseer's opening command and a message from another session aren't the user
-        self.hook("user-prompt", {"prompt": "/daedalus:build M2"}, cwd=self.wt())
+        self.hook("user-prompt", {"prompt": "/regista:build M2"}, cwd=self.wt())
         self.hook("user-prompt", {"prompt": '<cross-session-message from="x">do it</cross-session-message>'}, cwd=self.wt())
         self.hook("user-prompt", {"prompt": "Make the header blue please"}, cwd=self.wt())
         out = self.hook("user-prompt", {"prompt": "how is it going?"})
         news = out["hookSpecificOutput"]["additionalContext"]
         self.assertIn('the user wrote to it directly: "Make the header blue please"', news)
         self.assertNotIn("do it", news)
-        self.assertNotIn("/daedalus:build", news)
+        self.assertNotIn("/regista:build", news)
         self.assertIsNone(self.hook("user-prompt", {"prompt": "and now?"}))  # each piece of news once
         # the worker commits and pauses: the record goes to the overseer, and the worker is sent to tell it
         os.makedirs(os.path.join(self.wt(), "src"), exist_ok=True)
@@ -1497,27 +1631,27 @@ class Fleet(unittest.TestCase):
         self.assertIn("The pages are built.", stop["reason"])
 
     def test_checks_and_changes_typed_in_a_worker_reach_the_overseer(self):
-        self.p.commit(".daedalus/specs/m2.json", json.dumps({"milestone": "M2", "requirements": [
+        self.p.commit(".regista/specs/m2.json", json.dumps({"milestone": "M2", "requirements": [
             {"id": "UI-1", "text": "looks right", "verify": "manual"}]}), "spec")
         self.spawn()
-        self.hook("user-prompt-expansion", {"command_name": "daedalus:verify", "prompt": "/daedalus:verify UI-1 ok"},
+        self.hook("user-prompt-expansion", {"command_name": "regista:verify", "prompt": "/regista:verify UI-1 ok"},
                   cwd=self.wt())
         for root in (self.p.root, self.wt()):
-            state = jload(os.path.join(root, ".daedalus", "gates", "requirements.json"))
+            state = jload(os.path.join(root, ".regista", "gates", "requirements.json"))
             self.assertTrue(state["UI-1"]["passes"], root)
-        out = self.hook("user-prompt-expansion", {"command_name": "daedalus:change",
-                                                  "prompt": "/daedalus:change add a dark mode"}, cwd=self.wt())
+        out = self.hook("user-prompt-expansion", {"command_name": "regista:change",
+                                                  "prompt": "/regista:change add a dark mode"}, cwd=self.wt())
         self.assertIn("for the overseer", out["hookSpecificOutput"]["additionalContext"])
-        changes = jload(os.path.join(self.p.root, ".daedalus", "changes.json"))
+        changes = jload(os.path.join(self.p.root, ".regista", "changes.json"))
         self.assertEqual(changes[0]["text"], "add a dark mode")
-        self.assertFalse(os.path.exists(os.path.join(self.wt(), ".daedalus", "changes.json")))
+        self.assertFalse(os.path.exists(os.path.join(self.wt(), ".regista", "changes.json")))
 
     def test_who_may_do_what(self):
         self.spawn()
         w = self.wt()
-        for cmd in (f'python3 "{DD}" fleet spawn M3', "git push origin daedalus/m2", f'python3 "{DD}" deploy'):
+        for cmd in (f'python3 "{TOOL}" fleet spawn M3', "git push origin regista/m2", f'python3 "{TOOL}" deploy'):
             self.assertEqual(decision(self.hook("pre-tool", bash(cmd), cwd=w)), "deny", cmd)
-        self.assertIsNone(decision(self.hook("pre-tool", bash(f'python3 "{DD}" fleet'), cwd=w)))  # looking is fine
+        self.assertIsNone(decision(self.hook("pre-tool", bash(f'python3 "{TOOL}" fleet'), cwd=w)))  # looking is fine
         out = self.hook("pre-tool", {"tool_name": "Write", "tool_input": {
             "file_path": os.path.join(self.p.root, "src", "x.py"), "content": ""}}, cwd=w)
         self.assertEqual(decision(out), "deny")
@@ -1525,10 +1659,10 @@ class Fleet(unittest.TestCase):
         out = self.hook("pre-tool", {"tool_name": "Edit", "tool_input": {
             "file_path": os.path.join(w, "src", "x.py")}})
         self.assertEqual(decision(out), "deny")  # the overseer doesn't edit a worker's files
-        out = self.hook("pre-tool", {**bash(f"echo x > {self.p.root}/.daedalus/fleet/events.jsonl")})
+        out = self.hook("pre-tool", {**bash(f"echo x > {self.p.root}/.regista/fleet/events.jsonl")})
         self.assertEqual(decision(out), "deny")
-        out = self.hook("pre-tool", {**bash(f'python3 "{DD}" fleet merge m2'), "agent_id": "a1",
-                                     "agent_type": "daedalus:builder"})
+        out = self.hook("pre-tool", {**bash(f'python3 "{TOOL}" fleet merge m2'), "agent_id": "a1",
+                                     "agent_type": "regista:builder"})
         self.assertEqual(decision(out), "deny")
 
     def worker_commit(self, rel, text, msg="feat: work"):
@@ -1540,10 +1674,10 @@ class Fleet(unittest.TestCase):
         sh(self.wt(), "git", "commit", "-q", "-m", msg)
 
     def test_merge_behind_the_gates(self):
-        self.p.commit(".daedalus/TODO.md", "# Board\n- [ ] decide the colours\n", "board")
+        self.p.commit(".regista/TODO.md", "# Board\n- [ ] decide the colours\n", "board")
         self.spawn()
         self.worker_commit("src/pages.py", "pages = 1\n")
-        self.worker_commit(".daedalus/TODO.md", "# Board\n- [ ] decide the colours\n- [ ] ask about fonts\n", "board")
+        self.worker_commit(".regista/TODO.md", "# Board\n- [ ] decide the colours\n- [ ] ask about fonts\n", "board")
         self.p.commit("other.txt", "overseer's own commit\n", "other")
         r = self.fleet("merge", "m2")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
@@ -1551,7 +1685,7 @@ class Fleet(unittest.TestCase):
         self.assertIn("ask about fonts", r.stdout)  # its board lines are handed to the overseer
         self.assertIn("tests: PASS", r.stdout)
         self.assertEqual(sh(self.p.root, "git", "show", "HEAD:src/pages.py"), "pages = 1\n")
-        self.assertNotIn("fonts", sh(self.p.root, "git", "show", "HEAD:.daedalus/TODO.md"))
+        self.assertNotIn("fonts", sh(self.p.root, "git", "show", "HEAD:.regista/TODO.md"))
         self.assertEqual(len(sh(self.p.root, "git", "show", "-s", "--format=%P", "HEAD").split()), 2)
         self.assertEqual(sh(self.p.root, "git", "status", "--porcelain", "--untracked-files=no").strip(), "")
         self.assertIn("Nothing to merge", self.fleet("merge", "m2").stdout)
@@ -1582,11 +1716,11 @@ class Fleet(unittest.TestCase):
         self.assertEqual(sh(self.p.root, "git", "status", "--porcelain", "--untracked-files=no").strip(), "")
 
     def test_harness_records_merge_by_content(self):
-        self.assertEqual(dd.merge_json({"a": {"at": "1"}}, {"a": {"at": "2", "passes": False}, "b": 1},
+        self.assertEqual(regista.merge_json({"a": {"at": "1"}}, {"a": {"at": "2", "passes": False}, "b": 1},
                                        {"a": {"at": "3", "passes": True}, "c": 2}),
                          {"a": {"at": "3", "passes": True}, "b": 1, "c": 2})
-        self.assertEqual(dd.merge_json(["x"], ["x", "y"], ["x", "z"]), ["x", "y", "z"])
-        self.assertEqual(dd.merge_json({"k": 1, "gone": 1}, {"k": 1, "gone": 1}, {"k": 2}), {"k": 2})
+        self.assertEqual(regista.merge_json(["x"], ["x", "y"], ["x", "z"]), ["x", "y", "z"])
+        self.assertEqual(regista.merge_json({"k": 1, "gone": 1}, {"k": 1, "gone": 1}, {"k": 2}), {"k": 2})
 
     def test_stop_resume_remove(self):
         self.spawn()
@@ -1602,7 +1736,7 @@ class Fleet(unittest.TestCase):
         r = self.fleet("remove", "m2")
         self.assertEqual(r.returncode, 0, r.stdout)
         self.assertFalse(os.path.exists(self.wt()))
-        self.assertEqual(sh(self.p.root, "git", "branch", "--list", "daedalus/m2").strip(), "")
+        self.assertEqual(sh(self.p.root, "git", "branch", "--list", "regista/m2").strip(), "")
         r = self.spawn("M2")  # its steps are still open in the plan
         self.assertIn('"demo-m2-2"', r.stdout)  # a new session gets a name of its own
 
@@ -1610,12 +1744,12 @@ class Fleet(unittest.TestCase):
         self.spawn()
         tp = os.path.join(self.fake, "worker.jsonl")
         with open(tp, "w", encoding="utf-8") as f:
-            for d in ({"type": "user", "message": {"content": "/daedalus:build M2"}},
+            for d in ({"type": "user", "message": {"content": "/regista:build M2"}},
                       {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "SendMessage"}]}},
                       {"type": "user", "message": {"content": [{"type": "tool_result", "content": "sent"}]}},
                       {"type": "assistant", "message": {"content": [{"type": "text", "text": "Done; told the overseer."}]}}):
                 f.write(json.dumps(d) + "\n")
-        jsave(os.path.join(self.wt(), ".daedalus", "run.json"), {"active": False})
+        jsave(os.path.join(self.wt(), ".regista", "run.json"), {"active": False})
         self.worker_commit("src/pages.py", "pages = 1\n")
         self.assertIsNone(self.hook("stop", {"transcript_path": tp}, cwd=self.wt()))
         self.worker_commit("src/more.py", "more = 1\n")
@@ -1639,19 +1773,32 @@ class Fleet(unittest.TestCase):
         self.assertEqual(self.fleet("remove", "m2").returncode, 0)
 
     def test_init_proposes_how_a_worktree_gets_its_dependencies(self):
-        self.assertEqual(dd.worktree_setup(self.p.root), "")
+        self.assertEqual(regista.worktree_setup(self.p.root), "")
         self.p.write("package-lock.json", "{}")
-        self.assertEqual(dd.worktree_setup(self.p.root), "npm ci --silent --no-audit --no-fund")
-        self.assertEqual(dd.detect(self.p.root)["fleet"]["setup"], "npm ci --silent --no-audit --no-fund")
+        self.assertEqual(regista.worktree_setup(self.p.root), "npm ci --silent --no-audit --no-fund")
+        self.assertEqual(regista.detect(self.p.root)["fleet"]["setup"], "npm ci --silent --no-audit --no-fund")
 
-    def test_workers_share_one_gate_lock_and_learn_their_slot(self):
+    def test_workers_share_one_gate_lock_and_learn_their_slot(self):  # covers: CODE-2
         self.spawn()
-        self.assertEqual(dd.gate_lock_path(self.wt()), dd.gate_lock_path(self.p.root))
-        self.assertTrue(dd.gate_lock_path(self.wt()).endswith("daedalus-gates.lock"))
-        self.assertEqual(dd.gate_env(self.wt())["DAEDALUS_SLOT"], "1")
-        self.assertEqual(dd.gate_env(self.p.root)["DAEDALUS_SLOT"], "0")
-        self.assertIn("M2", dd.run_text(self.wt(), dd.load_config(self.wt())))
-        self.assertNotIn("M3", dd.run_text(self.wt(), dd.load_config(self.wt())))  # a worker's run is its milestone
+        self.assertEqual(regista.gate_lock_path(self.wt()), regista.gate_lock_path(self.p.root))
+        self.assertTrue(regista.gate_lock_path(self.wt()).endswith("regista-gates.lock"))
+        self.assertEqual(regista.gate_env(self.wt())["REGISTA_SLOT"], "1")
+        self.assertEqual(regista.gate_env(self.p.root)["REGISTA_SLOT"], "0")
+        self.assertIn("M2", regista.run_text(self.wt(), regista.load_config(self.wt())))
+        self.assertNotIn("M3", regista.run_text(self.wt(), regista.load_config(self.wt())))  # a worker's run is its milestone
+
+
+    def test_a_workers_gates_see_both_names(self):  # covers: CODE-5
+        self.spawn()
+        out = os.path.join(self.fake, "gate-env.txt")
+        with clean_environ():
+            env = regista.gate_env(self.wt())
+            res = regista.run_gates(self.wt(), regista.load_config(self.wt()), [env_gate(out)])
+        self.assertEqual((env["REGISTA_WORKER"], env["REGISTA_SLOT"]), ("m2", "1"))
+        self.assertEqual((env["DAEDALUS_WORKER"], env["DAEDALUS_SLOT"]), ("m2", "1"))
+        self.assertNotIn("fail", [r["status"] for r in res], res)
+        with open(out, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "W=m2 S=1 OW=m2 OS=1")
 
 
 class Launcher(unittest.TestCase):
@@ -1659,7 +1806,7 @@ class Launcher(unittest.TestCase):
 
     def setUp(self):
         self.p = Project(gates=[{"name": "tests", "run": "exit 1"}])
-        self.bin = tempfile.mkdtemp(prefix="dd-bin-")
+        self.bin = tempfile.mkdtemp(prefix="regista-bin-")
         for tool in ("sh", "dirname", "git", "bash", "cat"):
             found = shutil.which(tool)
             if found:
@@ -1671,30 +1818,72 @@ class Launcher(unittest.TestCase):
 
     def run_hook(self, event, payload):
         return subprocess.run(["sh", LAUNCHER, "hook", event], input=json.dumps({"cwd": self.p.root, **payload}),
-                              capture_output=True, text=True, env={"PATH": self.bin, "HOME": os.environ.get("HOME", "")})
+                              capture_output=True, text=True, cwd=self.p.root, env={"PATH": self.bin, "HOME": os.environ.get("HOME", "")})
 
-    def test_runs_with_only_python3(self):
+    def test_runs_with_only_python3(self):  # covers: CODE-1
         os.symlink(sys.executable, os.path.join(self.bin, "python3"))
         r = self.run_hook("pre-tool", bash("git commit -m x"))
         self.assertEqual(decision(json.loads(r.stdout)), "deny", r.stderr)
 
-    def test_without_python_guards_block_and_others_dont(self):
+    def test_without_python_guards_block_and_others_dont(self):  # covers: CODE-1
         r = self.run_hook("pre-tool", bash("ls"))
         self.assertEqual(r.returncode, 2)
         self.assertIn("needs Python 3.10", r.stderr)
         self.assertEqual(self.run_hook("stop", {}).returncode, 1)  # exit 2 would trap the session
 
-    def test_every_claude_hook_uses_the_launcher(self):
-        hooks = dd.load_json(os.path.join(dd.PLUGIN_ROOT, "hooks", "hooks.json"), {})["hooks"]
+    def test_every_claude_hook_uses_the_launcher(self):  # covers: DOC-2, CODE-1
+        hooks = regista.load_json(os.path.join(regista.PLUGIN_ROOT, "hooks", "hooks.json"), {})["hooks"]
         commands = [h["command"] for entries in hooks.values() for e in entries for h in e["hooks"]]
         self.assertEqual(len(commands), 9)
         for c in commands:
-            self.assertTrue(c.startswith('sh "${CLAUDE_PLUGIN_ROOT}/scripts/dd" hook '), c)
+            self.assertTrue(c.startswith('sh "${CLAUDE_PLUGIN_ROOT}/scripts/regista" hook '), c)
+
+    def test_every_codex_hook_runs_the_tool_with_python(self):  # covers: DOC-2
+        with open(os.path.join(os.path.dirname(os.path.dirname(TOOL)), "hooks", "codex-hooks.json"),
+                  encoding="utf-8") as f:
+            data = json.load(f)
+
+        def commands(value):
+            if isinstance(value, dict):
+                for k, v in value.items():
+                    if k == "command" and isinstance(v, str):
+                        yield v
+                    else:
+                        yield from commands(v)
+            elif isinstance(value, list):
+                for v in value:
+                    yield from commands(v)
+
+        found = list(commands(data))
+        self.assertTrue(found, "hooks/codex-hooks.json registers no command")
+        for c in found:
+            self.assertTrue(c.startswith('python "${PLUGIN_ROOT}/scripts/regista.py" hook '), c)
+            self.assertTrue(c.endswith("--host codex"), c)
+
+    def test_old_tool_files_are_gone(self):  # covers: CODE-1
+        scripts = os.path.dirname(TOOL)
+        self.assertTrue(os.path.isfile(LAUNCHER))
+        self.assertTrue(os.path.isfile(TOOL))
+        for old in ("dd", "dd.py"):
+            self.assertFalse(os.path.exists(os.path.join(scripts, old)), old)
+
+    def test_launcher_runs_the_tool(self):  # covers: CODE-1
+        env = {k: v for k, v in os.environ.items() if k != "CLAUDE_PROJECT_DIR"}
+        r = subprocess.run(["sh", LAUNCHER, "--help"], capture_output=True, text=True, encoding="utf-8", env=env,
+                           cwd=tempfile.gettempdir())
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("Core of the harness", r.stdout)
+        self.assertIn("regista.py", r.stdout)
+        self.assertNotIn("dd.py", r.stdout)
+        out = subprocess.run(["sh", LAUNCHER, "hook", "pre-tool"], input=json.dumps(
+            {"cwd": self.p.root, **bash("git push")}), capture_output=True, text=True, encoding="utf-8", env=env,
+            cwd=self.p.root)
+        self.assertEqual(decision(json.loads(out.stdout)), "ask", out.stdout + out.stderr)
 
 
 class Detect(unittest.TestCase):
     def setUp(self):
-        self.root = tempfile.mkdtemp(prefix="dd-detect-")
+        self.root = tempfile.mkdtemp(prefix="regista-detect-")
 
     def tearDown(self):
         shutil.rmtree(self.root, ignore_errors=True)
@@ -1706,7 +1895,7 @@ class Detect(unittest.TestCase):
             f.write(text)
 
     def test_empty_folder(self):
-        d = dd.detect(self.root)
+        d = regista.detect(self.root)
         self.assertEqual(d["gates"], [])
         self.assertTrue(any("no code yet" in n for n in d["notes"]))
         self.assertIn(".env", d["protected"])
@@ -1719,7 +1908,7 @@ class Detect(unittest.TestCase):
         self.write("playwright.config.ts", "export default { testDir: './e2e' }")
         self.write("app/page.tsx", "")
         self.write("node_modules/x/index.js", "")
-        d = dd.detect(self.root)
+        d = regista.detect(self.root)
         runs = {g["name"]: g for g in d["gates"]}
         self.assertEqual(d["kind"], "web app")
         self.assertEqual(runs["tests"]["run"], "pnpm run test")
@@ -1735,7 +1924,7 @@ class Detect(unittest.TestCase):
         self.write("uv.lock", "")
         self.write("calc/__init__.py", "")
         self.write("tests/test_calc.py", "")
-        d = dd.detect(self.root)
+        d = regista.detect(self.root)
         runs = {g["name"]: g["run"] for g in d["gates"]}
         self.assertEqual(d["kind"], "command-line tool")
         self.assertEqual(runs, {"tests": "uv run pytest -q", "lint": "uv run ruff check ."})
@@ -1743,16 +1932,18 @@ class Detect(unittest.TestCase):
         self.assertEqual(d["test_files"], 1)
         self.assertTrue(any("end-to-end" in n for n in d["notes"]))
 
-    def test_init_auto(self):
+    def test_init_auto(self):  # covers: CODE-2
         sh(self.root, "git", "init", "-q")
         self.write("go.mod", "module x\n")
-        r = subprocess.run([PY, DD, "init", "--auto", "--name", "X"], cwd=self.root, capture_output=True, text=True,
+        r = subprocess.run([PY, TOOL, "init", "--auto", "--name", "X"], cwd=self.root, capture_output=True, text=True,
                            env={**os.environ, "CLAUDE_PROJECT_DIR": self.root})
         self.assertEqual(r.returncode, 0, r.stderr)
-        cfg = dd.load_config(self.root)
+        self.assertTrue(os.path.isfile(os.path.join(self.root, ".regista", "config.json")))
+        self.assertFalse(os.path.exists(os.path.join(self.root, ".daedalus")))
+        cfg = regista.load_config(self.root)
         self.assertEqual([g["run"] for g in cfg["gates"]], ["go test ./...", "go vet ./..."])
         self.assertIn(".env", cfg["protected"])
-        self.assertEqual(dd.load_json(os.path.join(self.root, ".claude", "settings.json"), {})["env"],
+        self.assertEqual(regista.load_json(os.path.join(self.root, ".claude", "settings.json"), {})["env"],
                          {"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "65"})
 
 
@@ -1788,24 +1979,32 @@ class Codex(unittest.TestCase):
         out = self.hook("pre-tool", patch("Update File: README.md", "Add File: .env"))
         self.assertEqual(decision(out), "deny")
         self.assertIn(".env is protected", out["hookSpecificOutput"]["permissionDecisionReason"])
-        self.assertEqual(decision(self.hook("pre-tool", patch("Update File: README.md", "Move to: .daedalus/gates/x"))),
+        self.assertEqual(decision(self.hook("pre-tool", patch("Update File: README.md", "Move to: .regista/gates/x"))),
                          "deny")
         bad = {"tool_name": "apply_patch", "tool_input": {"command": "garbage"}}
         self.assertEqual(decision(self.hook("pre-tool", bad)), "deny")
 
-    def test_codex_agent_roles(self):
-        builder = {"agent_id": "t1", "agent_type": "daedalus-builder"}
+    def test_codex_agent_roles(self):  # covers: CODE-4
+        builder = {"agent_id": "t1", "agent_type": "regista-builder"}
         self.assertEqual(decision(self.hook("pre-tool", {**patch("Add File: tests/test_x.py"), **builder})), "deny")
         self.assertIsNone(self.hook("pre-tool", {**patch("Add File: src/x.py"), **builder}))
-        writer = {"agent_id": "t2", "agent_type": "daedalus-test-writer"}
+        writer = {"agent_id": "t2", "agent_type": "regista-test-writer"}
         self.assertEqual(decision(self.hook("pre-tool", {**patch("Add File: src/x.py"), **writer})), "deny")
         # the orchestrator doesn't edit source; Claude's role names mean nothing here
         self.assertEqual(decision(self.hook("pre-tool", patch("Add File: src/x.py"))), "deny")
         self.assertEqual(decision(self.hook("pre-tool", {**patch("Add File: src/x.py"), "agent_id": "t3",
-                                                         "agent_type": "daedalus:builder"})), "deny")
+                                                         "agent_type": "regista:builder"})), "deny")
         spawn = {"tool_name": "collaborationspawn_agent", "tool_input": {"message": "gAAAA"}}
         self.assertEqual(decision(self.hook("pre-tool", {**spawn, **builder})), "deny")
         self.assertIsNone(self.hook("pre-tool", spawn))
+
+    def test_old_host_variable_picks_codex(self):  # covers: CODE-6
+        push = {"session_id": "c1", **bash("git push origin main")}
+        with clean_environ():
+            out = self.p.hook("pre-tool", push, extra_env={"DAEDALUS_HOST": "codex"})  # no --host
+            self.assertEqual(decision(out), "deny")
+            self.assertIn("Ask the user now", out["hookSpecificOutput"]["permissionDecisionReason"])
+            self.assertEqual(decision(self.p.hook("pre-tool", push)), "ask")  # without it: Claude Code
 
     def test_ask_becomes_a_question_the_user_answers(self):
         push = bash("git push origin main")
@@ -1824,7 +2023,7 @@ class Codex(unittest.TestCase):
 
     def test_a_subagents_prompt_never_approves(self):
         self.hook("pre-tool", bash("git push"))
-        self.assertIsNone(self.hook("user-prompt", {"prompt": "yes", "agent_id": "t1", "agent_type": "daedalus-builder"}))
+        self.assertIsNone(self.hook("user-prompt", {"prompt": "yes", "agent_id": "t1", "agent_type": "regista-builder"}))
         self.assertEqual(decision(self.hook("pre-tool", bash("git push"))), "deny")
 
     def test_host_settings_are_guarded(self):
@@ -1835,53 +2034,97 @@ class Codex(unittest.TestCase):
             self.p.root, ".codex", "config.toml")))), "deny")
 
     def test_typed_verify(self):
-        self.p.write(".daedalus/specs/signup.json", json.dumps(TRY_SPEC))
-        note = self.hook("user-prompt", {"prompt": "$daedalus:verify UI-1 ok fits"})["hookSpecificOutput"]
+        self.p.write(".regista/specs/signup.json", json.dumps(TRY_SPEC))
+        note = self.hook("user-prompt", {"prompt": "$regista:verify UI-1 ok fits"})["hookSpecificOutput"]
         self.assertIn("recorded UI-1 as verified", note["additionalContext"])
-        state = dd.load_json(dd.requirements_path(self.p.root), {})
+        state = regista.load_json(regista.requirements_path(self.p.root), {})
         self.assertEqual(state["UI-1"]["by"], "user (typed in Codex)")
         # in Claude Code the same prompt records nothing: there only the typed slash command counts
-        self.p.hook("user-prompt", {"prompt": "$daedalus:verify UI-3 ok"})
-        self.assertNotIn("UI-3", dd.load_json(dd.requirements_path(self.p.root), {}))
+        self.p.hook("user-prompt", {"prompt": "$regista:verify UI-3 ok"})
+        self.assertNotIn("UI-3", regista.load_json(regista.requirements_path(self.p.root), {}))
 
-    def test_context_from_the_rollout(self):
+    def test_context_from_the_rollout(self):  # covers: CODE-3
         t = os.path.join(self.p.root, "rollout.jsonl")
         rollout(t, 145_000)  # 56 % of 258,400
         out = self.hook("pre-tool", {"transcript_path": t, **bash("ls")})
         self.assertIn("compacts itself", out["hookSpecificOutput"]["additionalContext"])
-        self.assertIn("$daedalus:save", out["hookSpecificOutput"]["additionalContext"])
+        self.assertIn("$regista:save", out["hookSpecificOutput"]["additionalContext"])
+        self.assertNotIn("/regista:save", out["hookSpecificOutput"]["additionalContext"])
         rollout(t, 197_000)  # 76 %
         self.assertEqual(decision(self.hook("pre-tool", {"transcript_path": t, **bash("pytest -q")})), "deny")
         ctx = self.hook("session-start", {"source": "startup"})["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("daedalus-builder", ctx)
-        self.assertIn("codex", dd.load_json(os.path.join(self.p.root, ".daedalus", "hosts.json"), {}))
+        self.assertIn("regista-builder", ctx)
+        self.assertIn("codex", regista.load_json(os.path.join(self.p.root, ".regista", "hosts.json"), {}))
 
-    def test_setup_writes_codex_project_files(self):
-        cfg = dd.load_config(self.p.root)
-        orig = dd.codex_window, dd.codex_wanted
-        dd.codex_window, dd.codex_wanted = (lambda: ("gpt-test", 200_000)), (lambda root: True)
+    def test_setup_writes_codex_project_files(self):  # covers: CODE-2
+        cfg = regista.load_config(self.p.root)
+        orig = regista.codex_window, regista.codex_wanted
+        regista.codex_window, regista.codex_wanted = (lambda: ("gpt-test", 200_000)), (lambda root: True)
         try:
             self.p.write(".codex/config.toml", 'model_reasoning_effort = "high"\n\n[features]\nhooks = true\n')
             self.p.write("AGENTS.md", "# Rules\nBe nice.\n")
-            dd.setup_codex_project(self.p.root, cfg)
-            dd.setup_codex_project(self.p.root, cfg)  # idempotent
+            regista.setup_codex_project(self.p.root, cfg)
+            regista.setup_codex_project(self.p.root, cfg)  # idempotent
         finally:
-            dd.codex_window, dd.codex_wanted = orig
-        toml = dd.read(os.path.join(self.p.root, ".codex", "config.toml"))
-        self.assertEqual(dd.toml_top_value(toml, "model_auto_compact_token_limit"), "123500")  # 65 % of 95 % of 200k
-        self.assertEqual(dd.toml_top_value(toml, "model_post_turn_compact_threshold_percent"), "65")
+            regista.codex_window, regista.codex_wanted = orig
+        toml = regista.read(os.path.join(self.p.root, ".codex", "config.toml"))
+        self.assertEqual(regista.toml_top_value(toml, "model_auto_compact_token_limit"), "123500")  # 65 % of 95 % of 200k
+        self.assertEqual(regista.toml_top_value(toml, "model_post_turn_compact_threshold_percent"), "65")
         self.assertLess(toml.index("model_auto_compact_token_limit"), toml.index("[features]"))
         self.assertIn('model_reasoning_effort = "high"', toml)
-        agent = dd.read(os.path.join(self.p.root, ".codex", "agents", "daedalus-builder.toml"))
-        self.assertIn('name = "daedalus-builder"', agent)
-        self.assertIn("Daedalus builder", agent)
-        md = dd.read(os.path.join(self.p.root, "AGENTS.md"))
+        agent = regista.read(os.path.join(self.p.root, ".codex", "agents", "regista-builder.toml"))
+        self.assertIn('name = "regista-builder"', agent)
+        self.assertIn("Regista builder", agent)
+        md = regista.read(os.path.join(self.p.root, "AGENTS.md"))
         self.assertTrue(md.startswith("# Rules"))
-        self.assertEqual(md.count("## Daedalus harness"), 1)
+        self.assertEqual(md.count("## Regista harness"), 1)
+        self.assertEqual(md.count("<!-- regista:start -->"), 1)
+        self.assertEqual(md.count("<!-- regista:end -->"), 1)
+        self.assertNotIn("daedalus:start", md)
+        for role in ("builder", "test-writer", "reviewer", "researcher"):
+            path = os.path.join(self.p.root, ".codex", "agents", f"regista-{role}.toml")
+            self.assertIn(f'name = "regista-{role}"', regista.read(path), role)
+            self.assertFalse(os.path.exists(os.path.join(self.p.root, ".codex", "agents", f"daedalus-{role}.toml")), role)
         if sys.version_info >= (3, 11):
             import tomllib
             tomllib.loads(toml)
             tomllib.loads(agent)
+
+    def codex_doctor(self, plugin, agent_prefix):
+        """Run `doctor` with a stand-in `codex` on the PATH and a home folder whose Codex config enables `plugin`;
+        the project has .codex/agents/<agent_prefix><role>.toml for each role."""
+        fake = tempfile.mkdtemp(prefix="regista-codex-")
+        self.addCleanup(shutil.rmtree, fake, True)
+        os.makedirs(os.path.join(fake, "bin"))
+        os.makedirs(os.path.join(fake, "home", ".codex"))
+        with open(os.path.join(fake, "bin", "codex"), "w", encoding="utf-8") as f:
+            f.write("#!/bin/sh\necho codex-cli 0.50.0\n")
+        os.chmod(os.path.join(fake, "bin", "codex"), 0o755)
+        with open(os.path.join(fake, "home", ".codex", "config.toml"), "w", encoding="utf-8") as f:
+            f.write(f'[features]\nhooks = true\n\n[plugins."{plugin}"]\nenabled = true\n')
+        for role in ("builder", "test-writer", "reviewer", "researcher"):
+            self.p.write(f".codex/agents/{agent_prefix}{role}.toml", f'name = "{agent_prefix}{role}"\n')
+        env = {k: v for k, v in os.environ.items() if k != "CLAUDE_PROJECT_DIR"}
+        env.update(PATH=os.path.join(fake, "bin") + os.pathsep + env.get("PATH", ""), HOME=os.path.join(fake, "home"),
+                   CODEX_HOME=os.path.join(fake, "home", ".codex"))
+        r = subprocess.run([PY, TOOL, "doctor"], cwd=self.p.root, capture_output=True, text=True, encoding="utf-8",
+                           env=env)
+        return r.stdout + r.stderr
+
+    def test_codex_doctor_finds_the_regista_plugin_and_agents(self):  # covers: CODE-8
+        out = self.codex_doctor("regista@regista", "regista-")
+        self.assertIn("Codex agents: builder, test writer, reviewer, researcher", out)
+        self.assertNotIn("Codex agents missing", out)
+        enabled = [line for line in out.splitlines() if "plugin enabled in Codex" in line]
+        self.assertEqual(len(enabled), 1, out)
+        self.assertIn("Regista", enabled[0])
+        self.assertNotIn("isn't enabled in Codex", out)
+
+    def test_codex_doctor_doesnt_count_the_old_names(self):  # covers: CODE-8
+        out = self.codex_doctor("daedalus@daedalus", "daedalus-")
+        self.assertIn("Codex agents missing: builder, test-writer, reviewer, researcher", out)
+        self.assertIn("Regista plugin isn't enabled in Codex", out)
+        self.assertIn("regista@regista", out)
 
 
 class SubagentContext(unittest.TestCase):
@@ -1897,7 +2140,7 @@ class SubagentContext(unittest.TestCase):
                     "model": "claude-sonnet-4-6", "usage": {"input_tokens": 10, "cache_read_input_tokens": 139_990,
                                                             "cache_creation_input_tokens": 0}}}) + "\n")
             # this subagent is at 70 % of 200k
-            out = p.hook("pre-tool", {"transcript_path": main, "agent_id": "a1", "agent_type": "daedalus:builder",
+            out = p.hook("pre-tool", {"transcript_path": main, "agent_id": "a1", "agent_type": "regista:builder",
                                       "tool_name": "Read", "tool_input": {"file_path": os.path.join(p.root, "README.md")}})
             self.assertEqual(decision(out), "deny")
             self.assertIn("report back", out["hookSpecificOutput"]["permissionDecisionReason"])

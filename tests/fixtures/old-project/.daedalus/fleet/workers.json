@@ -1,0 +1,16 @@
+{
+  "total": {
+    "milestone": "M1",
+    "title": "Add up the numbers",
+    "task": "Build M1 from .daedalus/plan.md.",
+    "branch": "daedalus/total",
+    "worktree": ".daedalus/worktrees/total",
+    "slot": 1,
+    "base": "main",
+    "started": "2026-01-05T09:00:00",
+    "state": "removed",
+    "mode": "orchestrated",
+    "generation": 1,
+    "merged_at": "2026-01-05T10:50:00"
+  }
+}
