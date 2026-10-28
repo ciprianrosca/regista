@@ -16,10 +16,17 @@ path (`python "${CLAUDE_PLUGIN_ROOT}/scripts/regista.py" …`). This skill check
    wins; fix the other at the next save.
 4. If a newer automatic snapshot (`-auto-` in the name) exists, the last session ended without
    saving: read it, look at the commits it lists, and reconstruct the resume point first.
-5. Reply in three lines:
-   - **Where we are:** milestone + last completed step + latest gate results (dated)
-   - **Next:** the resume point
-   - **Blocked on:** open decisions or human tasks that stop the next step
+5. Tell the user where things stand, written for a person who reads it on a phone, coming back to the
+   project cold. Plain words and full sentences, a sentence or two each:
+   - **Done:** what works now, in terms of what the project does ("the league table updates live"),
+     not milestone codes.
+   - **Next:** what gets built next, and whether you can carry on without them.
+   - **Needs you:** each decision, manual check or approval that waits on them, with what to do and
+     roughly how long it takes. For a manual check, end with its ready-to-send line
+     (`/regista:verify <ID> ok`). Say "nothing" when nothing does.
+
+   Milestone codes, commit hashes, requirement IDs and dated gate results go in a short **Details**
+   line at the end, only if they help. No arrows or shorthand in the sentences.
 6. **`/regista:start continue`** (the resume prompt after a pause): don't wait. If the handoff
    has work "In flight", finish that first; otherwise carry on from the resume point with the build
    loop (`/regista:build`). Stop only if the next step is blocked. If a build-all run is active (the
@@ -28,7 +35,7 @@ path (`python "${CLAUDE_PLUGIN_ROOT}/scripts/regista.py" …`). This skill check
 
 **A project on the old folder.** When the session-start context says the project still uses the old
 folder, everything keeps working there (read the files above in that folder instead of `.regista/`).
-After the three lines, offer the move: show the user what
+After the summary, offer the move: show the user what
 `python "${CLAUDE_PLUGIN_ROOT}/scripts/regista.py" migrate --check` lists, and run
 `python "${CLAUDE_PLUGIN_ROOT}/scripts/regista.py" migrate` only after they say yes.
 

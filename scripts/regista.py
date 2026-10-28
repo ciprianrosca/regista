@@ -14,6 +14,8 @@ CLI (run from anywhere inside the project):
   python regista.py gate [NAME...] [--all] [--accept]
                                           run gates; --all includes manual ones; --accept stores the
                                           passing metrics as the new baseline
+  python regista.py gate NAME --start [--ref R] | gate [NAME] --collect
+                                          start a long check elsewhere on a commit; collect results
   python regista.py snapshot [--reason TEXT]   write a mechanical handoff (git state, recent commits)
   python regista.py handoff-name SLUG          print the path for a new handoff file
   python regista.py context TRANSCRIPT         context use of a session transcript (tokens, window, %)
@@ -23,9 +25,17 @@ CLI (run from anywhere inside the project):
   python regista.py milestone M1               is M1's gate met? exit 0 = done
   python regista.py run [start|end --reason T] the build-all run: start it, end it, or show the milestones left
   python regista.py deploy                     deploy HEAD (config deploy.run), then run the live checks
+  python regista.py release [patch|minor|major] [--check] [--no-push]
+                                          raise the version, check changelog and gates, commit, tag,
+                                          push, publish the notes, deploy
   python regista.py change [add TEXT|done N]   changes to what gets built (add: the user only)
+  python regista.py change from-transcript "Q" (the orchestrator) record a change the user typed in this session
+  python regista.py plan add-milestone "TITLE" [--after M3] [--files GLOBS] [--gate T] [--step T]
+  python regista.py plan tick M3 STEP          tick a step (its number or its text); not in a worker
   python regista.py verify-manual ID --note T  (the user only) record a manual check
   python regista.py try [M1|ID] [--ask]        what to try yourself; --ask (the user, in a terminal) records it
+  python regista.py tests cleanup [--prove P | --apply P [c1 …]]  (the user only) overlapping tests: list them,
+                                          prove each adds nothing, remove the proven ones with your OK
   python regista.py detect                     propose gates, roles and protected paths (JSON)
   python regista.py init --auto [--name NAME]  init + detect + setup, in one go
   python regista.py setup                      the agent hosts' project settings (compaction, Codex agents)
@@ -152,7 +162,8 @@ DEFAULTS = {
 }
 # Commits that change only these (besides the harness's own records) skip the gates: there's no code to check.
 DEFAULTS["no_gates_for"] = []
-# A gate that passed on exactly the current files isn't run again (by the commit hook or `regista.py gate`).
+# A gate that passed on exactly the current files isn't run again (by the commit hook, `regista.py gate` or a
+# merge), in any worktree of the repository.
 DEFAULTS["reuse_passing_runs"] = True
 # The overseer's worker sessions (`regista.py fleet`): at most max_workers at once; launch "auto" (tmux with
 # Remote Control when tmux is there, else `claude --bg`), "tmux" or "bg"; setup runs in each new
@@ -382,7 +393,15 @@ def check_metrics(gate, values, baseline):
     return fails
 
 
+def gate_paths(g):
+    """The paths whose change makes a gate needed (`when_changed`, or its older name `paths`); [] = always."""
+    return g.get("when_changed") or g.get("paths") or []
+
+
 def select_gates(cfg, names=None, event=None, include_manual=False, files=None):
+    """The gates for an event. `files` is the change set they check, or None when it isn't known: a gate with
+    when_changed is left out only when the change set is known, not empty, and none of it matches; an
+    unknown or empty change set runs it. A release runs the commit gates too."""
     out = []
     for g in cfg["gates"]:
         if names and g["name"] not in names:
@@ -390,40 +409,133 @@ def select_gates(cfg, names=None, event=None, include_manual=False, files=None):
         when = g.get("when", ["commit"])
         when = [when] if isinstance(when, str) else when
         if not names:
-            if event and event not in when:
+            if event and event not in when and not (event == "release" and "commit" in when):
                 continue
             if not event and "commit" not in when and not include_manual:  # manual and deploy-only gates
                 continue
-        if files is not None and g.get("paths") and not any(matches(f, g["paths"]) for f in files):
-            out.append({**g, "_skip": "no changed file matches its paths"})
+        if not names and event == "commit" and detached(g):
+            out.append({**g, "_skip": "it runs elsewhere, so commits don't wait for it; milestones and releases do"})
+            continue
+        paths = gate_paths(g)
+        if files and paths and not any(matches(f, paths) for f in files):
+            out.append({**g, "_skip": "not needed for this change: no changed file matches its when_changed paths"})
             continue
         out.append(g)
     return out
 
 
+def scope_e2e_gates(root, cfg, gates, files):
+    """At an ordinary commit, an end-to-end gate with a `run_some` command (its {files} placeholder gets the
+    test files) runs only its test files that cover requirements of the milestones the commit works on, plus
+    the ones the commit changes. The whole suite runs when those milestones can't be told, when the commit
+    may close one (it has one open step left, or none), for a gate with metrics, and everywhere else: merges,
+    deploys and `regista.py gate`."""
+    some = {id(g) for g in gates if g.get("run_some") and g.get("evidence") == "e2e" and not g.get("_skip")
+            and not detached(g) and not g.get("metrics")}
+    ms = work_milestones(root, cfg, files) if some else []
+    if not ms:
+        return gates
+    plan = {m["id"]: m for m in plan_milestones(root, cfg)}
+    if any(m not in plan or plan[m]["open_steps"] <= 1 for m in ms):  # it may close a milestone: the whole suite
+        return gates
+    specs, _ = load_specs(root)
+    ids = {r.get("id") for s in specs if s.get("milestone") in ms for r in s.get("requirements") or []}
+    out = []
+    for g in gates:
+        tests = files_matching(root, g.get("tests") or []) if id(g) in some else []
+        marks = test_markers(root, tests)
+        pick = [f for f in tests if marks.get(f, set()) & ids or f in files]
+        if not tests or len(pick) == len(tests):
+            out.append(g)
+        elif not pick:
+            out.append({**g, "_skip": f"none of its test files cover {' or '.join(ms)}; the whole suite runs when "
+                                      "a milestone closes, at a merge and before a deploy"})
+        else:
+            out.append({**g, "_only": pick, "_of": len(tests), "_for": ms})
+    return out
+
+
+def work_milestones(root, cfg, files):
+    """The milestones a change works on, sorted, or [] when that can't be told: a worker's own milestone,
+    the milestones of the specs it changes, of the requirements its changed test files cover, and of the
+    plan milestones whose `Files:` line it touches."""
+    specs, problems = load_specs(root)
+    if problems or not files:
+        return []
+    by_file = {s["_file"]: s for s in specs}
+    of = {r.get("id"): s.get("milestone") for s in specs for r in s.get("requirements") or []}
+    test_globs = list(cfg["roles"]["tests"] or []) + [x for g in e2e_gates(cfg) for x in g.get("tests") or []]
+    ms = {worker_info(root).get("milestone")} - {None, ""}
+    for f in files:
+        if f in by_file:
+            if not by_file[f].get("milestone"):
+                return []  # a spec with no milestone: unsure
+            ms.add(by_file[f]["milestone"])
+    for ids in test_markers(root, [f for f in files if matches(f, test_globs)]).values():
+        ms |= {of[x] for x in ids if of.get(x)}
+    for m in plan_milestones(root, cfg):
+        if m["files"] and any(matches(f, m["files"]) for f in files if not bookkeeping(root, cfg, f)):
+            ms.add(m["id"])
+    return sorted(str(m) for m in ms)
+
+
 def state_fingerprint(root, cfg):
-    """sha256 over the content gates can see: the committed files and the uncommitted changes, without
-    the harness's own records (status, board, specs, reviews), so writing those doesn't void a run."""
+    """sha256 over the content gates can see, without the harness's own records (status, board, specs,
+    reviews), so writing those doesn't void a run: each file's path, mode and git object id, as a commit of
+    everything on disk would hold them (untracked files included, ignored ones not). It depends on the
+    content alone, not on the commits that led to it, so a merge that brings exactly the code a worker
+    passed has the worker's fingerprint."""
     import hashlib
+    tree = {}
+    for entry in git(root, "ls-tree", "-r", "-z", "HEAD", strip=False).split("\0"):
+        meta, _, path = entry.partition("\t")
+        if path:
+            mode, _, oid = meta.split(" ")
+            tree[path] = f"{mode} {oid}"
+    changed, parts = set(), git(root, "status", "--porcelain", "-z", "--untracked-files=all", strip=False).split("\0")
+    k = 0
+    while k < len(parts):  # "XY path", and for a rename or copy the old path in the next field
+        if len(parts[k]) > 3:
+            changed.add(parts[k][3:])
+            if parts[k][0] in "RC" and k + 1 < len(parts):
+                changed.add(parts[k + 1])
+                k += 1
+        k += 1
+    files, before = [], {}
+    for path in changed:
+        full = p(root, path)
+        before[path] = tree.pop(path, "100644 -")
+        if os.path.islink(full):
+            target = os.readlink(full).encode()
+            tree[path] = "120000 " + hashlib.sha1(b"blob %d\0" % len(target) + target).hexdigest()
+        elif os.path.isdir(full):  # a submodule: its commit and whether it has changes
+            tree[path] = "160000 " + git(full, "rev-parse", "HEAD") + (" dirty" if git(full, "status", "--porcelain") else "")
+        elif os.path.isfile(full):
+            files.append(path)
+    if files:  # the ids `git add` would give them (with the repository's line-ending filters)
+        r = subprocess.run(["git", "-C", root, "hash-object", "--stdin-paths"], input="\n".join(files) + "\n",
+                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+        oids = r.stdout.split() if r.returncode == 0 else []
+        if len(oids) != len(files) or any("\n" in f for f in files):  # never guess: a fingerprint nothing else has
+            return "unhashable-" + str(time.time())
+        for path, oid in zip(files, oids):
+            mode = (before[path].split(" ")[0] if os.name == "nt" else  # Windows keeps no executable bit
+                    "100755" if os.stat(p(root, path)).st_mode & 0o100 else "100644")
+            tree[path] = f"{mode} {oid}"
     h = hashlib.sha256()
-    for ln in git(root, "ls-tree", "-r", "HEAD").splitlines():
-        meta, _, path = ln.partition("\t")
+    for path in sorted(tree):
         if not bookkeeping(root, cfg, path):
-            h.update(path.encode() + b"\0" + meta.encode() + b"\n")
-    h.update(b"--changes--")
-    for f in sorted(changed_files(root)):
-        if bookkeeping(root, cfg, f):
-            continue
-        h.update(f.encode() + b"\0")
-        try:
-            with open(p(root, f), "rb") as fh:
-                h.update(hashlib.sha256(fh.read()).digest())
-        except OSError:
-            h.update(b"<deleted>")
+            h.update(path.encode() + b"\0" + tree[path].encode() + b"\n")
     return h.hexdigest()[:20]
 
 
 def passed_path(root):
+    """Passing gate runs, by state fingerprint. They're kept in the git folder that every worktree of the
+    repository shares, so a merge of exactly the code a worker just passed reuses that pass; outside git,
+    in the harness folder."""
+    common = git(root, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    if common and os.path.isdir(common):
+        return os.path.join(common, f"{SLUG}-passed.json")
     return harness_path(root, "gates", "passed.json")
 
 
@@ -438,13 +550,21 @@ def gate_lock_path(root, cfg=None):
     return harness_path(root, "gates", ".lock")
 
 
+# Variables the agent host sets that point a program at the session's project. A gate command never gets
+# them: a test suite that starts the harness (or any tool that reads them) would act on the session's folder
+# instead of its own. Codex names the folder only in its hooks' input, not in the environment.
+HOST_PROJECT_VARS = ("CLAUDE_PROJECT_DIR",)
+
+
 def gate_env(root):
     """Gate commands learn which worktree they run in: <ENV_PREFIX>WORKER (empty in the project folder)
     and <ENV_PREFIX>SLOT (0 there, 1, 2, … in the workers), to pick their own database or port. The same
-    values go out under <OLD_ENV_PREFIX> too, for gate scripts written before the rename."""
+    values go out under <OLD_ENV_PREFIX> too, for gate scripts written before the rename. The host's
+    project variables (HOST_PROJECT_VARS) are left out."""
     w = worker_info(root)
     worker, slot = w.get("name", ""), str(w.get("slot", 0))
-    return {**os.environ, **{prefix + "WORKER": worker for prefix in (ENV_PREFIX, OLD_ENV_PREFIX)},
+    env = {k: v for k, v in os.environ.items() if k not in HOST_PROJECT_VARS}
+    return {**env, **{prefix + "WORKER": worker for prefix in (ENV_PREFIX, OLD_ENV_PREFIX)},
             **{prefix + "SLOT": slot for prefix in (ENV_PREFIX, OLD_ENV_PREFIX)}}
 
 
@@ -504,6 +624,9 @@ def _run_gates(root, cfg, gates, accept, budget, started, reuse):
         if g.get("_skip"):
             results.append({"name": g["name"], "status": "skipped", "why": g["_skip"]})
             continue
+        if detached(g):  # its result comes from the run elsewhere, collected earlier
+            results.append(detached_result(root, cfg, g))
+            continue
         prev = earlier.get(g["name"])
         if prev and prev.get("run") == g["run"] and not accept:
             if not (g.get("metrics") and check_metrics(g, prev.get("metrics") or {}, baseline)):
@@ -518,9 +641,15 @@ def _run_gates(root, cfg, gates, accept, budget, started, reuse):
                                 "tail": "Make the commit gates faster, or move slow ones to when: [\"manual\"]."})
                 continue
             timeout = min(timeout, int(left))
+        cmd = g["run"]
+        if g.get("_only"):  # only some of its test files (scope_e2e_gates)
+            import shlex
+            cmd = fill(g["run_some"], files=" ".join(shlex.quote(f) for f in g["_only"]))
         t0 = time.time()
-        code, out = run_shell(g["run"], root, timeout, env=gate_env(root))
+        code, out = run_shell(cmd, root, timeout, env=gate_env(root))
         res = {"name": g["name"], "exit": code, "seconds": round(time.time() - t0, 1)}
+        if g.get("_only"):
+            res.update(only=g["_only"], of=g["_of"], milestones=g["_for"])
         fails = [] if code == 0 else [f"command exited {code}"]
         if g.get("metrics"):
             values = last_json(out) or {}
@@ -534,10 +663,14 @@ def _run_gates(root, cfg, gates, accept, budget, started, reuse):
         results.append(res)
     record = {"date": dt.datetime.now().isoformat(timespec="seconds"),
               "commit": git(root, "rev-parse", "--short", "HEAD"), "results": results}
+    over = budget_note(cfg, gates, results)
+    if over:
+        record["over_budget"] = over
     save_json(harness_path(root, "gates", "last.json"), record)
     with open(harness_path(root, "gates", "history.jsonl"), "a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
-    fresh = [r for r in results if r["status"] == "pass" and not r.get("reused")]
+    fresh = [r for r in results if r["status"] == "pass" and not r.get("reused") and not r.get("elsewhere")
+             and not r.get("only")]  # a run of some test files says nothing about the whole suite
     if fresh and state_fingerprint(root, cfg) == fp:  # a run that changed the files proves nothing about them
         runs = {g["name"]: g["run"] for g in gates}
         entry = passed.get(fp) or {"gates": {}}
@@ -545,11 +678,13 @@ def _run_gates(root, cfg, gates, accept, budget, started, reuse):
             entry["gates"][r["name"]] = {"run": runs[r["name"]], "at": record["date"], "result": r,
                                          "metrics": r.get("metrics")}
         entry["at"] = record["date"]
-        passed[fp] = entry
-        save_json(passed_path(root), dict(sorted(passed.items(), key=lambda kv: kv[1]["at"])[-20:]))
+        path = passed_path(root)
+        passed = {**load_json(path, {}), fp: entry}  # other worktrees may have added theirs meanwhile
+        save_json(path + ".tmp", dict(sorted(passed.items(), key=lambda kv: kv[1]["at"])[-40:]))
+        os.replace(path + ".tmp", path)
     if accept:
         for r in results:
-            if r["status"] == "pass" and r.get("metrics"):
+            if r["status"] == "pass" and r.get("metrics") and not r.get("elsewhere"):
                 baseline[r["name"]] = {"metrics": r["metrics"], "date": record["date"], "commit": record["commit"]}
         save_json(baseline_path(root), baseline)
     return results
@@ -561,19 +696,277 @@ def format_results(results):
         if r["status"] == "skipped":
             lines.append(f"- {r['name']}: skipped ({r['why']})")
             continue
+        if r.get("elsewhere"):
+            lines.append(f"- {r['name']}: {r['status'].upper()}, run elsewhere ({r['elsewhere']})")
+            lines += [f"    · {fl}" for fl in r.get("fails", [])]
+            continue
         m = ", ".join(f"{k}={v}" for k, v in (r.get("metrics") or {}).items())
         again = f", reused: it passed at {r['reused'][11:16]} on exactly these files" if r.get("reused") else ""
+        if r.get("only"):
+            again += (f", only {len(r['only'])} of its {r['of']} test files: the ones for "
+                      f"{' and '.join(r.get('milestones') or [])}")
         lines.append(f"- {r['name']}: {r['status'].upper()} in {r['seconds']} s{again}" + (f" ({m})" if m else ""))
         for fl in r.get("fails", []):
             lines.append(f"    · {fl}")
     return "\n".join(lines)
 
 
+def budget_note(cfg, gates, results):
+    """A plain warning when a gate run took longer than the project's time budget (the config's
+    gates_budget_seconds for the whole run, a gate's budget_seconds for that gate), or "". Reused results
+    and checks run elsewhere took no time here. It only warns: nothing runs or changes because of it."""
+    def span(s):
+        return f"{round(s)} s" if s < 90 else f"{round(s / 60, 1):g} minutes"
+
+    def limit(x):
+        return x if isinstance(x, (int, float)) and not isinstance(x, bool) and x > 0 else None
+    ran = [r for r in results if r.get("status") in ("pass", "fail") and not r.get("reused")
+           and not r.get("elsewhere")]
+    caps = {g["name"]: limit(g.get("budget_seconds")) for g in gates}
+    over = [f"{r['name']} took {span(r.get('seconds', 0))}, over its budget of {span(caps[r['name']])}"
+            for r in ran if caps.get(r["name"]) and r.get("seconds", 0) > caps[r["name"]]]
+    total, cap = sum(r.get("seconds", 0) for r in ran), limit(cfg.get("gates_budget_seconds"))
+    if cap and total > cap:
+        over.insert(0, f"the gates took {span(total)} in all, over the project's budget of {span(cap)}")
+    if not over:
+        return ""
+    return ("The gate run went over its time budget: " + "; ".join(over) + ". Every commit waits for the gates, so "
+            "tell the user and suggest they run `regista.py tests cleanup`, which looks for tests that check the same "
+            "thing twice or could run at a cheaper level. Nothing has been changed.")
+
+
+# --- long checks run elsewhere ----------------------------------------------------------------
+#
+# Some checks take an hour and run on another machine (a staging server, a GPU box). A gate with
+# "kind": "detached" has a `start` command that launches the run there and returns at once, and a
+# `status` command that says whether it has finished and how it went. `regista.py gate <name> --start`
+# records the run against a commit; `--collect`, and session start (briefly), ask for the result. The hooks
+# never wait for one: a commit skips it, and a milestone or a release that needs it waits for a collected
+# pass on the same code. The records live in the harness folder's gates/detached.json (local), which only
+# the harness writes.
+
+DETACHED_TIMEOUT = 6 * 3600  # seconds a long check may take before it counts as failed (the gate's "timeout")
+DETACHED_RUNNING = ("running", "active", "activating", "queued", "pending", "waiting", "started", "busy")
+DETACHED_PASS = ("pass", "passed", "ok", "success", "succeeded")
+DETACHED_FAIL = ("fail", "failed", "failure", "error")
+
+
+def detached(g):
+    return g.get("kind") == "detached"
+
+
+def detached_path(root):
+    return harness_path(root, "gates", "detached.json")
+
+
+def fill(cmd, **values):
+    """A command with its {name} placeholders filled in; other braces (awk, ${VAR}, git's ^{commit}) stay."""
+    for k, v in values.items():
+        cmd = cmd.replace("{" + k + "}", v)
+    return cmd
+
+
+def diff_files(root, base, head="HEAD"):
+    """Files that differ between two commits, or None when git can't tell (no base, an unknown commit)."""
+    if not base:
+        return None
+    code, out = call(["git", "-C", root, "diff", "--name-only", "--no-renames", base, head, "--"])
+    return None if code else [f.strip().strip('"') for f in out.splitlines() if f.strip()]
+
+
+def changes_since(root, cfg, commit, ignore=()):
+    """The files the current code (HEAD and uncommitted changes) has changed since `commit`, without the
+    harness's own records and the `ignore` globs; None when git can't tell."""
+    files = diff_files(root, commit)
+    if files is None:
+        return None
+    return [f for f in sorted(set(files) | set(changed_files(root)))
+            if not bookkeeping(root, cfg, f) and not (ignore and matches(f, ignore))]
+
+
+def detached_runs(root):
+    return load_json(detached_path(root), {}).get("runs", [])
+
+
+def save_detached_runs(root, runs):
+    keep, seen = [], {}
+    for r in reversed(runs):  # the newest 20 runs of each gate
+        seen[r["gate"]] = seen.get(r["gate"], 0) + 1
+        if seen[r["gate"]] <= 20:
+            keep.append(r)
+    save_json(detached_path(root), {"runs": list(reversed(keep))})
+
+
+def detached_cover(root, cfg, g, ignore=()):
+    """The collected pass of a long check that holds for the current code, or None: a pass, with today's
+    start command, on a commit with the same code (only the harness's records differ), or, for a gate with
+    when_changed, on a commit whose differences don't touch those paths."""
+    paths = gate_paths(g)
+    for r in reversed(detached_runs(root)):
+        if r.get("gate") != g["name"] or r.get("state") != "pass" or r.get("start") != g.get("start"):
+            continue
+        changed = changes_since(root, cfg, r["sha"], ignore)
+        if changed is not None and (not changed or (paths and not any(matches(f, paths) for f in changed))):
+            return r
+    return None
+
+
+def detached_result(root, cfg, g, ignore=()):
+    """A long check's result for the current code, as a gate result: its collected pass, or a failure that
+    says what's missing (started and not collected yet, failed, or never started on this code)."""
+    name, at = g["name"], lambda r: r.get("collected", r.get("started", "")).replace("T", " ")[:16]
+    hit = detached_cover(root, cfg, g, ignore)
+    if hit:
+        return {"name": name, "status": "pass", "seconds": hit.get("seconds", 0), "metrics": hit.get("metrics"),
+                "elsewhere": f"passed on {hit['sha'][:7]}, collected {at(hit)}"}
+    runs = [r for r in detached_runs(root) if r.get("gate") == name]
+    head = git(root, "rev-parse", "HEAD")
+    mine = [r for r in runs if r.get("sha") == head]
+    last = (mine or [None])[-1]
+    if last and last.get("state") == "running":
+        why = (f"it's still running elsewhere (started {at(last)} on {head[:7]}): collect it with "
+               f"`regista.py gate {name} --collect`")
+    elif last and last.get("state") == "fail":
+        why = (f"its run on {head[:7]} failed ({'; '.join(last.get('fails') or ['no reason given'])}): fix the cause, "
+               f"commit, and start it again with `regista.py gate {name} --start`")
+    else:
+        why = (f"it has no passing run on this code: start it with `regista.py gate {name} --start`, then collect "
+               f"it with `regista.py gate {name} --collect` once it's done")
+    return {"name": name, "status": "fail", "seconds": 0, "fails": [why], "elsewhere": "no result for this code"}
+
+
+def detached_start(root, cfg, g, ref="HEAD", fresh=False):
+    """Start a long check on a commit, elsewhere. Returns (ok, lines)."""
+    name = g["name"]
+    if not (g.get("start") and g.get("status")):
+        return False, [f"The long check '{name}' needs a \"start\" command and a \"status\" command in "
+                       f"{harness_rel('config.json', root=root)}."]
+    sha = git(root, "rev-parse", "--verify", "--quiet", ref + "^{commit}")
+    if not sha:
+        return False, [f"There's no commit '{ref}' here."]
+    pending = work_changes(root, cfg)
+    runs = detached_runs(root)
+    same = [r for r in runs if r.get("gate") == name and r.get("sha") == sha and r.get("start") == g["start"]]
+    if same and same[-1].get("state") in ("running", "pass") and not fresh:
+        r = same[-1]
+        return True, [f"'{name}' already " + ("runs" if r["state"] == "running" else "passed") + f" on {sha[:7]} "
+                      f"(started {r['started'].replace('T', ' ')[:16]}). Collect it with `regista.py gate {name} "
+                      "--collect`, or add --fresh to start it again."]
+    label = f"{name}-{sha[:7]}-{dt.datetime.now():%m%d-%H%M%S}"
+    values = {"sha": sha, "short": sha[:7], "label": label, "name": name}
+    env = {**gate_env(root), ENV_PREFIX + "SHA": sha, ENV_PREFIX + "LABEL": label}
+    code, out = run_shell(fill(g["start"], **values), root, g.get("start_timeout", 300), env=env)
+    if code != 0:
+        return False, [f"The long check '{name}' didn't start (its start command exited {code}). Its last lines:",
+                       "\n".join(out.strip().splitlines()[-15:])]
+    runs.append({"gate": name, "sha": sha, "label": label, "start": g["start"], "state": "running",
+                 "started": dt.datetime.now().isoformat(timespec="seconds")})
+    save_detached_runs(root, runs)
+    tail = out.strip().splitlines()[-3:]
+    return True, [f"Started the long check '{name}' on {sha[:7]} (its label: {label}). It runs elsewhere; collect the "
+                  f"result with `regista.py gate {name} --collect` when it's done (session start checks too)."] + \
+        [f"  {x}" for x in tail] + \
+        ([f"It checks the commit only: {plural(len(pending), 'uncommitted file')} here "
+          f"{'is' if len(pending) == 1 else 'are'}n't part of it "
+          f"({', '.join(pending[:5])})."] if pending else [])
+
+
+def detached_verdict(code, out):
+    """What a status command's output says: ("pass" | "fail" | "running" | None, values). Its last line is a
+    word (pass, fail, running) or the gate's JSON line, with or without a "status"; None: it couldn't tell."""
+    lines = [x.strip() for x in out.strip().splitlines() if x.strip()]
+    last = lines[-1] if lines else ""
+    values = last_json(last) if last.startswith("{") else None
+    if values is not None and "status" not in values:  # the result line itself: the command finished
+        return ("pass" if code == 0 else "fail"), values
+    word = str((values or {}).get("status", last)).lower().strip(" .!:")
+    if word in DETACHED_RUNNING:
+        return "running", values or {}
+    if word in DETACHED_FAIL:
+        return "fail", values or {}
+    if word in DETACHED_PASS:
+        return ("pass" if code == 0 else "fail"), values or {}
+    return None, values or {}
+
+
+def detached_collect(root, cfg, names=None, accept=False, budget=None):
+    """Ask each running long check for its result and record the ones that finished. Returns lines. With
+    `budget` (seconds, for session start), stops asking when it runs out."""
+    gates = {g["name"]: g for g in cfg["gates"] if detached(g)}
+    runs, lines, started = detached_runs(root), [], time.time()
+    baseline = load_json(baseline_path(root), {})
+    finished = []
+    for r in runs:
+        g = gates.get(r.get("gate"))
+        if r.get("state") != "running" or not g or (names and r["gate"] not in names):
+            continue
+        left = None if budget is None else budget - (time.time() - started)
+        if left is not None and left < 3:
+            lines.append(f"- {r['gate']} on {r['sha'][:7]}: not checked this time (session start keeps it short).")
+            continue
+        values = {"sha": r["sha"], "short": r["sha"][:7], "label": r["label"], "name": r["gate"]}
+        env = {**gate_env(root), ENV_PREFIX + "SHA": r["sha"], ENV_PREFIX + "LABEL": r["label"]}
+        timeout = g.get("status_timeout", 60) if left is None else max(1, min(g.get("status_timeout", 60), int(left)))
+        code, out = run_shell(fill(g["status"], **values), root, timeout, env=env)
+        state, got = detached_verdict(code, out)
+        since = r["started"].replace("T", " ")[:16]
+        age = time.time() - dt.datetime.fromisoformat(r["started"]).timestamp()
+        if state in (None, "running") and age > g.get("timeout", DETACHED_TIMEOUT):
+            state, got = "fail", {}
+            r["fails"] = [f"it didn't report a result within its time limit of {g.get('timeout', DETACHED_TIMEOUT) // 60} minutes"]
+        if state is None:
+            last = (out.strip().splitlines() or ["(nothing)"])[-1][:200]
+            lines.append(f"- {r['gate']} on {r['sha'][:7]}: couldn't tell how it's doing (its status command exited "
+                         f"{code} and said: {last}). It stays open; try again later.")
+            continue
+        if state == "running":
+            lines.append(f"- {r['gate']} on {r['sha'][:7]}: still running (started {since}).")
+            continue
+        metrics = {k: got.get(k) for k in g.get("metrics") or {}}
+        fails = r.get("fails") or ([] if state == "pass" else ["its run reported a failure"])
+        if state == "pass" and g.get("metrics"):
+            fails = check_metrics(g, got, baseline)
+        r.update(state="fail" if fails else "pass", collected=dt.datetime.now().isoformat(timespec="seconds"),
+                 seconds=round(age), metrics=metrics or None, fails=fails or None,
+                 tail="\n".join(out.strip().splitlines()[-25:]) if fails else None)
+        r = {k: v for k, v in r.items() if v is not None}
+        finished.append(r)
+        m = ", ".join(f"{k}={v}" for k, v in metrics.items())
+        lines.append(f"- {r['gate']} on {r['sha'][:7]}: {'PASSED' if not fails else 'FAILED'}" + (f" ({m})" if m else "")
+                     + "".join(f"\n    · {x}" for x in fails))
+        if not fails and accept and metrics:
+            baseline[r["gate"]] = {"metrics": metrics, "date": r["collected"], "commit": r["sha"][:7]}
+            save_json(baseline_path(root), baseline)
+    if finished:
+        done = {(x["gate"], x["label"]): x for x in finished}
+        runs = [done.get((x.get("gate"), x.get("label")), x) for x in runs]
+        save_detached_runs(root, runs)
+        # Requirement results describe committed code: record an end-to-end check that finished on it.
+        e2e = {x["name"] for x in e2e_gates(cfg)}
+        head = git(root, "rev-parse", "HEAD")
+        results = [{"name": x["gate"], "status": x["state"]} for x in finished if x["gate"] in e2e and x["sha"] == head]
+        if results and not work_changes(root, cfg):
+            record_requirements(root, cfg, results)
+    return lines
+
+
+def detached_text(root, cfg, collect=False):
+    """For session start: the long checks still running, asked once more (briefly) when `collect`."""
+    if not any(r.get("state") == "running" for r in detached_runs(root)):
+        return ""
+    lines = detached_collect(root, cfg, budget=20) if collect else [
+        f"- {r['gate']} on {r['sha'][:7]}: running since {r['started'].replace('T', ' ')[:16]}"
+        for r in detached_runs(root) if r.get("state") == "running"]
+    return "## Long checks run elsewhere\n" + "\n".join(lines) if lines else ""
+
+
 # --- state ----------------------------------------------------------------------------------
 
 def handoffs(root, cfg):
+    """The handoffs, oldest first: by the date in the file name (YYYY-MM-DD-slug.md), then by the time each was
+    written within a day. A move or a checkout gives every file the same time, so the name's date comes first."""
     files = glob.glob(os.path.join(p(root, cfg["state_dir"]), "[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]-*.md"))
-    return sorted(files, key=os.path.getmtime)
+    return sorted(files, key=lambda f: (os.path.basename(f)[:10], os.path.getmtime(f), os.path.basename(f)))
 
 
 def newest_handoff(root, cfg, real_only=False):
@@ -660,6 +1053,12 @@ def config_loosened(root, cfg):
             out.append(f"the gate '{g.get('name')}' was removed")
         elif new_gates[g.get("name")] != g:
             out.append(f"the gate '{g.get('name')}' was changed")
+    olds = {g.get("name") for g in old["gates"]}
+    for g in cfg["gates"]:  # a gate's test files are guarded like tests: the test writer may change them
+        lits = [re.split(r"[*?\[]", str(x), 1)[0] for x in g.get("tests") or []] if g.get("name") not in olds else []
+        src = [re.split(r"[*?\[]", str(x), 1)[0] for x in cfg["roles"].get("source") or []]
+        if any(a.startswith(b) or b.startswith(a) for a in lits for b in src):
+            out.append(f"the new gate '{g.get('name')}' counts source files as its tests, so the test writer may change them")
 
     def dropped(label, before, after):
         gone = [x for x in before or [] if x not in (after or [])]
@@ -680,10 +1079,45 @@ def config_loosened(root, cfg):
             out.append(label)
     if old["mode"] == "orchestrated" and cfg["mode"] != "orchestrated":
         out.append("the main session may now edit code itself (solo mode)")
+    if (old.get("deploy") or {}).get("ref") == "tag" and (cfg.get("deploy") or {}).get("ref") != "tag":
+        out.append("deploys no longer need a release tag")
     order = {"block": 0, "ask": 1, "allow": 2}
     if order.get(cfg["push"], 2) > order.get(old["push"], 2):
         out.append(f"pushing went from '{old['push']}' to '{cfg['push']}'")
     return out
+
+
+def config_write_loosens(root, tool, ti):
+    """What an edit of the harness config would loosen compared with the last commit's (config_loosened on the
+    config as it would be after the edit), [] when it loosens nothing, or None when that can't be told: a shell
+    write, a patch, an edit whose text isn't in the file, JSON that doesn't parse, or no committed config to
+    compare with. None asks the user, as before."""
+    rel = harness_rel("config.json", root=root)
+    if not (folder_move(root) or git(root, "rev-parse", "--verify", "-q", "HEAD:" + rel)):
+        return None
+    text = read_exact(p(root, rel))
+    if tool == "Write" and isinstance(ti.get("content"), str):
+        text = ti["content"]
+    elif tool in ("Edit", "MultiEdit") and text is not None:
+        edits = ti.get("edits") if tool == "MultiEdit" else [ti]
+        for e in edits if isinstance(edits, list) else [None]:
+            if not isinstance(e, dict) or not isinstance(e.get("old_string"), str) \
+                    or not isinstance(e.get("new_string"), str) or not e["old_string"] or e["old_string"] not in text:
+                return None
+            text = (text.replace(e["old_string"], e["new_string"]) if e.get("replace_all")
+                    else text.replace(e["old_string"], e["new_string"], 1))
+    else:
+        return None
+    try:
+        data, now = json.loads(text), json.loads(read_exact(p(root, rel)) or "null")
+        if not isinstance(data, dict) or not isinstance(now, dict):
+            return None
+        new, now = with_defaults(root, data), with_defaults(root, now)
+        if any(new.get(k) != now.get(k) for k in set(new) | set(now) if k not in ("gates", "protected")):
+            return None  # only gates and protected paths are judged here; the rest asks, as before
+        return config_loosened(root, new)
+    except (ValueError, TypeError, KeyError, AttributeError):
+        return None
 
 
 def commits_since(root, cfg, since):
@@ -745,6 +1179,13 @@ def resume_text(root, cfg, detailed=False):
     open_items = [ln for ln in board.splitlines() if re.match(r"\s*[-*]\s*(⬜|🔄|\[ \])", ln)]
     if open_items:
         parts.append("\n## Open on the board\n" + "\n".join(open_items[:12]))
+    needs = [f"- try {r['id']}: {(r.get('try') or {}).get('title') or r.get('text', '')}"
+             for _, r, st in try_items(root, cfg) if r.get("verify") == "manual" and not st.get("passes")][:8]
+    needs += [f"- the worker {n} waits for their OK: {x.get('reason', '')[:200]}"
+              for n, w in load_workers(root).items() if w.get("state") == "running"
+              for x in [worker_pending(root, w)] if x]
+    if needs:
+        parts.append("\n## Waiting on the user\n" + "\n".join(needs))
     parts.append("\n## Git")
     parts.append(f"- {git(root, 'rev-parse', '--abbrev-ref', 'HEAD')} @ {git(root, 'rev-parse', '--short', 'HEAD')}, "
                  f"{'clean' if not dirty else f'{len(dirty)} uncommitted file(s)'}, {ahead_count(root)} commit(s) not pushed")
@@ -752,7 +1193,8 @@ def resume_text(root, cfg, detailed=False):
     if unsaved:
         parts.append(f"- {len(unsaved)} commit(s) since the last handoff: " + "; ".join(unsaved[:5]))
     if last:
-        parts.append(f"\n## Last gate run ({last.get('date')}, {last.get('commit')})\n" + format_results(last["results"]))
+        parts.append(f"\n## Last gate run ({last.get('date')}, {last.get('commit')})\n" + format_results(last["results"])
+                     + (f"\n\n{last['over_budget']}" if last.get("over_budget") else ""))
     live = live_text(root, cfg)
     if live:
         parts.append(f"\n## {live}")
@@ -764,12 +1206,15 @@ def resume_text(root, cfg, detailed=False):
         parts.append(f"\n## Build-all run\nActive since {run.get('started')}. After a compaction or "
                      f"`{cmd_name('start')} continue`, carry on with `{cmd_name('build')} all` without waiting. In a new "
                      f"session, wait for the user's command; `{PY} \"{DD}\" run` shows where it stands.")
+    parts.append("\n(For the user: what's done, what's next and what needs them, in plain words. Milestone codes, commit "
+                 "hashes and dated gate results go in a short Details part at the end, if at all.)")
     if detailed:
         parts.append("\n## Recent commits\n" + git(root, "log", "--oneline", "-8"))
         if dirty:
             parts.append("\n## Uncommitted\n" + "\n".join(dirty[:30]))
         parts.append("\n## Gates\n" + "\n".join(
-            f"- {g['name']}: `{g['run']}` when={g.get('when', ['commit'])}" + (f" paths={g['paths']}" if g.get("paths") else "")
+            f"- {g['name']}: `{g.get('run') or g.get('start')}` when={g.get('when', ['commit'])}"
+            + (f" when_changed={gate_paths(g)}" if gate_paths(g) else "")
             for g in cfg["gates"]) if cfg["gates"] else "\n## Gates\nNone configured.")
         if cfg["protected"]:
             parts.append("\n## Protected paths\n" + ", ".join(cfg["protected"]))
@@ -925,9 +1370,10 @@ def review_record(root, cfg):
 #   {"step": "stats", "milestone": "M1", "title": "...", "state": "active" | "planned",
 #    "requirements": [{"id": "STATS-1", "text": "WHEN the list is empty mean SHALL raise ValueError",
 #                      "verify": "test" | "e2e" | "manual"}]}
-# A requirement is covered when a test file names its ID (e.g. a `# covers: STATS-1` comment):
-# "test" in any test file, "e2e" in a file under an e2e gate's `tests` globs. It passes when it is
-# covered and every gate that proves it passed in the same run. "manual" passes only through
+# A requirement is covered when a test file marks it: `covers: STATS-1`, or several, `covers: STATS-1, STATS-2`
+# (see COVERS): "test" in any test file, "e2e" in a file under an e2e gate's `tests` globs. A test file that
+# only mentions the ID (a comment, an expected message) doesn't cover it; it's shown as a warning. It passes
+# when it is covered and every gate that proves it passed in the same run. "manual" passes only through
 # `regista.py verify-manual`, which no agent may run. Results: the harness folder's gates/requirements.json.
 
 REQ_ID = re.compile(r"^[A-Za-z][A-Za-z0-9_.]*-\d+$")
@@ -979,25 +1425,59 @@ def files_matching(root, globs):
     return sorted(f for f in out if globs and matches(f, globs))
 
 
+# The marker that says a test covers a requirement: `covers:` (any case) and one or more IDs on the same line,
+# separated by commas or spaces. It works in any comment style (# // /* -- ;), a docstring or a test's name:
+# `# covers: STATS-1`, `// covers: STATS-1, STATS-2`, `test("empty list (covers: STATS-1)", …)`.
+_ID = r"[A-Za-z][A-Za-z0-9_.]*-\d+"
+COVERS = re.compile(r"\bcovers[ \t]*:[ \t]*(" + _ID + r"(?:(?:[ \t]*,[ \t]*|[ \t]+)" + _ID + r")*)", re.I)
+MENTION = re.compile(r"(?<![A-Za-z0-9_.-])" + _ID)  # an ID anywhere, as a whole word
+
+
 def coverage(root, cfg, specs):
-    """{req id: {"tests": [files naming it], "e2e": [e2e gate names whose test files name it]}}"""
+    """{req id: {"tests": [test files marking it], "e2e": [e2e gate names whose test files mark it],
+    "mentions": [test files that name it without a `covers:` marker]}}. Only the marker counts."""
     test_files = files_matching(root, cfg["roles"]["tests"])
-    texts = {}
-    for f in set(test_files) | {x for g in e2e_gates(cfg) for x in files_matching(root, g.get("tests") or [])}:
+    e2e_files = {g["name"]: files_matching(root, g.get("tests") or []) for g in e2e_gates(cfg)}
+    marked, named = {}, {}
+    for f in set(test_files).union(*e2e_files.values()):
         try:
             with open(p(root, f), encoding="utf-8", errors="replace") as fh:
-                texts[f] = fh.read()
+                text = fh.read()
         except OSError:
-            pass
+            continue
+        marked[f] = {x for m in COVERS.finditer(text) for x in re.findall(_ID, m.group(1))}
+        named[f] = set(MENTION.findall(text))
     cov = {}
     for s in specs:
         for r in s.get("requirements") or []:
             rid = r.get("id", "")
-            pat = re.compile(r"(?<![A-Za-z0-9_.-])" + re.escape(rid) + r"(?![0-9])")
-            cov[rid] = {"tests": [f for f in test_files if pat.search(texts.get(f, ""))],
-                        "e2e": [g["name"] for g in e2e_gates(cfg)
-                                if any(pat.search(texts.get(f, "")) for f in files_matching(root, g.get("tests") or []))]}
+            cov[rid] = {"tests": [f for f in test_files if rid in marked.get(f, ())],
+                        "e2e": [g for g, files in e2e_files.items() if any(rid in marked.get(f, ()) for f in files)],
+                        "mentions": sorted(f for f in marked if rid in named[f] and rid not in marked[f])}
     return cov
+
+
+def test_markers(root, files):
+    """{test file: the requirement IDs its `covers:` markers name}, for the files that can be read."""
+    out = {}
+    for f in files:
+        try:
+            with open(p(root, f), encoding="utf-8", errors="replace") as fh:
+                text = fh.read()
+        except OSError:
+            continue
+        out[f] = {x for m in COVERS.finditer(text) for x in re.findall(_ID, m.group(1))}
+    return out
+
+
+def mention_hint(rid, c):
+    """For a requirement no test marks: the test files that only name it, as a plain sentence, or ""."""
+    m = c.get("mentions") or []
+    if not m:
+        return ""
+    return (f" {', '.join(m[:3])}{' and others' if len(m) > 3 else ''} name{'s' if len(m) == 1 else ''} it without "
+            f"marking it; if a test there checks it, add `covers: {rid}` next to that test (a plain mention no "
+            "longer counts).")
 
 
 def active(spec):
@@ -1017,24 +1497,29 @@ def coverage_problems(root, cfg):
             v, rid = r.get("verify", "test"), r.get("id", "")
             c = cov.get(rid, {})
             if v == "test" and not c.get("tests"):
-                problems.append(f"{rid} ({s['_file']}): no test names it. The test writer adds `covers: {rid}` to the test.")
+                problems.append(f"{rid} ({s['_file']}): no test is marked `covers: {rid}`. The test writer adds the "
+                                "marker to the test that checks it." + mention_hint(rid, c))
             if v == "e2e" and not c.get("e2e"):
                 where = ", ".join(f"{g['name']} ({', '.join(g.get('tests') or [])})" for g in e2e_gates(cfg)) or \
                     "none configured: add a gate with \"evidence\": \"e2e\" and its \"tests\" globs"
-                problems.append(f"{rid} ({s['_file']}): needs an end-to-end test naming it, run by an e2e gate: {where}.")
+                problems.append(f"{rid} ({s['_file']}): needs an end-to-end test marked `covers: {rid}`, run by an e2e "
+                                f"gate: {where}." + mention_hint(rid, c))
     return problems
 
 
 def record_requirements(root, cfg, results):
     """After a gate run on committed code (the commit hook's, or a run on a clean tree), the harness
-    alone updates which requirements pass. An entry is rewritten only when its result changes, so the
-    file doesn't churn with every commit."""
+    alone updates which requirements pass. An entry is rewritten only when its result (pass or fail)
+    changes: the same result proven by another gate or test file (live checks one time, the end-to-end
+    tests the next) keeps the entry as it is, so the file doesn't churn with every run."""
     specs, _ = load_specs(root)
     cov = coverage(root, cfg, specs)
     status = {r["name"]: r["status"] for r in results}
     commit_gates_ok = all(r["status"] != "fail" for r in results)
     e2e_names = {g["name"] for g in e2e_gates(cfg)}
     tests_ran = any(r["name"] not in e2e_names and r["status"] in ("pass", "fail") for r in results)
+    only = {r["name"]: r["only"] for r in results if r.get("only")}  # gates that ran some of their test files
+    marks = test_markers(root, sorted({f for fs in only.values() for f in fs}))
     before = load_json(requirements_path(root), {})
     state = json.loads(json.dumps(before))
     now = dt.datetime.now().isoformat(timespec="seconds")
@@ -1052,13 +1537,14 @@ def record_requirements(root, cfg, results):
                 ok = bool(c.get("tests")) and commit_gates_ok
                 evidence = c.get("tests", [])
             else:
-                ran = [g for g in c.get("e2e", []) if g in status]
-                if not ran:  # its e2e gate didn't run this time: keep the last verdict
+                ran = [g for g in c.get("e2e", []) if status.get(g) in ("pass", "fail")
+                       and (g not in only or any(rid in marks.get(f, ()) for f in only[g]))]
+                if not ran:  # its e2e gate didn't run this time (or wasn't needed): keep the last verdict
                     state[rid] = keep
                     continue
                 ok = all(status[g] == "pass" for g in ran) and commit_gates_ok
                 evidence = ran
-            if prev.get("passes") == ok and prev.get("evidence") == evidence and prev.get("at"):
+            if prev.get("passes") == ok and prev.get("at"):
                 state[rid] = keep
                 continue
             state[rid] = {"verify": v, "milestone": s.get("milestone"), "spec": s["_file"], "passes": ok,
@@ -1066,6 +1552,32 @@ def record_requirements(root, cfg, results):
     if state != before:
         save_json(requirements_path(root), state)
     return state
+
+
+def results_changed(before, after):
+    """What changed between two requirement records, as a short plain phrase ("NAV-1 now passes, NAV-2 now
+    fails"), or ""."""
+    out = [f"{rid} now {'passes' if r.get('passes') else 'fails'}" for rid, r in after.items()
+           if r.get("at") and r.get("at") != (before.get(rid) or {}).get("at")]
+    return ", ".join(out[:8]) + (f" and {len(out) - 8} more" if len(out) > 8 else "")
+
+
+def commit_records(root, rels, message):
+    """Commit the records a gate run wrote (the requirement results; a deploy's record) on their own, so the
+    run leaves the folder clean. Called only when the folder had no work changes before the run: the records
+    then describe the last commit. Only these files go in (anything else staged stays staged), and a commit
+    of records only skips the gates and the review (harness_only), like any commit of the harness's own
+    records. Returns a plain sentence for the output, or "" when nothing changed."""
+    rels = [r for r in rels if git(root, "status", "--porcelain", "--", r)]
+    if not rels:
+        return ""
+    code, out = call(["git", "-C", root, "add", "--", *rels])
+    if code == 0:
+        code, out = call(["git", "-C", root, "commit", "-q", "--only", "-m", message, "--", *rels])
+    if code:
+        return (f"The updated records ({', '.join(rels)}) couldn't be committed, so they're left uncommitted: "
+                f"{out.strip()[-300:]}")
+    return f"Committed the updated records on their own: \"{message}\"."
 
 
 def work_changes(root, cfg):
@@ -1089,7 +1601,20 @@ def milestone_status(root, cfg, milestone):
             r.get("verify") == "e2e" and state.get(r["id"], {}).get("passes") for _, r in reqs):
         reasons.append(f"no end-to-end requirement of {milestone} passes: a milestone needs behavioural evidence, "
                        "not only unit tests")
+    reasons += long_check_reasons(root, cfg, "milestone")
     return not reasons, reasons
+
+
+def long_check_reasons(root, cfg, event):
+    """What's missing for the long checks run elsewhere that `event` needs (gates with it in `when`)."""
+    out = []
+    for g in cfg["gates"]:
+        when = g.get("when", ["commit"])
+        if detached(g) and event in ([when] if isinstance(when, str) else when):
+            r = detached_result(root, cfg, g)
+            if r["status"] != "pass":
+                out.append(f"the long check '{g['name']}' has no collected pass on this code: " + "; ".join(r["fails"]))
+    return out
 
 
 # --- deploy: what's live, checked where it's served ------------------------------------------
@@ -1114,26 +1639,52 @@ def deploy(root, cfg):
     if pending:
         return False, [f"Commit first: a deploy ships a commit, and {len(pending)} file(s) aren't committed "
                        f"({', '.join(pending[:5])})."]
-    head = git(root, "rev-parse", "--short", "HEAD")
+    head, tag = git(root, "rev-parse", "--short", "HEAD"), ""
+    if d.get("ref") == "tag":  # the server runs tagged releases only
+        tag, tagged = release_tag_for(root, cfg)
+        if not tag:
+            return False, ["This project deploys tagged releases only (deploy.ref is \"tag\"), and the last commit "
+                           "isn't a release. Make one with `regista.py release`, which deploys it."]
+        head = tagged
+    whole = [g for g in select_gates(cfg, event="commit") if g.get("run_some") and not g.get("_skip")]
+    if whole:  # commits may have run only some of these tests: the whole suite passes before anything goes live
+        results = run_gates(root, cfg, whole)
+        if any(r["status"] == "fail" for r in results):
+            return False, ["Not deployed: the whole end-to-end suite must pass before a deploy, and it failed:",
+                           format_results(results)] + [f"[{r['name']}] last lines:\n{r['tail']}" for r in results
+                                                       if r.get("tail")]
+    last = load_json(deployed_path(root), {})
+    since = changes_since(root, cfg, last.get("commit")) if last.get("ok") else None  # since the last good deploy
     t0 = time.time()
-    code, out = run_shell(d["run"], root, d.get("timeout", 1200))
+    code, out = run_shell(fill(d["run"], ref=tag or head), root, d.get("timeout", 1200),
+                          env={**os.environ, ENV_PREFIX + "DEPLOY_REF": tag or head})
     rec = {"commit": head, "at": dt.datetime.now().isoformat(timespec="seconds"),
            "deploy": {"exit": code, "seconds": round(time.time() - t0, 1)}}
-    lines = [f"Deploy of {head}: " + ("done" if code == 0 else f"FAILED (exit {code})") + f" in {rec['deploy']['seconds']} s"]
-    checks = select_gates(cfg, event="deploy")
-    results = []
+    if tag:
+        rec["tag"] = tag
+    lines = [f"Deploy of {tag or head}: " + ("done" if code == 0 else f"FAILED (exit {code})") + f" in {rec['deploy']['seconds']} s"]
+    checks = select_gates(cfg, event="deploy", files=since)
+    results, changed = [], ""
     if code != 0:
         lines.append("\n".join(out.strip().splitlines()[-25:]))
     elif checks:
         results = run_gates(root, cfg, checks, reuse=False)
-        record_requirements(root, cfg, results)
+        before = load_json(requirements_path(root), {})
+        changed = results_changed(before, record_requirements(root, cfg, results))
         lines.append("Live checks:\n" + format_results(results))
         lines += [f"\n[{r['name']}] last lines:\n{r['tail']}" for r in results if r.get("tail")]
     else:
         lines.append("No live checks: add gates with \"when\": [\"deploy\"] that look at what's served.")
     rec["checks"] = [{k: r.get(k) for k in ("name", "status", "seconds")} for r in results]
-    rec["ok"] = code == 0 and all(r["status"] == "pass" for r in results)
+    rec["ok"] = code == 0 and all(r["status"] in ("pass", "skipped") for r in results)
     save_json(deployed_path(root), rec)
+    # the folder was clean (checked above), so the records go in a commit of their own
+    state = "the live checks passed" if rec["ok"] else "the deploy failed" if code else "the live checks failed"
+    note = commit_records(root, [harness_rel("gates", "deployed.json", root=root),
+                                 harness_rel("gates", "requirements.json", root=root)],
+                          f"Record the deploy of {head}: {state}" + (f"; {changed}" if changed else ""))
+    if note:
+        lines.append(note)
     return rec["ok"], lines
 
 
@@ -1148,7 +1699,7 @@ def live_text(root, cfg):
               if not all(bookkeeping(root, cfg, f) for f in git(root, "show", "--name-only", "--format=", c).splitlines())]
     state = ("live checks passed" if rec.get("ok") else
              "the deploy FAILED" if rec.get("deploy", {}).get("exit") else "live checks FAILED")
-    return (f"Live: {rec['commit']}, deployed {rec['at'].replace('T', ' ')[:16]}, {state}"
+    return (f"Live: {rec['tag'] + ' (' + rec['commit'] + ')' if rec.get('tag') else rec['commit']}, deployed {rec['at'].replace('T', ' ')[:16]}, {state}"
             + (f"; {len(behind)} code commit(s) since aren't deployed." if behind else "; it's the latest code."))
 
 
@@ -1159,7 +1710,398 @@ def runs_deploy_command(cfg, eff):
         return False
     segs, _ = shell_segments(run)
     want = [w for w in (segs[0]["words"] if segs else []) if not ASSIGN.match(w)]
+    if any("{ref}" in w for w in want):  # the words up to the release it deploys
+        want = want[:next(k for k, w in enumerate(want) if "{ref}" in w)]
     return bool(want) and any(words[:len(want)] == want for words in eff["runs"])
+
+
+# Commands that only set up a gate's run (`cd e2e && npm test`): never the gate itself.
+SETUP_CMDS = {"cd", "pushd", "popd", "export", "set", "unset", "source", ".", "true", "false", ":", "echo", "printf",
+              "test", "[", "exit", "wait", "sleep", "trap", "local", "return", "shift"}
+PACKAGE_MANAGERS = {"npm", "pnpm", "yarn", "bun"}
+
+
+def command_words(words):
+    """A command's words in a form two spellings of the same command share: no leading `./`, a program on the
+    PATH without .exe or .cmd, and `npm run x` as `npm x` (`npm t` as `npm test`)."""
+    words = [w.replace("\\", "/")[2:] if w.startswith(("./", ".\\")) else w for w in words]
+    if not words:
+        return words
+    name = words[0] if "/" in words[0].replace("\\", "/") else re.sub(r"\.(exe|cmd|bat|ps1)$", "", words[0].lower())
+    rest = words[1:]
+    if name in PACKAGE_MANAGERS and rest[:1] and rest[0] in ("run", "run-script"):
+        rest = rest[1:]
+    if name in PACKAGE_MANAGERS and rest[:1] and rest[0] in ("t", "tst"):
+        rest = ["test"] + rest[1:]
+    return [name] + rest
+
+
+def runs_like(words, want):
+    """Do the words run the command `want`: the same program and arguments in that order, with more
+    arguments allowed after them or as options in between, and `want`'s own options optional (`npm run e2e`
+    runs the gate `npm run e2e --silent`)."""
+    words, want = command_words(words), command_words(want)
+    if not words or not want or words[0] != want[0]:
+        return False
+    i = 1
+    for w in want[1:]:
+        while i < len(words) and words[i] != w and words[i].startswith("-"):
+            i += 1  # an option of the command's own
+        if i < len(words) and words[i] == w:
+            i += 1
+        elif not w.startswith("-"):
+            return False
+    return True
+
+
+def runs_gate_command(root, cfg, eff):
+    """The gate whose command the shell command runs itself, outside `regista.py gate` and so outside the gate
+    lock, or None. A gate's command is the last one its `run` starts that isn't setup (`cd`, `export`):
+    `npm run e2e` for `cd web && npm run e2e`. Only commands that run count: echo, grep or a commit message
+    that mention it don't."""
+    if not eff or not eff["runs"]:
+        return None
+    for g in cfg["gates"]:
+        for cmd in (g.get("run") or "", fill(g.get("run_some") or "", files="")):  # its whole run or a part of it
+            runs = [w for w in shell_effects(cmd, root)["runs"] if command_words(w)[0] not in SETUP_CMDS]
+            if runs and any(runs_like(words, runs[-1]) for words in eff["runs"]):
+                return g
+    return None
+
+
+# --- releases: a version, a tag, its notes, then a deploy -------------------------------------
+#
+# `regista.py release [patch|minor|major]` raises the version in the configured files, checks that the
+# changelog has a dated entry for it and that the gates pass (the commit gates, and the release's long
+# checks on the same code), commits, tags, pushes the tag (the project's push policy applies), publishes
+# the GitHub release page from the changelog, and deploys. A release above a patch is the user's call:
+# the hook asks them before an agent runs one. When the version files already carry a version that has
+# no tag yet (a pull request set it), that version is released as it is.
+
+RELEASE_DEFAULTS = {"version_files": [], "changelog": "CHANGELOG.md", "heading": "## [{version}] - {date}",
+                    "tag": "v{version}", "message": "{project} {version}", "github_release": False,
+                    "title": "{project} {version}", "deploy": True, "remote": "origin"}
+VERSION = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
+LEVELS = ("patch", "minor", "major")
+
+
+def release_settings(cfg):
+    return {**RELEASE_DEFAULTS, **(cfg.get("release") or {})}
+
+
+def version_key(v):
+    return tuple(int(x) for x in v.split("."))
+
+
+def bump_version(v, level):
+    a, b, c = version_key(v)
+    return f"{a + 1}.0.0" if level == "major" else f"{a}.{b + 1}.0" if level == "minor" else f"{a}.{b}.{c + 1}"
+
+
+def release_level(old, new):
+    o, n = version_key(old), version_key(new)
+    return "major" if n[0] > o[0] else "minor" if n[1] > o[1] else "patch"
+
+
+def tag_regex(fmt):
+    return re.compile(re.escape(fmt).replace(re.escape("{version}"), r"(\d+\.\d+\.\d+)"))
+
+
+def version_spots(root, cfg):
+    """Each version file with the pattern that finds its version (one group around it). The common files
+    need no pattern: pyproject.toml, Cargo.toml, package.json, and the project's own entry in uv.lock or
+    Cargo.lock. Others are given as {"file": …, "match": …}."""
+    out = []
+    for entry in release_settings(cfg)["version_files"]:
+        path, rx = (entry.get("file", ""), entry.get("match", "")) if isinstance(entry, dict) else (entry, "")
+        folder, name = path.rsplit("/", 1) if "/" in path else ("", path)
+        if not rx and name in ("pyproject.toml", "Cargo.toml"):
+            rx = r'(?m)^version\s*=\s*"([^"]+)"'
+        elif not rx and name == "package.json":
+            rx = r'"version"\s*:\s*"([^"]+)"'
+        elif not rx and name in ("uv.lock", "Cargo.lock"):
+            manifest = (folder + "/" if folder else "") + ("pyproject.toml" if name == "uv.lock" else "Cargo.toml")
+            m = re.search(r'(?m)^name\s*=\s*"([^"]+)"', read(p(root, manifest)))
+            if m:
+                pkg = re.sub(r"[-_.]+", "-", m.group(1)).lower() if name == "uv.lock" else m.group(1)
+                rx = r'(?m)^name = "' + re.escape(pkg) + r'"\r?\nversion = "([^"]+)"'
+        out.append((path, rx))
+    return out
+
+
+def released_versions(root, cfg):
+    rx = tag_regex(release_settings(cfg)["tag"])
+    found = [m.group(1) for m in (rx.fullmatch(t) for t in git(root, "tag", "--list").splitlines()) if m]
+    return sorted(set(found), key=version_key)
+
+
+def release_tag_for(root, cfg):
+    """(tag, short commit) of the release whose code HEAD has: a release tag on HEAD, or on an older commit
+    when only the harness's records changed since. ("", "") when there's none."""
+    rx = tag_regex(release_settings(cfg)["tag"])
+    for c in git(root, "rev-list", "--max-count=50", "HEAD").splitlines():
+        tags = [t for t in git(root, "tag", "--points-at", c).splitlines() if rx.fullmatch(t)]
+        if tags:
+            return sorted(tags, key=lambda t: version_key(rx.fullmatch(t).group(1)))[-1], c[:7]
+        files = git(root, "show", "--name-only", "--format=", c).splitlines()
+        if not files or not all(bookkeeping(root, cfg, f) for f in files):
+            return "", ""
+    return "", ""
+
+
+def changelog_entry(text, heading, version):
+    """(date or "", notes) of the changelog's entry for `version`, or None when it has none."""
+    rx = (re.escape(heading).replace(re.escape("{version}"), re.escape(version))
+          .replace(re.escape("{date}"), r"(\d{4}-\d{2}-\d{2})"))
+    m = re.search(r"(?m)^" + rx + r"(?=[ \t]|\r?$)", text)
+    if not m:
+        return None
+    level = len(re.match(r"#*", heading).group()) or 2
+    end = re.compile(r"(?m)^#{1,%d}\s" % level).search(text, m.end())
+    rest = text[m.end():end.start() if end else len(text)]
+    return (m.group(1) if m.groups() else ""), rest.split("\n", 1)[1].strip() if "\n" in rest else ""
+
+
+def release_plan(root, cfg, level=None):
+    """What a release would do, and what stands in its way: the version now and next, the files to bump,
+    the tag, the notes, and `problems` in plain language."""
+    rs = release_settings(cfg)
+    plan = {"problems": [], "level": None, "current": "", "previous": "", "new": "", "bump": [], "tag": "", "notes": ""}
+    problems = plan["problems"]
+    spots = version_spots(root, cfg)
+    if not spots:
+        problems.append(f"No release is configured: add a \"release\" section to {harness_rel('config.json', root=root)} "
+                        "with the files that carry the version, for example \"version_files\": [\"pyproject.toml\"].")
+        return plan
+    found = []
+    for path, rx in spots:
+        if not rx:
+            problems.append(f"{DISPLAY_NAME} doesn't know where {path} keeps the version: list it as "
+                            f"{{\"file\": \"{path}\", \"match\": \"<a pattern with the version in brackets>\"}}.")
+            continue
+        m = re.search(rx, read(p(root, path)))
+        if not m:
+            problems.append(f"Couldn't find the version in {path}" +
+                            ("." if os.path.isfile(p(root, path)) else ": the file doesn't exist."))
+            continue
+        found.append((path, rx, m.group(1)))
+    if len({v for _, _, v in found}) > 1:
+        problems.append("The version files disagree: " + ", ".join(f"{f} says {v}" for f, _, v in found) +
+                        ". Set them all to the same version first.")
+    if problems:
+        return plan
+    cur = found[0][2]
+    if not VERSION.match(cur):
+        problems.append(f"The version in {found[0][0]} is {cur}, which isn't of the form 1.2.3.")
+        return plan
+    released = released_versions(root, cfg)
+    prev = released[-1] if released else ""
+    plan.update(current=cur, previous=prev)
+    if cur in released:  # the usual case: raise the released version
+        plan.update(new=bump_version(cur, level or "patch"), level=level or "patch", previous=cur, bump=found)
+    elif not released:  # the first release: the version the files carry, or raised from it when asked
+        plan.update(new=bump_version(cur, level) if level else cur, level=level or "first", bump=found if level else [])
+    elif version_key(cur) > version_key(prev):  # the files already carry the next version (a pull request set it)
+        implied = release_level(prev, cur)
+        if level and level != implied:
+            problems.append(f"The version files already say {cur}, which is a {implied} release after {prev}, but you "
+                            f"asked for a {level} release. Release {cur} with `regista.py release {implied}`, or set "
+                            "the files to the version you want.")
+        plan.update(new=cur, level=implied)
+    else:
+        problems.append(f"The version files say {cur}, which is older than the last release, {prev}. Set them to "
+                        f"{prev} and run the release again.")
+        return plan
+    new = plan["new"]
+    plan["tag"] = tag = fill(rs["tag"], version=new)
+    if git(root, "rev-parse", "--verify", "--quiet", "refs/tags/" + tag):
+        problems.append(f"The tag {tag} already exists: {new} is released.")
+    cl, today = rs["changelog"], dt.date.today().isoformat()
+    if cl:
+        want = fill(rs["heading"], version=new, date=today)
+        entry = changelog_entry(read(p(root, cl)), rs["heading"], new)
+        if entry is None:
+            problems.append(f"{cl} has no entry for {new}. Add one at the top, headed \"{want}\", saying in plain "
+                            "words what changed for the people who use it.")
+        elif entry[0] and entry[0] != today:
+            problems.append(f"{cl}'s entry for {new} is dated {entry[0]}. A release is dated the day it's tagged: "
+                            f"change it to {today}.")
+        elif not entry[1]:
+            problems.append(f"{cl}'s entry for {new} is empty: say in plain words what changed.")
+        else:
+            plan["notes"] = entry[1]
+    dirty = [f for f in work_changes(root, cfg) if f != cl]
+    if dirty:
+        problems.append(f"{plural(len(dirty), 'file')} {'isn' if len(dirty) == 1 else 'aren'}'t committed "
+                        f"({', '.join(dirty[:5])}). Commit them first: a release tags a commit.")
+    return plan
+
+
+def release_gates(root, cfg, plan):
+    """The gates a release needs, judged against what changed since the last release (None: unknown)."""
+    rs = release_settings(cfg)
+    prev_tag = fill(rs["tag"], version=plan["previous"]) if plan["previous"] else ""
+    since = changes_since(root, cfg, prev_tag) if prev_tag else None
+    return select_gates(cfg, event="release", files=since)
+
+
+def release(root, cfg, level=None, check=False, push=True):
+    """Make a release. Returns (ok, lines), in plain language."""
+    rs = release_settings(cfg)
+    plan = release_plan(root, cfg, level)
+    if worker_info(root):
+        plan["problems"].insert(0, "Only the overseer releases, after merging. Tell it your work is ready.")
+    new, prev, cl = plan["new"], plan["previous"], rs["changelog"]
+    if plan["problems"]:
+        return False, [f"Not released{': ' + new + ' is not ready' if new else ''}. What's missing:"] + \
+            [f"- {x}" for x in plan["problems"]]
+    kind = ("the first release" if plan["level"] == "first" else f"a {plan['level']} release after {prev}")
+    gates = release_gates(root, cfg, plan)
+    ignore = [f for f, _, _ in plan["bump"]] + ([cl] if cl else [])  # the release's own edits don't void a long check
+    longs = [detached_result(root, cfg, g, ignore) for g in gates if detached(g) and not g.get("_skip")]
+    if check:
+        lines = [f"Ready to release {new} ({kind})."]
+        if plan["bump"]:
+            lines.append(f"- It sets the version to {new} in {', '.join(f for f, _, _ in plan['bump'])}.")
+        lines.append("- The gates run first: " + (", ".join(g["name"] for g in gates if not detached(g) and not g.get("_skip"))
+                                                  or "none") + " (a run that passed on exactly these files counts).")
+        lines += [f"- {r['name']}: " + ("its pass holds for this code." if r["status"] == "pass" else r["fails"][0])
+                  for r in longs]
+        commits = plan["bump"] or (cl and cl in changed_files(root))
+        lines.append(f"- Then it {'commits, ' if commits else ''}tags {plan['tag']}" +
+                     (", pushes the tag" if cfg["push"] != "block" else "") +
+                     (", publishes the GitHub release page" if rs["github_release"] else "") +
+                     (" and deploys it." if rs["deploy"] and (cfg.get("deploy") or {}).get("run") else "."))
+        failing = [r for r in longs if r["status"] != "pass"]
+        if failing:
+            lines[0] = f"Not ready to release {new} ({kind}): a long check has no pass on this code yet."
+        return not failing, lines
+    if any(r["status"] != "pass" for r in longs):
+        return False, [f"Not released: {new} needs its long checks to pass on this code first.", format_results(longs)]
+    before = {}
+    for path, rx, _ in plan["bump"]:
+        text = read_exact(p(root, path)) or ""
+        m = re.search(rx, text)
+        before[path] = text
+        write_exact(p(root, path), text[:m.start(1)] + new + text[m.end(1):])
+
+    def undo():
+        for path, text in before.items():
+            write_exact(p(root, path), text)
+    normal = [g for g in gates if not detached(g) or g.get("_skip")]
+    results = run_gates(root, cfg, normal) if normal else []
+    failed = [r for r in results if r["status"] == "fail"]
+    if failed:
+        undo()
+        return False, [f"Not released: a gate fails on {new}, so the version files are back as they were.",
+                       format_results(results)] + [f"[{r['name']}] last lines:\n{r.get('tail', '')}" for r in failed]
+    results += longs
+    lines = [f"Released {new}, {kind}."]
+    to_commit = list(before) + ([cl] if cl and cl in changed_files(root) else [])
+    if results:
+        record_requirements(root, cfg, results)
+        req = harness_rel("gates", "requirements.json", root=root)
+        if req in changed_files(root):
+            to_commit.append(req)
+    if before or (cl and cl in to_commit):
+        call(["git", "-C", root, "add", "--", *to_commit])
+        code, out = call(["git", "-C", root, "commit", "-q", "-m", f"Release {new}"])
+        if code:
+            call(["git", "-C", root, "reset", "-q", "--", *to_commit])
+            undo()
+            return False, [f"Not released: the release commit failed, so the version files are back as they were. "
+                           f"git said: {out.strip()[-400:]}"]
+        lines.append(f"- Committed the release as \"Release {new}\"" +
+                     (f", with the version set to {new} in {', '.join(before)}." if before else ", with its changelog."))
+    if results:
+        lines.append("- The gates passed:\n" + "\n".join("  " + x for x in format_results(results).splitlines()))
+    project = cfg["project"] or os.path.basename(root)
+    tag = plan["tag"]
+    code, out = call(["git", "-C", root, "tag", "-a", tag, "-m", fill(rs["message"], project=project, version=new)])
+    if code:
+        lines.append(f"- Couldn't tag the release: {out.strip()[-300:]}. Tag it with `git tag -a {tag} -m \"{new}\"`.")
+        return False, lines
+    lines.append(f"- Tagged it {tag}.")
+    title = fill(rs["title"], project=project, version=new)
+    later = ([f"push the tag: `git push {rs['remote']} {tag}`"] +
+             ([f"publish its release page: `gh release create {tag} --verify-tag --title \"{title}\" --notes-file -` "
+               f"with the changelog's {new} section as the notes"] if rs["github_release"] else []) +
+             (["deploy it: `regista.py deploy`"] if rs["deploy"] and (cfg.get("deploy") or {}).get("run") else []))
+    if not push or cfg["push"] == "block":
+        why = "You asked for no push" if not push else "Pushing is off for this project"
+        lines.append(f"{why}, so the rest is yours to do:\n" + "\n".join(f"- {x}" for x in later))
+        return True, lines
+    upstream = git(root, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
+    remote, branch = upstream.split("/", 1) if "/" in upstream else (rs["remote"], "")
+    if not git(root, "remote", "get-url", remote):
+        lines.append(f"- There's no remote named {remote}, so the tag stays here.")
+    else:
+        refs = ([f"HEAD:refs/heads/{branch}"] if branch else []) + [f"refs/tags/{tag}"]
+        code, out = call(["git", "-C", root, "push", "--atomic", "-q", remote, *refs], timeout=300)
+        if code:
+            lines.append(f"- The push to {remote} failed, so nothing went out: {out.strip()[-300:]}\nWhat's left:\n" +
+                         "\n".join(f"- {x}" for x in later))
+            return False, lines
+        lines.append(f"- Pushed the tag {tag}" + (f" and {branch}" if branch else
+                                                  " (this branch has no upstream, so the release commit went with the tag only)")
+                     + f" to {remote}.")
+        if rs["github_release"]:
+            gh = tool_exe("gh")
+            if not gh:
+                lines.append(f"- GitHub's command line tool (gh) isn't installed, so there's no release page yet: "
+                             f"{later[1]}.")
+            else:
+                try:
+                    r = subprocess.run([gh, "release", "create", tag, "--verify-tag", "--title", title, "--notes-file", "-"],
+                                       cwd=root, input=plan["notes"] or f"{title}.", capture_output=True, text=True,
+                                       encoding="utf-8", errors="replace", timeout=120)
+                    code, out = r.returncode, (r.stdout or "") + (r.stderr or "")
+                except (OSError, subprocess.TimeoutExpired) as e:
+                    code, out = 1, str(e)
+                lines.append(f"- Published the release page on GitHub from the changelog's {new} section." if code == 0
+                             else f"- The GitHub release page failed ({out.strip()[-300:]}). Create it with: {later[1]}.")
+    if rs["deploy"] and (cfg.get("deploy") or {}).get("run"):
+        ok, dlines = deploy(root, cfg)
+        lines += ["", *dlines]
+        return ok, lines
+    return True, lines
+
+
+GH_PUBLISH = (["pr", "merge"], ["release", "create"], ["release", "edit"], ["release", "delete"], ["release", "upload"])
+
+
+def gh_publishes(eff):
+    """Does the command merge a pull request or create or change a release with GitHub's gh? Like a push, it
+    changes what others see."""
+    for words in (eff or {}).get("runs") or []:
+        name = re.sub(r"\.exe$", "", os.path.basename(words[0].replace("\\", "/")).lower()) if words else ""
+        if name == "gh" and any(words[k:k + 2] in GH_PUBLISH for k in range(1, len(words) - 1)):
+            return True
+    return False
+
+
+def release_guard(root, cfg, data):
+    """`regista.py release` from an agent: a release above a patch is the user's call, and so are the pushes
+    it makes when the project's push policy is "ask". Only the main session releases."""
+    eff = effects_of(root, data)
+    if not eff or not runs_cli(eff, "release"):
+        return
+    words = next((w for w in eff["runs"] if "release" in w and any(x.endswith(("regista.py", "scripts/regista"))
+                                                                    for x in w)), [])
+    if "--check" in words:
+        return
+    plan = release_plan(root, cfg, next((x for x in words if x in LEVELS), None))
+    if plan["problems"]:
+        return  # it changes nothing and says what's missing
+    rs, what = release_settings(cfg), []
+    if plan["level"] in ("minor", "major"):
+        what.append(f"it's a {plan['level']} release ({plan['previous'] or plan['current']} to {plan['new']}), and only "
+                    "the user decides a release above a patch")
+    if cfg["push"] == "ask" and "--no-push" not in words:
+        what.append(f"it pushes the tag {plan['tag']}" + (" and publishes its GitHub release page" if rs["github_release"]
+                                                          else ""))
+    if what:
+        ask(f"{DISPLAY_NAME}: releasing {plan['new']} needs the user's go-ahead: " + "; ".join(what) + ".")
 
 
 # --- build all: one run through every milestone ---------------------------------------------
@@ -1175,6 +2117,7 @@ def run_path(root):
 
 
 AFTER = re.compile(r"^\s*(?:[-*]\s*)?\**After\**\s*:\**\s*(.+?)\s*$", re.M | re.I)
+FILES = re.compile(r"^\s*(?:[-*]\s*)?\**Files\**\s*:\**\s*(.+?)\s*$", re.M | re.I)  # the files a milestone changes
 
 
 def plan_milestones(root, cfg):
@@ -1188,11 +2131,181 @@ def plan_milestones(root, cfg):
         body = re.split(r"^##\s", body, maxsplit=1, flags=re.M)[0]
         rule = AFTER.search(body)
         after = rule.group(1).strip().rstrip(".") if rule else ""
+        files = FILES.search(body)
         out.append({"id": m.group(1), "title": m.group(2).strip(),
                     "open_steps": len(re.findall(r"^\s*[-*]\s*\[ \]", body, re.M)),
                     "after": "all" if re.match(r"(all|everything|the rest|last)\b", after, re.I) else
-                    re.findall(r"\bM\d+[a-z]?\b", after)})
+                    re.findall(r"\bM\d+[a-z]?\b", after),
+                    "files": split_globs(files.group(1)) if files else []})
     return out
+
+
+def split_globs(text):
+    """'src/pages/**, `tests/test_pages.py`' → ['src/pages/**', 'tests/test_pages.py']. The template's
+    placeholder (`<…>`) names nothing."""
+    if re.search(r"<[^>]*>", text or ""):
+        return []
+    return [g for g in (x.strip().strip("`'\"") for x in re.split(r"[,\s]+", text or "")) if g]
+
+
+# --- the plan command: the overseer and the orchestrator change the plan through the harness ---
+#
+# `regista.py plan add-milestone "<title>"` writes a milestone section in the plan's own format, and
+# `regista.py plan tick M3 "<step>"` ticks a step. The commit hook ticks the step a commit completes
+# (tick_committed_steps), and a worker never edits the plan: its ticks reach the project when the
+# overseer merges its branch (plan_tick).
+
+STEP_LINE = re.compile(r"^(\s*[-*]\s*)\[([ xX])\](.*?)(\r?)$")
+
+
+def plan_rel(root, cfg):
+    return cfg["plan"] or harness_rel("plan.md", root=root)
+
+
+def step_key(text):
+    """A step's text compared loosely: no Markdown emphasis, case, extra spaces or a final full stop."""
+    return re.sub(r"\s+", " ", re.sub(r"[*_`]", "", text or "")).strip().rstrip(".:;").strip().lower()
+
+
+def milestone_span(lines, milestone):
+    """(start, end) line indexes of a milestone's section ('## M3 — …' up to the next '## '), or None."""
+    start = next((i for i, ln in enumerate(lines)
+                  if re.match(r"^##\s+" + re.escape(milestone) + r"\b", ln, re.I)), None)
+    if start is None:
+        return None
+    end = next((i for i in range(start + 1, len(lines)) if re.match(r"^##\s", lines[i])), len(lines))
+    return start, end
+
+
+def find_step(steps, wanted, exact=False):
+    """The index in `steps` [(line index, ticked, text)] of the step `wanted` names: its number in the
+    milestone (1 is the first), or its text. Exact text first; unless `exact`, then a part of the text
+    that only one step has. Returns (index or None, why not)."""
+    w = str(wanted).strip()
+    if re.fullmatch(r"\d+", w):
+        k = int(w)
+        return (k - 1, "") if 1 <= k <= len(steps) else (None, f"it has {plural(len(steps), 'step')}, not {k}")
+    key = step_key(w)
+    if not key:
+        return None, "the step's text is empty"
+    hits = [i for i, (_, _, t) in enumerate(steps) if step_key(t) == key or slugify(t) == slugify(w) == w.lower()]
+    if not hits and not exact:
+        hits = [i for i, (_, _, t) in enumerate(steps) if key in step_key(t)]
+    if len(hits) == 1:
+        return hits[0], ""
+    return None, ("no step has that text" if not hits else f"{len(hits)} steps match it; give its number")
+
+
+def plan_tick(root, milestone, step, cfg=None, exact=False):
+    """Tick a step of a milestone in the plan: `step` is its number in the milestone or its text.
+    Returns (ok, message). Also what a merge calls to carry a worker's ticks into the project."""
+    cfg = cfg or load_config(root)
+    path = p(root, plan_rel(root, cfg))
+    md = read_exact(path)
+    if md is None:
+        return False, f"There's no plan at {plan_rel(root, cfg)}."
+    lines = md.splitlines(keepends=True)
+    span = milestone_span(lines, milestone)
+    if not span:
+        return False, f"There's no milestone {milestone} in the plan."
+    milestone = re.match(r"^##\s+(\S+?)\b", lines[span[0]]).group(1)  # as the plan writes it
+    steps = [(i, m.group(2) != " ", m.group(3).strip()) for i in range(*span)
+             for m in [STEP_LINE.match(lines[i].rstrip("\n"))] if m]
+    if not steps:
+        return False, f"{milestone} has no steps in the plan."
+    k, why = find_step(steps, step, exact)
+    if k is None:
+        listed = "\n".join(f"  {n}. [{'x' if t else ' '}] {s}" for n, (_, t, s) in enumerate(steps, 1))
+        return False, f"Couldn't tell which step of {milestone} that is: {why}. Its steps:\n{listed}"
+    i, ticked, text = steps[k]
+    if ticked:
+        return True, f"{milestone}, step {k + 1} was already ticked: {text}"
+    lines[i] = STEP_LINE.sub(lambda m: f"{m.group(1)}[x]{m.group(3)}{m.group(4)}", lines[i].rstrip("\n"), count=1) + \
+        ("\n" if lines[i].endswith("\n") else "")
+    write_exact(path, "".join(lines))
+    return True, f"Ticked {milestone}, step {k + 1}: {text}"
+
+
+def plan_add_milestone(root, cfg, title, after="", files="", gate=(), steps=()):
+    """Write a new milestone section, numbered after the last one, before 'Out of scope' if the plan has it.
+    Returns (ok, lines)."""
+    title = (title or "").strip()
+    if not title:
+        return False, ["Give the milestone a title: `regista.py plan add-milestone \"<title>\"`."]
+    path = p(root, plan_rel(root, cfg))
+    md = read_exact(path)
+    if md is None:
+        return False, [f"There's no plan at {plan_rel(root, cfg)}. `/{SLUG}:init` writes one."]
+    ms = plan_milestones(root, cfg)
+    ids = {m["id"].upper(): m["id"] for m in ms}
+    rule = ""
+    if after.strip():
+        if re.fullmatch(r"\s*(all|last)\s*", after, re.I):
+            rule = "all"
+        else:
+            want = re.findall(r"M\d+[a-z]?", after, re.I)
+            unknown = [x for x in want if x.upper() not in ids]
+            if not want or unknown:
+                return False, [f"--after takes milestones in the plan (M3, or M3,M5) or \"all\"; "
+                               f"{', '.join(unknown) or after.strip()} isn't one."]
+            rule = ", ".join(ids[x.upper()] for x in want)
+    n = max([int(re.match(r"M(\d+)", m["id"]).group(1)) for m in ms] + [0]) + 1
+    mid = f"M{n}"
+    globs = split_globs(files)
+    nl = "\r\n" if "\r\n" in md else "\n"
+    section = [f"## {mid} — {title}"] + ([f"After: {rule}"] if rule else []) + \
+        ([f"Files: {', '.join(globs)}"] if globs else []) + [""]
+    if gate:
+        section += ["Gate:"] + [f"- {g.strip()}" for g in gate if g.strip()] + [""]
+    if steps:
+        section += ["Steps:"] + [f"- [ ] {s.strip()}" for s in steps if s.strip()] + [""]
+    text = nl.join(section) + nl
+    out_of_scope = re.search(r"^##\s+Out of scope\b", md, re.M | re.I)
+    if out_of_scope:
+        md = md[:out_of_scope.start()] + text + md[out_of_scope.start():]
+    else:
+        md = md.rstrip("\r\n") + nl + nl + text
+    write_exact(path, md)
+    lines = [f"Added {mid} — {title} to {plan_rel(root, cfg)}" +
+             (f", built after {'every other milestone' if rule == 'all' else rule}" if rule else "") + "."]
+    missing = [x for x, given in (("its gate (what must be true, measurably)", gate), ("its steps", steps)) if not given]
+    if missing:
+        lines.append(f"Write {' and '.join(missing)} under its heading before anyone builds it: a milestone with no "
+                     "open steps counts as built.")
+    if not globs:
+        lines.append("It names no files (--files), so `fleet spawn` can't warn when a worker beside it changes "
+                     "the same ones.")
+    lines.append("Commit the plan before you start a worker on it: workers start from the last commit.")
+    return True, lines
+
+
+def tick_committed_steps(root, cfg, files):
+    """The commit hook ticks the plan step a commit completes. It can tell which one when the commit
+    holds work besides the harness's records and the step's spec (specs/<step>.json, not "planned"),
+    and the spec names its step: "plan_step" (the step's text in the plan, or its number in the
+    milestone), or else a title or step name equal to the step's text. When it can't tell, nothing is
+    ticked. The tick is staged, so the commit carries it. Returns notes for the session."""
+    plan = plan_rel(root, cfg)
+    if not any(not bookkeeping(root, cfg, f) and f != plan for f in files):
+        return []
+    notes = []
+    specs = harness_rel("specs", root=root) + "/"
+    for f in files:
+        if not (f.startswith(specs) and f.endswith(".json")):
+            continue
+        spec = load_json(p(root, f), None)
+        if not isinstance(spec, dict) or spec.get("state") == "planned" or not spec.get("milestone"):
+            continue
+        named = [spec["plan_step"]] if spec.get("plan_step") not in (None, "") else \
+            [x for x in (spec.get("title"), spec.get("step")) if isinstance(x, str) and x.strip()]
+        for wanted in named:
+            ok, msg = plan_tick(root, str(spec["milestone"]), wanted, cfg, exact=True)
+            if ok:
+                if msg.startswith("Ticked"):
+                    git(root, "add", "--", plan)
+                    notes.append(f"{DISPLAY_NAME}: {msg} (in the plan, with this commit).")
+                break
+    return notes
 
 
 def build_order(ms):
@@ -1323,6 +2436,8 @@ def run_nudge(root, cfg, data):
     pct, _ = context_pct(cfg, data)
     if pct is not None and pct >= pause_at(cfg):
         return None  # the pause comes first; `start continue` picks the run up again
+    if agents_running(root, data):
+        return None  # the session waits on its agents; their completion notices wake it, so this isn't a stall
     head = git(root, "rev-parse", "HEAD")
     if run.get("nudged_at") == head:
         run_end(root, cfg, "the session tried to stop twice without committing anything new", outcome="stalled")
@@ -1340,6 +2455,12 @@ def run_nudge(root, cfg, data):
             f"\nIf every milestone is done, or everything left waits on the user (a decision, a manual check, a "
             f"step that stayed blocked), or the user asked you to stop: save, run `{PY} \"{DD}\" run end --reason "
             f"\"<why>\"`, and give the final report."}
+
+
+def waits_on_agents(root, data):
+    """A build-all run is active and the session stopped while agents it started still work: the stop is
+    quiet, because their completion notices wake the session again."""
+    return bool(load_json(run_path(root), {}).get("active") and agents_running(root, data))
 
 
 # --- the overseer and its workers -----------------------------------------------------------
@@ -1372,7 +2493,8 @@ def exclude_block(lines):
     return f"# {DISPLAY_NAME} workers\n" + "\n".join(lines) + "\n"
 
 
-FLEET_WRITES = ("spawn", "merge", "stop", "resume", "remove")
+FLEET_WRITES = ("spawn", "merge", "stop", "resume", "remove", "allow")
+FLEET_FROM_PROJECT = ("spawn", "merge", "resume", "remove", "sync", "allow")  # refused from a session started elsewhere
 
 
 def worker_info(root):
@@ -1457,6 +2579,30 @@ def overseer_self(root, sessions):
             "mode": seen.get("permission_mode", "") if seen.get("session_id") in ("", sid) else ""}
 
 
+def session_folder():
+    """The folder the Claude Code session running this command was started in: Claude Code puts the
+    session's id in its shells' environment, and its list of live sessions gives each one's folder. None
+    from a plain terminal, or when the list doesn't say."""
+    sid = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    s = next((x for x in claude_sessions() if x.get("sessionId") == sid), None) if sid else None
+    return (s or {}).get("cwd") or None
+
+
+def outside_project(root):
+    """Fleet commands run only from a session started in the project (a worker's: in its worktree). A
+    session started elsewhere gets none of the project's hooks: no news from its workers, and no rules. The
+    refusal, or "" (also from a plain terminal, which has no session)."""
+    folder = session_folder()
+    home = find_root(folder) if folder else None
+    if not folder or (home and os.path.normcase(os.path.realpath(home)) == os.path.normcase(os.path.realpath(root))):
+        return ""
+    return (f"{DISPLAY_NAME}: this session was started in {folder}, not in the project ({root}), so the project's "
+            "hooks never reach it: it would hear nothing from the workers, and the project's rules wouldn't apply "
+            f"to it. Run the overseer from the project folder instead: in a terminal, `cd {root} && claude`, then "
+            f"`/{SLUG}:oversee`. (In a plain terminal, outside Claude Code, `regista.py fleet` works from the project "
+            "folder as it is.)")
+
+
 def exclude_local(root):
     """Keep the worktrees and the fleet's records out of git, in every worktree, without touching a
     tracked file (the overseer's tree must stay clean for merges)."""
@@ -1483,13 +2629,55 @@ def ready_milestones(root, cfg, workers=None):
     return [m for m in order if m["open_steps"] and m["id"] not in taken and all(d in built for d in deps[m["id"]])]
 
 
-def launch_worker(cfg, wt, sname, mode, prompt, resume=""):
-    """Start the worker's Claude Code session. Returns (how, ref, url, problems)."""
+def files_overlap(root, a, b):
+    """What two milestones' `Files:` globs share: the same glob, a file one names that the other's globs
+    cover, or files in the project both cover. Sorted, project-relative."""
+    norm = lambda g: g.replace("\\", "/").lstrip("./")  # noqa: E731
+    a, b = [norm(g) for g in a], [norm(g) for g in b]
+    out = set(a) & set(b)
+    for x, y in ((a, b), (b, a)):
+        out |= {g for g in x if not re.search(r"[*?\[]", g) and matches(g, y)}
+    out |= set(f for f in files_matching(root, a) if matches(f, b))
+    return sorted(out)
+
+
+def spawn_overlaps(root, cfg, name, milestone, workers):
+    """Warnings for a new worker whose milestone names files a running worker's milestone also names.
+    A warning, not a refusal: the overseer decides (an `After:` line, or telling both workers)."""
+    others = [(n, w["milestone"]) for n, w in workers.items()
+              if n != name and w.get("state") == "running" and w.get("milestone") and w["milestone"] != milestone]
+    if not milestone or not others:
+        return []
+    files = {m["id"]: m["files"] for m in plan_milestones(root, cfg)}
+    if not files.get(milestone):
+        return [f"Note: {milestone} names no files in the plan (a `Files:` line), so the harness couldn't check it "
+                f"against the running workers ({', '.join(f'{n} on {m}' for n, m in others)})."]
+    out = []
+    unnamed = [f"{n} ({m})" for n, m in others if not files.get(m)]
+    if unnamed:
+        out.append(f"Note: the running {'worker' if len(unnamed) == 1 else 'workers'} {', '.join(unnamed)} "
+                   f"{'has a milestone that names' if len(unnamed) == 1 else 'have milestones that name'} no files in "
+                   f"the plan, so the harness couldn't check {milestone} against {'it' if len(unnamed) == 1 else 'them'}.")
+    for n, m in others:
+        shared = files_overlap(root, files[milestone], files.get(m) or [])
+        if shared:
+            more = f" and {len(shared) - 8} more" if len(shared) > 8 else ""
+            out.append(f"Warning: {milestone} and the running worker {n} ({m}) change the same files: "
+                       f"{', '.join(shared[:8])}{more}. Two workers editing one file clash when their branches merge. "
+                       f"If {milestone} needs {m}'s work there, stop this worker (`regista.py fleet stop {name}`) and "
+                       f"add `After: {m}` to {milestone}; otherwise tell both workers which of them owns those files.")
+    return out
+
+
+def launch_worker(cfg, wt, sname, mode, prompt, resume="", trust=False):
+    """Start the worker's Claude Code session. Returns (how, ref, url, problems). `trust` answers Claude Code's
+    "do you trust this folder" question with yes (only for `regista.py open`, which the user runs themselves);
+    an empty `mode` leaves the permission mode to the user's settings."""
     claude, tmux = tool_exe("claude"), tool_exe("tmux")
     how = cfg["fleet"].get("launch", "auto")
     if how == "auto":
         how = "tmux" if tmux and os.name != "nt" else "bg"
-    args = (["--resume", resume] if resume else []) + ["-n", sname, "--permission-mode", mode] + \
+    args = (["--resume", resume] if resume else []) + ["-n", sname] + (["--permission-mode", mode] if mode else []) + \
         [os.path.expanduser(str(x)) for x in cfg["fleet"].get("claude_args") or []]
     if how == "tmux":
         if not tmux:
@@ -1500,6 +2688,7 @@ def launch_worker(cfg, wt, sname, mode, prompt, resume=""):
         if code:
             return None, None, "", [f"tmux couldn't start the session: {out.strip()[-300:]}"]
         url, problems, deadline = "", [], time.time() + float(env_value("LAUNCH_WAIT", "40"))
+        answered = False
         while time.time() < deadline:
             code, screen = call([tmux, "capture-pane", "-p", "-t", sname])
             m = re.search(r"https://claude\.ai/code/session_\w+", screen)
@@ -1507,9 +2696,15 @@ def launch_worker(cfg, wt, sname, mode, prompt, resume=""):
                 url = m.group(0)
                 break
             if code:
-                return None, None, "", ["The worker's session ended right after it started. "
+                return None, None, "", ["The session ended right after it started. "
                                         f"Try it by hand to see why: `cd {wt} && claude`."]
             if re.search(r"trust (this|the) folder|Do you trust", screen, re.I):
+                if trust:  # its first choice is "Yes, proceed"; the screen may show it a moment longer
+                    if not answered:
+                        call([tmux, "send-keys", "-t", sname, "Enter"])
+                        answered = True
+                    time.sleep(1)
+                    continue
                 problems.append(f"Claude Code asks whether to trust the worker's folder. Answer it once: `tmux attach "
                                 f"-t {sname}` (Ctrl-b d to leave).")
                 break
@@ -1529,6 +2724,39 @@ def find_session_id(sname, wait=15.0):
         if s or time.time() >= deadline:
             return (s or {}).get("sessionId", "")
         time.sleep(1)
+
+
+def open_session(folder, name, mode=""):
+    """`regista.py open <folder> <name>`: the user's one-line way to start a Claude Code session in a folder, in tmux
+    with Remote Control under that name, past the folder-trust question. Agents are refused it (integrity_check).
+    Returns (ok, lines)."""
+    folder = os.path.abspath(os.path.expanduser(folder))
+    if not os.path.isdir(folder):
+        return False, [f"There's no folder {folder}."]
+    sname = re.sub(r"[^\w-]+", "-", name or "").strip("-")
+    if not sname:
+        return False, ["Give the session a name: `regista.py open <folder> <name>`."]
+    tmux = tool_exe("tmux")
+    if not tool_exe("claude"):
+        return False, ["Claude Code's `claude` command isn't on the PATH here, so no session can start."]
+    if not tmux or os.name == "nt":
+        return False, ["This needs tmux: it keeps the session running after you close the terminal, with Remote Control "
+                       "on. Install tmux (`sudo apt install tmux`), or start the session yourself: "
+                       f"`cd {folder} && claude --remote-control {sname}`."]
+    if sname in call([tmux, "list-sessions", "-F", "#{session_name}"])[1].splitlines():
+        return False, [f"A tmux session called {sname} is already running. Open it with `tmux attach -t {sname}`, or "
+                       "pick another name."]
+    how, ref, url, problems = launch_worker({"fleet": {"launch": "tmux"}}, folder, sname, mode, "", trust=True)
+    if not how:
+        return False, problems
+    lines = [f"Started Claude Code in {folder} as the session \"{sname}\", in tmux"
+             + (f", with Remote Control: {url}" if url else "") + ".",
+             f"Open it from the Claude app, where it's listed as \"{sname}\", or in a terminal: `tmux attach -t {sname}` "
+             "(Ctrl-b d leaves it running)."]
+    if not url or not find_session_id(sname, wait=5):
+        lines.append(f"It hasn't shown up in Claude Code's list yet. If it isn't in the app within a minute, look at its "
+                     f"screen: `tmux attach -t {sname}`.")
+    return True, lines + problems
 
 
 def remove_worktree(root, wt, branch):
@@ -1571,9 +2799,10 @@ def fleet_spawn(root, cfg, milestone="", name="", task="", force=False):
     if len(running) >= cfg["fleet"]["max_workers"]:
         return False, [f"{len(running)} workers are running already ({', '.join(running)}), the most "
                        f"fleet.max_workers allows. Merge or stop one first."]
-    if git(root, "status", "--porcelain", "--untracked-files=no"):
-        return False, ["The project folder has uncommitted changes. Commit them first (the plan above all): "
-                       "the worker starts from the last commit and wouldn't see them."]
+    problem, saved = commit_harness_records(root, cfg, f"Save the plan and the harness's records before starting worker {name}")
+    if problem:
+        return False, [f"The project folder has uncommitted changes ({', '.join(problem[:6])}). Commit them first: the "
+                       "worker starts from the last commit and wouldn't see them."]
     prefix = OLD_BRANCH_PREFIX if is_old_project(root) else BRANCH_PREFIX  # an old project keeps 0.8's branches
     branch, rel = f"{prefix}{name}", harness_rel("worktrees", name, root=root)
     wt = p(root, rel)
@@ -1629,7 +2858,9 @@ def fleet_spawn(root, cfg, milestone="", name="", task="", force=False):
     return True, [f"Started worker {name} ({what}) in {rel}, on the branch {branch}, as the session \"{sname}\" "
                   f"({mode} permission mode, like yours).",
                   f"The user can talk to it directly, {reach}; what they tell it reaches you.",
-                  f"Next: SendMessage to \"{sname}\" with notify_when_idle, so its next pause wakes you."] + problems
+                  f"Next: SendMessage to \"{sname}\" with notify_when_idle, so its next pause wakes you."] + problems + \
+        ([f"First committed the plan and the harness's records that had changed ({', '.join(saved[:5])})."] if saved else []) + \
+        spawn_overlaps(root, cfg, name, milestone, workers)
 
 
 def worker_line(root, name, w, sessions):
@@ -1651,6 +2882,11 @@ def worker_line(root, name, w, sessions):
     else:
         parts.append(w["state"])
     parts.append(f"{ahead} commit(s) not merged" if ahead != "0" else "everything merged")
+    pend = worker_pending(root, w) if w["state"] == "running" else None
+    if pend:
+        why = pend.get("reason", "")
+        why = why[len(DISPLAY_NAME) + 2:] if why.startswith(DISPLAY_NAME + ": ") else why
+        parts.append(f"waiting for the user's OK: {why[:300]}")
     if w.get("milestone") and os.path.isdir(wt):
         try:
             done, _ = milestone_status(wt, load_config(wt), w["milestone"])
@@ -1692,7 +2928,20 @@ def describe_event(e):
         return f"the user recorded a check there ({t}); it's in your project too"
     if k == "change":
         return f"the user asked there for a change, recorded in your project: \"{t}\". Plan it."
+    if k == "ask":
+        return f"waiting for your OK: {t}"
     return t
+
+
+# A worker's pause that says it's ready, blocked, waiting or asking is news in full; any other is progress.
+NEWSWORTHY = re.compile(r"\?|\b(ready|finished|blocked|blocking|stuck|waiting|wait(s)? (for|on)|decide|decision|"
+                        r"needs? (you|your|the user|a decision|an answer)|question|approv\w*|permission|your OK|"
+                        r"merge|failing|fails|failed|can'?t|cannot)\b", re.I)
+
+
+def progress_only(e):
+    """A worker's turn that only reports progress: no question, nothing ready, blocked or waiting."""
+    return e.get("kind") == "turn" and not NEWSWORTHY.search(e.get("text") or "")
 
 
 def fleet_news(root):
@@ -1715,15 +2964,40 @@ def fleet_news(root):
             e = json.loads(ln)
         except ValueError:
             continue
-        if e.get("kind") not in ("started", "merged", "stopped", "removed"):  # the overseer's own doings
+        if e.get("kind") not in ("started", "merged", "stopped", "removed", "allowed"):  # the overseer's own doings
             events.append(e)
+    # News about a worker that's gone, or about an earlier worker of the same name, is history.
+    workers = load_workers(root)
+    events = [e for e in events if (workers.get(e.get("worker")) or {}).get("state") != "removed"
+              and str(e.get("at", "")) >= str((workers.get(e.get("worker")) or {}).get("started", ""))]
     if not events:
         return ""
-    shown = events[-25:]
-    more = f" ({len(events) - len(shown)} earlier ones in `regista.py fleet news --all`)" if len(events) > len(shown) else ""
-    return (f"{DISPLAY_NAME}: news from the workers" + more + ". Act on what needs you: answer a worker with SendMessage, "
-            "tell the user what matters, merge finished work (`regista.py fleet merge <name>`):\n"
-            + "\n".join(f"- {e['worker']} at {e['at'][11:16]}: {describe_event(e)}" for e in shown))
+    asks = [e for e in events if e.get("kind") == "ask"]
+    folded = {}
+    for e in events:
+        if progress_only(e):
+            folded.setdefault(e["worker"], []).append(e)
+    rest = [e for e in events if e.get("kind") != "ask" and not progress_only(e)]
+    lines = [f"- {e['worker']} at {e['at'][11:16]}: {describe_event(e)}" for e in rest]
+    for name, es in folded.items():
+        commits = [c for e in es for c in e.get("commits") or []]
+        last = (es[-1].get("text") or "").strip().replace("\n", " ")
+        last = last if len(last) <= 200 else last[:200] + "…"
+        lines.append(f"- {name}: {len(es)} progress update(s) from {es[0]['at'][11:16]} to {es[-1]['at'][11:16]}"
+                     + (f", {len(commits)} commit(s) ({'; '.join(commits[-5:])})" if commits else "") + (f"; the latest: \"{last}\"" if last else ""))
+    shown = lines[-25:]
+    more = f" ({len(lines) - len(shown)} earlier ones in `regista.py fleet news --all`)" if len(lines) > len(shown) else ""
+    out = []
+    if asks:
+        out.append(f"{DISPLAY_NAME}: workers waiting for the user's OK. Ask the user now, in plain words, what each wants "
+                   "to do and why; only once they reply yes, run `regista.py fleet allow <name>` and tell the worker "
+                   "with SendMessage. If they say no, tell the worker not to.\n"
+                   + "\n".join(f"- {e['worker']} at {e['at'][11:16]}: {describe_event(e)}" for e in asks))
+    if shown:
+        out.append(f"{DISPLAY_NAME}: news from the workers" + more + ". Act on what needs you: answer a worker with "
+                   "SendMessage, tell the user what matters, merge finished work (`regista.py fleet merge <name>`):\n"
+                   + "\n".join(shown))
+    return "\n\n".join(out)
 
 
 def merge_json(base, ours, theirs):
@@ -1752,41 +3026,116 @@ def merge_json(base, ours, theirs):
     return theirs
 
 
-def fleet_merge(root, cfg, name, force=False):
-    """Merge a worker's branch into the project: one merge commit, made only when the commit gates
-    pass on the merged code. The overseer's status and board stay as they are. Returns (ok, lines)."""
-    if worker_info(root):
-        return False, [f"{DISPLAY_NAME}: only the overseer merges. Tell it your work is ready (SendMessage)."]
-    workers = load_workers(root)
-    w = workers.get(name)
-    if not w or w.get("state") == "removed":
-        return False, [f"There's no worker {name}. `regista.py fleet` lists them."]
-    if git(root, "status", "--porcelain", "--untracked-files=no"):
-        return False, ["The project folder has uncommitted changes. Commit them first, so the merge is a commit of "
-                       "its own."]
-    s = session_of(claude_sessions(), w)
-    if s and s.get("status") == "busy" and not force:
-        return False, [f"{name} is busy. Merge when it pauses (SendMessage with notify_when_idle tells you), or "
-                       "--force to merge what it has committed so far."]
-    wt = p(root, w["worktree"])
-    if os.path.isdir(wt) and git(wt, "status", "--porcelain", "--untracked-files=no") and not force:
-        return False, [f"{name} has uncommitted changes. Ask it to commit or drop them first (or --force to merge "
-                       "only what's committed)."]
-    ahead = git(root, "rev-list", "--count", f"HEAD..{w['branch']}")
-    if ahead in ("", "0"):
-        return True, [f"Nothing to merge: {name} has no commits that aren't in the project yet."]
+TICK = re.compile(r"^(\s*[-*+]\s+\[)([ xX])(\].*)$", re.S)
+
+
+def merge_plan_ticks(main, base, other):
+    """Three-way merge of the plan where the two sides' conflicts are only tick boxes: the main branch's
+    text, with a step ticked when either side ticked it. None when a conflict changes anything else."""
+    import difflib
+    import tempfile
+    untick = lambda lines: [TICK.sub(r"\1 \3", x) for x in lines]  # noqa: E731
+    with tempfile.TemporaryDirectory() as d:
+        names = []
+        for k, text in enumerate((main, base, other)):
+            names.append(os.path.join(d, str(k)))
+            with open(names[-1], "w", encoding="utf-8", newline="") as f:
+                f.write(text)
+        code, out = call(["git", "merge-file", "-p", "--diff3", "-L", "main", "-L", "base", "-L", "other", *names])
+    if code < 0 or code > 127:
+        return None
+    result, part, hunk = [], None, {"main": [], "base": [], "other": []}
+    for ln in out.splitlines(keepends=True):
+        mark = ln.rstrip("\r\n")
+        if part is None and mark.startswith("<<<<<<< "):
+            part = "main"
+        elif part == "main" and mark.startswith("||||||| "):
+            part = "base"
+        elif part in ("main", "base") and mark == "=======":
+            part = "other"
+        elif part == "other" and mark.startswith(">>>>>>> "):
+            ours, theirs = hunk["main"], hunk["other"]
+            if untick(theirs) not in (untick(ours), untick(hunk["base"])):
+                return None  # the other side changed more than tick boxes there
+            ticked = set()
+            for a, b, n in difflib.SequenceMatcher(None, untick(theirs), untick(ours), autojunk=False).get_matching_blocks():
+                ticked |= {b + j for j in range(n) if TICK.sub(r"\2", theirs[a + j]) in ("x", "X")}
+            result += [TICK.sub(r"\1x\3", x) if k in ticked else x for k, x in enumerate(ours)]
+            part, hunk = None, {"main": [], "base": [], "other": []}
+        elif part:
+            hunk[part].append(ln)
+        else:
+            result.append(ln)
+    return None if part else "".join(result)
+
+
+def tracked_changes(root):
+    """Tracked files with uncommitted changes (staged or not)."""
+    return [ln[3:].strip('"').split(" -> ")[-1] for ln in
+            git(root, "status", "--porcelain", "--untracked-files=no", strip=False).splitlines() if len(ln) > 3]
+
+
+def uncommitted_work(root, cfg):
+    """Tracked files with uncommitted changes that aren't the harness's own records. The config and the
+    specs count as work here: a commit of those goes through the commit hook, which checks them."""
+    checked = (harness_rel("config.json", root=root), harness_rel("specs", root=root) + "/")
+    return [f for f in tracked_changes(root) if not bookkeeping(root, cfg, f) or f.startswith(checked)]
+
+
+def commit_harness_records(root, cfg, message):
+    """When the only uncommitted changes are the harness's own records (status, board, plan, requirement
+    results, decisions, handoffs), commit them on their own: a commit of records only runs no gates anyway.
+    Returns (what stops it: the other changed files, or why the commit failed; the records it committed)."""
+    files, others = tracked_changes(root), uncommitted_work(root, cfg)
+    if others or not files:
+        return others, []
+    call(["git", "-C", root, "add", "--", *files])
+    code, out = call(["git", "-C", root, "commit", "-q", "-m", message])
+    return ([f"committing the harness's records first failed: {out.strip()[-300:]}"] if code else []), files
+
+
+def set_aside_records(root, cfg, ref):
+    """Harness records that `ref` adds and that lie here untracked (a results file a gate run wrote, say)
+    would stop git's merge. Move each to <name>.before-merge. Returns [(record, where it went)]."""
+    here = set(git(root, "ls-tree", "-r", "-z", "--name-only", "HEAD", strip=False).split("\0"))
+    moved = []
+    for f in git(root, "ls-tree", "-r", "-z", "--name-only", ref, strip=False).split("\0"):
+        if f and f not in here and os.path.isfile(p(root, f)) and bookkeeping(root, cfg, f):
+            to, k = f + ".before-merge", 1
+            while os.path.exists(p(root, to)):
+                k += 1
+                to = f"{f}.before-merge-{k}"
+            os.replace(p(root, f), p(root, to))
+            moved.append((f, to))
+    return moved
+
+
+def abort_merge(root, moved):
+    """Undo a merge that won't be committed, and put the records set aside back."""
+    call(["git", "-C", root, "merge", "--abort"])
+    for f, to in moved:
+        if not os.path.exists(p(root, f)):
+            os.replace(p(root, to), p(root, f))
+
+
+def resolve_records(root, cfg, main_side):
+    """Resolve a merge's conflicts in the harness's records: the status and the board as the main branch
+    has them (`main_side` is git's stage for it: 2 when merging into it, 3 when bringing it in), the
+    harness's JSON records by content, the plan when only tick boxes differ. Returns the files left."""
     keep = [cfg["status_file"], cfg["board_file"]]
-    board = [ln[1:].strip() for ln in git(root, "diff", f"HEAD...{w['branch']}", "--", cfg["board_file"]).splitlines()
-             if ln.startswith("+") and not ln.startswith("+++") and ln[1:].strip()]
-    code, out = call(["git", "-C", root, "merge", "--no-ff", "--no-commit", w["branch"]])
-    conflicted = git(root, "diff", "--name-only", "--diff-filter=U").splitlines()
-    if code and not conflicted:
-        call(["git", "-C", root, "merge", "--abort"])
-        return False, [f"git couldn't merge {w['branch']}: {out.strip()[-400:]}"]
+    plan = cfg["plan"] or harness_rel("plan.md", root=root)
     unresolved = []
-    for f in conflicted:
+    for f in git(root, "diff", "--name-only", "--diff-filter=U").splitlines():
         if f in keep:
-            call(["git", "-C", root, "checkout", "--ours", "--", f])
+            call(["git", "-C", root, "checkout", "--ours" if main_side == 2 else "--theirs", "--", f])
+        elif f == plan:
+            sides = {k: git(root, "show", f":{k}:{f}", strip=False) for k in (1, 2, 3)}
+            merged = merge_plan_ticks(sides[main_side], sides[1], sides[5 - main_side]) if sides[2] and sides[3] else None
+            if merged is None:
+                unresolved.append(f)
+                continue
+            with open(p(root, f), "w", encoding="utf-8", newline="") as fh:
+                fh.write(merged)
         elif f.startswith(harness_rel(root=root) + "/") and f.endswith(".json"):
             try:
                 sides = [json.loads(git(root, "show", f":{k}:{f}", strip=False) or "null") for k in (1, 2, 3)]
@@ -1798,36 +3147,127 @@ def fleet_merge(root, cfg, name, force=False):
             unresolved.append(f)
             continue
         call(["git", "-C", root, "add", "--", f])
+    return unresolved
+
+
+DEPENDENCY_FILES = re.compile(r"(^|/)(package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb?|"
+                              r"uv\.lock|poetry\.lock|Pipfile\.lock|requirements[^/]*\.txt|Cargo\.lock|go\.sum|"
+                              r"Gemfile\.lock|composer\.lock)$")
+
+
+def install_dependencies(root, cfg, files):
+    """When a merge changed the dependency lock files, install them here before the gates run, with the
+    command a new worktree gets (fleet.setup, or the one the lock file implies). Returns (ok, lines)."""
+    deps = [f for f in files if DEPENDENCY_FILES.search(f)]
+    if not deps:
+        return True, []
+    setup = cfg["fleet"].get("setup") or worktree_setup(root)
+    if not setup:
+        return True, [f"The merge changed {', '.join(deps[:4])}, and there's no setup command (fleet.setup) to "
+                      "install the dependencies here: install them before you run the app."]
+    code, out = run_shell(setup, root, 1800)
+    if code:
+        return False, [f"The merge changed {', '.join(deps[:4])}, and installing the dependencies (`{setup}`) failed:",
+                       out.strip()[-800:]]
+    return True, [f"The merge changed {', '.join(deps[:4])}, so the dependencies were installed first (`{setup}`)."]
+
+
+def wait_until_idle(w, seconds):
+    """A worker that just reported is often still finishing its turn: wait up to `seconds` for its session
+    to stop being busy. Returns its session (or None when Claude Code doesn't list it)."""
+    deadline = time.time() + seconds
+    while True:
+        s = session_of(claude_sessions(), w)
+        if not s or s.get("status") != "busy" or time.time() >= deadline:
+            return s
+        time.sleep(min(2.0, max(0.1, deadline - time.time())))
+
+
+def fleet_merge(root, cfg, name, force=False, wait=None):
+    """Merge a worker's branch into the project: one merge commit, made only when the commit gates
+    pass on the merged code. The overseer's status and board stay as they are. A busy worker gets `wait`
+    seconds (fleet.merge_wait, 60 by default) to finish its turn. Returns (ok, lines)."""
+    if worker_info(root):
+        return False, [f"{DISPLAY_NAME}: only the overseer merges. Tell it your work is ready (SendMessage)."]
+    workers = load_workers(root)
+    w = workers.get(name)
+    if not w or w.get("state") == "removed":
+        return False, [f"There's no worker {name}. `regista.py fleet` lists them."]
+    others = uncommitted_work(root, cfg)
+    if others:
+        return False, [f"The project folder has uncommitted changes ({', '.join(others[:6])}). Commit them first, so "
+                       "the merge is a commit of its own. (The harness's own records, like the status, the board and the "
+                       "requirement results, don't count: the merge commits those itself.)"]
+    wait = cfg["fleet"].get("merge_wait", 60) if wait is None else wait
+    s = session_of(claude_sessions(), w)
+    if s and s.get("status") == "busy" and not force and wait > 0:
+        s = wait_until_idle(w, wait)
+    if s and s.get("status") == "busy" and not force:
+        secs = f"{round(wait)} second" + ("" if round(wait) == 1 else "s")
+        return False, [f"{name} is busy" + (f", still after waiting {secs} for its turn to end" if wait > 0
+                                           else "") + ". Merge when it pauses (`fleet merge " + name + " --when-idle 600` "
+                       "waits up to 10 minutes), or --force to merge what it has committed so far."]
+    wt = p(root, w["worktree"])
+    if os.path.isdir(wt) and uncommitted_work(wt, cfg) and not force:  # its records aren't merged anyway
+        return False, [f"{name} has uncommitted changes. Ask it to commit or drop them first (or --force to merge "
+                       "only what's committed)."]
+    ahead = git(root, "rev-list", "--count", f"HEAD..{w['branch']}")
+    if ahead in ("", "0"):
+        return True, [f"Nothing to merge: {name} has no commits that aren't in the project yet."]
+    problem, saved = commit_harness_records(root, cfg, f"Save the harness's records before merging {name}")
+    if problem:
+        return False, [f"Not merged: {problem[0]}"]
+    keep = [cfg["status_file"], cfg["board_file"]]
+    board = [ln[1:].strip() for ln in git(root, "diff", f"HEAD...{w['branch']}", "--", cfg["board_file"]).splitlines()
+             if ln.startswith("+") and not ln.startswith("+++") and ln[1:].strip()]
+    moved = set_aside_records(root, cfg, w["branch"])
+    code, out = call(["git", "-C", root, "merge", "--no-ff", "--no-commit", w["branch"]])
+    conflicted = git(root, "diff", "--name-only", "--diff-filter=U").splitlines()
+    if code and not conflicted:
+        abort_merge(root, moved)
+        return False, [f"git couldn't merge {w['branch']}: {out.strip()[-400:]}"]
+    unresolved = resolve_records(root, cfg, 2)
     if unresolved:
-        call(["git", "-C", root, "merge", "--abort"])
+        abort_merge(root, moved)
+        plan = cfg["plan"] or harness_rel("plan.md", root=root)
         return False, [f"Not merged: {name}'s branch and the project changed the same lines in "
-                       f"{', '.join(unresolved[:8])}. Ask the worker to merge the project into its branch "
-                       f"(`git merge {git(root, 'rev-parse', '--abbrev-ref', 'HEAD')}`), resolve, run its gates and "
-                       "commit; then merge again."]
+                       f"{', '.join(unresolved[:8])}" + (" (in the plan, more than tick boxes)" if plan in unresolved else "")
+                       + f". Ask the worker to bring the project's work into its branch (`regista.py fleet sync`), "
+                       "resolve what it reports, run its gates and commit; then merge again."]
     for f in keep:  # the overseer keeps the status and the board
         if call(["git", "-C", root, "cat-file", "-e", f"HEAD:{f}"])[0] == 0:
             call(["git", "-C", root, "checkout", "HEAD", "--", f])
     files = changed_files(root)
+    ok, installed = install_dependencies(root, cfg, files)
+    if not ok:
+        abort_merge(root, moved)
+        return False, ["Not merged."] + installed
     gates = [] if harness_only(root, cfg, files) else select_gates(cfg, event="commit", files=files)
     results = run_gates(root, cfg, gates) if gates else []
     failed = [r for r in results if r["status"] == "fail"]
     if failed:
-        call(["git", "-C", root, "merge", "--abort"])
+        abort_merge(root, moved)
         return False, [f"Not merged: the merged code fails a gate.", format_results(results)] + \
             [f"[{r['name']}]\n{r.get('tail', '')}" for r in failed] + \
-            [f"Ask {name} to merge the project into its branch, fix it there and commit; then merge again."]
+            [f"Ask {name} to bring the project's work into its branch (`regista.py fleet sync`), fix it there and "
+             "commit; then merge again."]
     if results:
         record_requirements(root, cfg, results)
         call(["git", "-C", root, "add", "--", harness_rel("gates", "requirements.json", root=root)])
     what = f"{w['milestone']} — {w['title']}" if w.get("milestone") else (w.get("task") or name)[:60]
     code, out = call(["git", "-C", root, "commit", "-q", "-m", f"Merge {what} (worker {name})"])
     if code:
-        call(["git", "-C", root, "merge", "--abort"])
+        abort_merge(root, moved)
         return False, [f"The merge commit failed: {out.strip()[-400:]}"]
     w.update(merged_at=now_iso(), merged_head=git(root, "rev-parse", w["branch"]))
     save_workers(root, workers)
     fleet_event(root, name, "merged", f"{ahead} commit(s)")
     lines = [f"Merged {name} ({what}): {ahead} commit(s), in one merge commit."]
+    if saved:
+        lines.append(f"First committed the harness's records that had changed here ({', '.join(saved[:5])}).")
+    lines += [f"Your untracked {f} was in the way of the branch's copy, so it's now {to}. Compare the two and delete "
+              "it when you're done." for f, to in moved]
+    lines += installed
     if results:
         lines.append(format_results(results))
     if board:
@@ -1836,9 +3276,76 @@ def fleet_merge(root, cfg, name, force=False):
     others = [n for n, x in workers.items() if n != name and x.get("state") == "running"
               and git(root, "rev-list", "--count", f"HEAD..{x['branch']}") not in ("", "0")]
     if others:
-        lines.append(f"Still running from an older commit: {', '.join(others)}. Tell one to merge the project into "
-                     "its branch only if it touches the same files.")
+        lines.append(f"Still running from an older commit: {', '.join(others)}. If one touches the same files, tell it "
+                     "to bring this work into its branch with `regista.py fleet sync`.")
     return True, lines
+
+
+def fleet_sync(root, cfg):
+    """A worker brings the project's newer work (the overseer's branch) into its own branch. The harness's
+    records merge by content, the overseer's status and board win, and plan tick boxes from both sides are
+    kept. The merge commit is made when the commit gates pass. A real code conflict leaves the merge open,
+    with the records already resolved, for the worker to finish and commit through the commit hook; run
+    during a merge already under way, it resolves that merge's records. Returns (ok, lines)."""
+    w = worker_info(root)
+    if not w:
+        return False, ["`fleet sync` is for a worker: it brings the project's newer work into the worker's branch. "
+                       "The overseer brings a worker's work into the project with `fleet merge <name>`."]
+    home = overseer_root(root)
+    main = git(home, "rev-parse", "--abbrev-ref", "HEAD") if home else ""
+    if not main or main == "HEAD":
+        main = git(home, "rev-parse", "HEAD") if home else ""
+    if not main:
+        return False, ["The overseer's project folder isn't there any more, so there's nothing to bring in. Ask the "
+                       "overseer (SendMessage)."]
+    moved, saved = [], []
+    under_way = bool(git(root, "rev-parse", "-q", "--verify", "MERGE_HEAD"))
+    if not under_way:
+        problem, saved = commit_harness_records(root, cfg, f"Save the harness's records before bringing in {main}")
+        if problem:
+            return False, [f"Your worktree has uncommitted changes ({', '.join(problem[:6])}). Commit them (the gates "
+                           "run) or drop them, then run `fleet sync` again."]
+        behind = git(root, "rev-list", "--count", f"HEAD..{main}")
+        if behind in ("", "0"):
+            return True, [f"Nothing to bring in: your branch already has everything on {main}."]
+        moved = set_aside_records(root, cfg, main)
+        code, out = call(["git", "-C", root, "merge", "--no-ff", "--no-commit", main])
+        if code and not git(root, "diff", "--name-only", "--diff-filter=U"):
+            abort_merge(root, moved)
+            return False, [f"git couldn't bring in {main}: {out.strip()[-400:]}"]
+    lines = [f"First committed the harness's records that had changed here ({', '.join(saved[:5])})."] if saved else []
+    lines += [f"Your untracked {f} was in the way of {main}'s copy, so it's now {to}." for f, to in moved]
+    finish = ("then commit the merge with `git commit --no-edit`: the commit hook runs the gates and the review as "
+              "usual. To give up instead: `git merge --abort`.")
+    unresolved = resolve_records(root, cfg, 3)
+    if unresolved:
+        return False, lines + [
+            f"Brought in {main}'s work and merged the harness's records, but your branch and {main} changed the same "
+            f"lines in {', '.join(unresolved[:8])}. Resolve those files (keep what both sides meant), `git add` them, "
+            + finish]
+    if under_way:
+        return True, lines + ["The harness's records in the merge under way are resolved. If nothing else is left, "
+                              + finish]
+    files = changed_files(root)
+    ok, installed = install_dependencies(root, cfg, files)
+    lines += installed
+    if not ok:
+        return False, lines + ["The merge is still open. Fix the install, " + finish]
+    gates = [] if harness_only(root, cfg, files) else select_gates(cfg, event="commit", files=files)
+    results = run_gates(root, cfg, gates) if gates else []
+    failed = [r for r in results if r["status"] == "fail"]
+    if failed:
+        return False, lines + [f"Brought in {main}'s work, but the merged code fails a gate, so it isn't committed yet.",
+                               format_results(results)] + [f"[{r['name']}]\n{r.get('tail', '')}" for r in failed] + \
+            ["The merge is still open. Fix it, " + finish]
+    if results:
+        record_requirements(root, cfg, results)
+        call(["git", "-C", root, "add", "--", harness_rel("gates", "requirements.json", root=root)])
+    code, out = call(["git", "-C", root, "commit", "-q", "-m", f"Bring {main} into {w.get('branch') or 'this branch'}"])
+    if code:
+        return False, lines + [f"The merge commit failed: {out.strip()[-400:]}. The merge is still open."]
+    return True, [f"Brought {main}'s work into your branch, in one merge commit."] + lines + \
+        ([format_results(results)] if results else [])
 
 
 def fleet_stop(root, cfg, name, state="stopped"):
@@ -1880,6 +3387,34 @@ def fleet_resume(root, cfg, name):
     w.update(state="running", how=how, ref=ref, url=url or w.get("url", ""))
     save_workers(root, workers)
     return True, [f"{name} is running again, with its conversation." + (f" Remote Control: {url}" if url else "")] + problems
+
+
+def worker_pending(root, w):
+    """What a worker waits for the user's OK on (its pending ask()), or None."""
+    wt = p(root, w.get("worktree", ""))
+    return (load_json(approvals_path(wt), {}).get("pending") or None) if w.get("worktree") and os.path.isdir(wt) else None
+
+
+def fleet_allow(root, cfg, name):
+    """The user's yes, passed on by the overseer, to what a worker asked: that exact action is allowed once in the
+    worker's own session. The PreToolUse hook lets the overseer run this only right after the user typed yes."""
+    if worker_info(root):
+        return False, [f"{DISPLAY_NAME}: only the overseer passes on the user's OK."]
+    w = load_workers(root).get(name)
+    if not w or w.get("state") == "removed":
+        return False, [f"There's no worker {name}."]
+    pend = worker_pending(root, w)
+    if not pend:
+        return False, [f"{name} isn't waiting for an OK."]
+    path = approvals_path(p(root, w["worktree"]))
+    st = load_json(path, {})
+    st["granted"] = {"key": pend["key"], "session": pend.get("session", ""), "at": time.time()}
+    st.pop("pending", None)
+    save_json(path, st)
+    fleet_event(root, name, "allowed", pend.get("reason", ""))
+    return True, [f"{name} may now do what it asked, once: {pend.get('reason', '')}",
+                  f"Next: SendMessage to \"{w.get('session_name')}\" that the user approved, so it runs exactly the "
+                  "same action again."]
 
 
 def fleet_remove(root, cfg, name, force=False):
@@ -1936,9 +3471,11 @@ def worker_note(root, cfg):
             f"Your job: {what}" + (f". The overseer's notes: {w['task']}" if w.get("milestone") and w.get("task") else "")
             + ".\nHow you work with the overseer:\n"
             "- Commit on your branch as usual (gates and review apply). Never push, deploy, merge into the project, "
-            "or switch branches; the overseer does those.\n"
-            "- The plan, the status file and the board are the overseer's. Tick your own steps in the plan, but don't "
-            "rewrite the status or the board: send the overseer what belongs there.\n"
+            "or switch branches; the overseer does those. To bring the project's newer work into your branch, run "
+            f"`{PY} \"{DD}\" fleet sync`: it merges the harness's records for you.\n"
+            "- The plan, the status file and the board are the overseer's. Don't edit the plan: the commit hook ticks a "
+            "step when you commit it (its spec's \"plan_step\" names it), and the overseer's merge carries the tick over. "
+            "Don't rewrite the status or the board either: send the overseer what belongs there.\n"
             f"- When you finish, get blocked, or need a decision or an answer, tell the overseer with SendMessage to "
             f"\"{w.get('overseer') or 'the overseer'}\": two to four plain lines. Don't send progress updates (waiting "
             "for an agent isn't news): the harness records your commits and your last words each turn for the "
@@ -1954,6 +3491,54 @@ def person_prompt(prompt):
     return bool(prompt.strip()) and not re.match(
         r"\s*(<(cross-session-message|task-notification|system-reminder|agent-message)\b|Another Claude session sent)",
         prompt)
+
+
+def transcript_messages(path):
+    """The main thread's words in a session transcript, oldest first: [(who, text, at, line)], `who` being
+    "person" (a prompt a person typed, or sent while the session was busy) or "assistant", `at` the entry's time
+    (ISO, or "") and `line` its index in transcript_tail(path). Reads Claude Code transcripts and Codex rollouts."""
+    out = []
+    for i, ln in enumerate(transcript_tail(path or "") or []):
+        if '"assistant"' not in ln and '"user' not in ln and '"queued_command"' not in ln and '"agent_message"' not in ln:
+            continue
+        try:
+            d = json.loads(ln)
+        except ValueError:
+            continue
+        if not isinstance(d, dict) or d.get("isSidechain") or d.get("isMeta"):
+            continue
+        at, kind = d.get("timestamp") or "", d.get("type")
+        pl = d.get("payload") if isinstance(d.get("payload"), dict) else {}
+        content = (d.get("message") or {}).get("content") if isinstance(d.get("message"), dict) else None
+        if kind == "assistant" and isinstance(content, list):
+            text = "\n".join(b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text")
+            if text.strip():
+                out.append(("assistant", text, at, i))
+        elif kind == "user":
+            if isinstance(content, list):
+                if any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
+                    continue
+                content = "\n".join(b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text")
+            if isinstance(content, str) and person_prompt(content):
+                out.append(("person", content, at, i))
+        elif kind == "attachment":
+            att = d.get("attachment") if isinstance(d.get("attachment"), dict) else {}
+            if att.get("type") == "queued_command" and (att.get("origin") or {}).get("kind") == "human" \
+                    and isinstance(att.get("prompt"), str):
+                out.append(("person", att["prompt"], at, i))
+        elif kind == "event_msg" and pl.get("type") in ("user_message", "agent_message") \
+                and isinstance(pl.get("message"), str):  # Codex
+            out.append(("person" if pl["type"] == "user_message" else "assistant", pl["message"], at, i))
+    return out
+
+
+def iso_epoch(at):
+    """Seconds since the epoch for a transcript's ISO time ("…Z" is UTC), or None."""
+    try:
+        t = dt.datetime.fromisoformat(str(at).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return t.timestamp() if t.tzinfo else t.astimezone().timestamp()
 
 
 def worker_heard_user(root, data):
@@ -2137,12 +3722,19 @@ def try_text(root, cfg, which=None):
             lines.append(f"   Status: {status}")
         lines.append("")
     if waiting:
-        lines += ["Tell the harness what you saw (only you can record these):",
-                  f"  in Claude Code:  /{SLUG}:verify {waiting[0][1]['id']} ok   or   "
-                  f"/{SLUG}:verify {waiting[0][1]['id']} fail <what happened>",
-                  f"  in Codex:        ${SLUG}:verify {waiting[0][1]['id']} ok   (or fail <what happened>)",
-                  f"  in a terminal:   {PY} \"{DD}\" try --ask   (walks you through each check)"]
+        lines += verify_lines([x[1]["id"] for x in waiting])
     return "\n".join(lines)
+
+
+def verify_lines(ids):
+    """How the user records the checks `ids`: the ready-to-send lines, for the end of every question that asks
+    them to try something."""
+    return (["Tell the harness what you saw (only you can record these). When a check works, send its line as it is,",
+             f"in Claude Code (several lines in one message are fine; in Codex, start with ${SLUG}: instead of /{SLUG}:):"]
+            + [f"  /{SLUG}:verify {x} ok" for x in ids]
+            + [f"When one doesn't work: /{SLUG}:verify <ID> fail <what happened>"
+               + (f". All of them at once: /{SLUG}:verify all ok" if len(ids) > 1 else ""),
+               f"In a terminal: {PY} \"{DD}\" try --ask walks you through each check."])
 
 
 def verify_from_user(root, cfg, args, by):
@@ -2199,6 +3791,7 @@ def try_ask(root, cfg, which=None):
     if not items:
         print("No manual checks" + (f" for {which}" if which else "") + ".")
         return
+    skipped = []
     for s, r, st in items:
         t = r.get("try") or {}
         print(f"\n{r['id']} — {t.get('title') or r.get('text', '')}")
@@ -2219,6 +3812,582 @@ def try_ask(root, cfg, which=None):
                 note = input("  What happened instead? ").strip()
             record_manual(root, r["id"], False, note, "user (terminal)")
             print("  Recorded: not working. The agent will see it at the next start.")
+        elif not st.get("passes"):
+            skipped.append(r["id"])
+    if skipped:
+        print("\nSkipped for now. When you've tried them, run this again, or send these lines in Claude Code:")
+        print("\n".join(f"  /{SLUG}:verify {x} ok" for x in skipped))
+
+
+# --- cleaning up the tests -------------------------------------------------------------------
+#
+# `regista.py tests cleanup`, which only the user runs (integrity_check refuses it to every agent). It lists
+# tests that overlap (the same `covers:` IDs on the same code, near-identical bodies, one check repeated per
+# page) and proves a test adds nothing before it may go: on a scratch copy of the project it breaks the code
+# the test guards on purpose (mutation testing) and checks that the remaining tests still fail. Nothing is
+# removed until the user types yes. The building flow never removes tests: commit_check asks the user when a
+# commit drops some (tests_removed).
+
+TEST_LANG = {".py": "py", ".js": "js", ".mjs": "js", ".cjs": "js", ".ts": "js", ".tsx": "js", ".jsx": "js"}
+PY_TEST = re.compile(r"^([ \t]*)(?:async[ \t]+)?def[ \t]+(test\w*)[ \t]*\(")
+PY_CLASS = re.compile(r"^([ \t]*)class[ \t]+(\w+)")
+JS_TEST = re.compile(r"^([ \t]*)(?:test|it)(\.each\b[^(]*\([^)]*\))?(?:\.only|\.concurrent)?[ \t]*\(")
+JS_TITLE = re.compile(r"\(\s*(['\"`])(.*?)\1")
+JS_LOOP = re.compile(r"\bfor\s*\(|\.forEach\s*\(|\.map\s*\(|\b(?:describe|test|it)\.each\b")
+ASSERTS = re.compile(r"\bassert\w*\b|\bexpect\s*\(|\.assert\w+\(|pytest\.raises")
+
+
+def _indent(line):
+    return len(line) - len(line.lstrip(" \t"))
+
+
+def _close_paren(text, pos):
+    """The index just past the bracket that closes the one at pos, skipping strings and comments, or None."""
+    depth, i, n = 0, pos, len(text)
+    while i < n:
+        c = text[i]
+        if c in "'\"`":
+            j = i + 1
+            while j < n and text[j] != c:
+                j += 2 if text[j] == "\\" else 1
+            i = j + 1
+            continue
+        if text.startswith("//", i) or text.startswith("/*", i):
+            end = text.find("\n" if text[i + 1] == "/" else "*/", i + 2)
+            i = n if end < 0 else end + (1 if text[i + 1] == "/" else 2)
+            continue
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return None
+
+
+def find_tests(text, lang):
+    """The tests in one file: [{"name", "start", "end" (0-based lines, end exclusive, with the comments and
+    decorators just above), "line" (1-based, the definition), "body", "repeat" (run once per item of a list)}]."""
+    lines = text.split("\n")
+    out = []
+    for i, line in enumerate(lines):
+        if lang == "py":
+            m = PY_TEST.match(line)
+            if not m:
+                continue
+            ind, end = _indent(line), i + 1
+            while end < len(lines) and (not lines[end].strip() or _indent(lines[end]) > ind):
+                end += 1
+            cls = next((c.group(2) for c in (PY_CLASS.match(x) for x in reversed(lines[:i]))
+                        if c and _indent(c.group(0)) < ind), None) if ind else None
+            name = f"{cls}::{m.group(2)}" if cls else m.group(2)
+            repeat = False
+        else:
+            m = JS_TEST.match(line)
+            if not m:
+                continue
+            ind = _indent(line)
+            offset = sum(len(x) + 1 for x in lines[:i])
+            close = _close_paren(text, offset + m.end() - 1)
+            if close is None:
+                continue
+            end = text.count("\n", 0, close) + 1
+            t = JS_TITLE.search(line, m.end() - 1)
+            name = t.group(2) if t else line.strip()
+            above = next((x for x in reversed(lines[:i]) if x.strip() and _indent(x) < ind), "")
+            repeat = bool(m.group(2) or JS_LOOP.search(above))
+        while end > i + 1 and not lines[end - 1].strip():
+            end -= 1
+        start = i
+        while start > 0 and lines[start - 1].strip() and _indent(lines[start - 1]) == _indent(line) and \
+                lines[start - 1].lstrip().startswith(("#", "@", "//")):
+            start -= 1
+        decorators = "\n".join(lines[start:i])
+        repeat = repeat or "parametrize" in decorators
+        out.append({"name": name, "start": start, "end": end, "line": i + 1,
+                    "body": "\n".join(lines[start:end]), "repeat": repeat})
+    return [t for t in out if not any(o is not t and o["start"] < t["start"] < o["end"] for o in out)]
+
+
+def _shingles(body, lang):
+    lines = body.split("\n")
+    b = "\n".join(x for x in lines if not x.lstrip().startswith(("#", "@", "//")))
+    b = "\n".join(b.split("\n")[1:])  # without the definition line: its name or title
+    b = re.sub(r"#.*" if lang == "py" else r"//.*", "", b)
+    b = re.sub(r"([\"'`])(?:\\.|(?!\1).)*\1", "S", b)
+    b = re.sub(r"\b\d+(\.\d+)?\b", "N", b)
+    toks = re.findall(r"[A-Za-z_$][\w$]*|[^\s\w]", b)
+    return {tuple(toks[i:i + 4]) for i in range(max(1, len(toks) - 3))}
+
+
+def _imports(root, rel, text, lang, sources):
+    """{name used in the tests: source file} for what a test file imports from the project's source."""
+    out = {}
+    if lang == "py":
+        def mods(dotted):
+            path = dotted.strip(".").replace(".", "/")
+            return [s for s in sources if path and (s.endswith("/" + path + ".py") or s == path + ".py"
+                                                    or s.endswith("/" + path + "/__init__.py") or s == path + "/__init__.py")]
+        for m in re.finditer(r"^\s*from\s+([\w.]+)\s+import\s+\(?([\w\s,]+)\)?", text, re.M):
+            for n in m.group(2).split(","):
+                n = n.split(" as ")[-1].strip()
+                hit = mods(m.group(1)) + mods(m.group(1) + "." + n)
+                if n and hit:
+                    out[n] = hit[0]
+        for m in re.finditer(r"^\s*import\s+([\w.]+)(?:\s+as\s+(\w+))?", text, re.M):
+            hit = mods(m.group(1))
+            if hit:
+                out[m.group(2) or m.group(1)] = hit[0]
+        return out
+    here = os.path.dirname(rel)
+    for m in re.finditer(r"import\s*(?:(\w+)\s*,?\s*)?(?:\{([^}]*)\}|\*\s+as\s+(\w+))?\s*from\s*['\"]([^'\"]+)['\"]|"
+                         r"(?:const|let|var)\s*(?:\{([^}]*)\}|(\w+))\s*=\s*require\(\s*['\"]([^'\"]+)['\"]", text):
+        spec = m.group(4) or m.group(7)
+        if not spec.startswith("."):
+            continue
+        base = os.path.normpath(os.path.join(here, spec)).replace("\\", "/")
+        hit = next((base + ext for ext in ("", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", "/index.js", "/index.ts")
+                    if base + ext in sources), None)
+        if not hit:
+            continue
+        names = [m.group(1), m.group(3), m.group(6)] + re.split(r",", m.group(2) or m.group(5) or "")
+        for n in names:
+            n = (n or "").split(" as ")[-1].split(":")[-1].strip()
+            if n:
+                out[n] = hit
+    return out
+
+
+def test_inventory(root, cfg):
+    """Every test in the project's test files: file, name, lines, body, covers IDs, the source files it
+    guards, its assertion count, and whether it's a browser test (in an end-to-end gate's test files)."""
+    browser = set().union(*[files_matching(root, g.get("tests") or []) for g in e2e_gates(cfg)])
+    files = sorted(set(files_matching(root, cfg["roles"]["tests"])) | browser)
+    sources = set(files_matching(root, cfg["roles"]["source"])) - set(files)
+    out = []
+    for f in files:
+        lang = TEST_LANG.get(os.path.splitext(f)[1].lower())
+        if not lang:
+            continue
+        try:
+            with open(p(root, f), encoding="utf-8", errors="replace") as fh:
+                text = fh.read()
+        except OSError:
+            continue
+        names = _imports(root, f, text, lang, sources)
+        tests = find_tests(text, lang)
+        for t in tests:
+            used = sorted({src for n, src in names.items() if re.search(r"(?<![\w$.])" + re.escape(n) + r"\s*[.(]", t["body"])})
+            ids = sorted({x for m in COVERS.finditer(t["body"]) for x in re.findall(_ID, m.group(1))})
+            out.append({**t, "file": f, "lang": lang, "browser": f in browser, "covers": ids,
+                        "guards": used or sorted(set(names.values())), "asserts": len(ASSERTS.findall(t["body"])),
+                        "sh": _shingles(t["body"], lang)})
+    return out
+
+
+def _jaccard(a, b):
+    return len(a & b) / max(1, len(a | b))
+
+
+def cleanup_propose(root, cfg, similar=0.8):
+    """Find overlapping tests and write the proposal (Markdown for the user, JSON for --prove and --apply)."""
+    import hashlib
+    inv = test_inventory(root, cfg)
+    parent = list(range(len(inv)))
+
+    def find(x):
+        while parent[x] != x:
+            x = parent[x]
+        return x
+    why = {}
+    for a in range(len(inv)):
+        for b in range(a + 1, len(inv)):
+            A, B = inv[a], inv[b]
+            if A["browser"] != B["browser"] or (A["file"] != B["file"] and not set(A["guards"]) & set(B["guards"])
+                                                and not A["browser"]):
+                continue
+            j = _jaccard(A["sh"], B["sh"])
+            if A["covers"] and A["covers"] == B["covers"] and A["guards"] and A["guards"] == B["guards"]:
+                reason = f"it covers the same requirements ({', '.join(A['covers'])}) and tests the same code"
+            elif j >= similar:
+                reason = f"its body is {round(j * 100)}% the same"
+            else:
+                continue
+            parent[find(a)] = find(b)
+            why.setdefault(a, (b, reason))
+            why.setdefault(b, (a, reason))
+    groups = {}
+    for i in why:
+        groups.setdefault(find(i), []).append(i)
+    label = lambda t: f"{t['file']}::{t['name']}"
+    candidates, suggestions = [], []
+    for members in groups.values():
+        members.sort(key=lambda i: (-inv[i]["asserts"], -len(inv[i]["sh"]), inv[i]["file"], inv[i]["line"]))
+        keeper = inv[members[0]]
+        if keeper["browser"]:
+            suggestions.append({"tests": [label(inv[i]) for i in members],
+                                "why": f"{len(members)} browser tests do nearly the same check ({why[members[0]][1]})",
+                                "instead": "keep one of them, and check the shared part with a unit test"})
+            continue
+        for i in members[1:]:
+            t = inv[i]
+            other, reason = why[i]
+            candidates.append({"file": t["file"], "name": t["name"], "line": t["line"], "start": t["start"],
+                               "end": t["end"], "lang": t["lang"], "guards": t["guards"], "covers": t["covers"],
+                               "keeper": label(keeper), "why": f"{reason} as {label(inv[other])}",
+                               "body_sha": hashlib.sha256(t["body"].encode()).hexdigest()})
+    for t in inv:
+        if t["repeat"] and t["browser"]:
+            suggestions.append({"tests": [label(t)], "why": "the same check runs once for every item of a list (each page)",
+                                "instead": "run it on one page, and check the shared part with a unit test"})
+    candidates.sort(key=lambda c: (c["file"], c["line"]))
+    for n, c in enumerate(candidates, 1):
+        c["id"] = f"c{n}"
+    for n, s in enumerate(suggestions, 1):
+        s["id"] = f"s{n}"
+    prop = {"created": now_iso(), "commit": git(root, "rev-parse", "--short", "HEAD"), "similar": similar,
+            "counted": {"tests": len([t for t in inv if not t["browser"]]), "browser": len([t for t in inv if t["browser"]])},
+            "candidates": candidates, "suggestions": suggestions}
+    folder = harness_path(root, "cleanup")
+    os.makedirs(folder, exist_ok=True)
+    base, n = time.strftime("%Y-%m-%d"), 1
+    while os.path.exists(os.path.join(folder, (base if n == 1 else f"{base}-{n}") + ".json")):
+        n += 1
+    path = os.path.join(folder, (base if n == 1 else f"{base}-{n}") + ".json")
+    cleanup_save(path, prop)
+    return path, prop
+
+
+def cleanup_save(path, prop):
+    """The JSON for the harness, and the same proposal in plain language next to it."""
+    save_json(path, prop)
+    c = prop["candidates"]
+    proven = [x for x in c if x.get("status") == "proven"]
+    n, b = prop["counted"]["tests"], prop["counted"]["browser"]
+    lines = [f"# Cleaning up the tests ({prop['created'][:10]})", "",
+             f"{n} test{'s' if n != 1 else ''} and {b} browser test{'s' if b != 1 else ''} were read, at commit "
+             f"{prop['commit'] or 'none yet'}. Nothing has been removed. "
+             + (f"{len(c)} tests could go because they overlap with a test that stays." if c else "No test overlaps enough to go."),
+             ""]
+    if any("status" in x for x in c):
+        lines += [f"The proof ran: {len(proven)} of {len(c)} are proven to add nothing. Only those can be removed, "
+                  "and only after you approve.", ""]
+    if c:
+        lines += ["## Tests that could go", ""]
+    for x in c:
+        lines.append(f"**{x['id']}. {x['file']}, `{x['name']}`** (line {x['line']})")
+        lines.append(f"- Why it could go: {x['why']}.")
+        lines.append(f"- What replaces it: `{x['keeper'].split('::', 1)[1]}` in {x['keeper'].split('::')[0]}, "
+                     "and the rest of the tests.")
+        if x.get("status"):
+            lines.append(f"- {'Proven' if x['status'] in ('proven', 'removed') else 'Not proven'}: {x['proof']}")
+            for m in x.get("mutations") or []:
+                lines.append(f"  - {m['what']}: {m['result']}")
+        lines.append("")
+    if prop["suggestions"]:
+        lines += ["## Browser checks that could move down to unit tests", "",
+                  "These are never removed by the command: moving a check needs a new unit test first.", ""]
+        for s in prop["suggestions"]:
+            lines.append(f"**{s['id']}.** {', '.join(s['tests'][:6])}{' and more' if len(s['tests']) > 6 else ''}: "
+                         f"{s['why']}. Instead: {s['instead']}.")
+        lines.append("")
+    rel = os.path.basename(path)
+    lines += ["## Next", "",
+              f"- Prove them (it breaks code on a scratch copy, never in the project): `regista.py tests cleanup --prove {rel}`"
+              if not any("status" in x for x in c) else
+              f"- Remove the proven ones, after you approve: `regista.py tests cleanup --apply {rel}` (or name some: `c1 c3`)"]
+    with open(os.path.splitext(path)[0] + ".md", "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+
+
+def cleanup_load(root, arg):
+    """The proposal JSON for a path the user gives (the .md or the .json, or just its name)."""
+    for cand in (arg, harness_path(root, "cleanup", arg), os.path.join(root, arg)):
+        path = os.path.splitext(cand)[0] + ".json"
+        if os.path.isfile(path):
+            return path, load_json(path, {})
+    sys.exit(f"There's no cleanup proposal at {arg}. Run `regista.py tests cleanup` first; it writes one in "
+             f"{harness_rel('cleanup', root=root)}/.")
+
+
+MUTATIONS = [  # (pattern, replacement, how a person would say it): one per line, the first that applies
+    (re.compile(r"(?<![<>=!\-])(===|!==|==|!=|<=|>=|<|>)(?![<>=])"), None, "a comparison flipped"),
+    (re.compile(r"\breturn\s+(?!None\b|undefined\b|;)(\S.*?)(;?)\s*$"), None, "a return value dropped"),
+    (re.compile(r"(?<![\w.])(\d+)(?![\w.])"), None, "a constant changed"),
+    (re.compile(r"\b(True|False|true|false)\b"), None, "a true/false swapped"),
+    (re.compile(r"(&&|\|\||\band\b|\bor\b)"), None, "an and/or swapped"),
+]
+FLIP = {"===": "!==", "!==": "===", "==": "!=", "!=": "==", "<=": "<", ">=": ">", "<": "<=", ">": ">=",
+        "True": "False", "False": "True", "true": "false", "false": "true", "&&": "||", "||": "&&",
+        "and": "or", "or": "and"}
+
+
+def mutations_for(text, lang, limit):
+    """Simple, deterministic ways to break a source file, spread over it: [(line index, new line, what)]."""
+    found = []
+    for i, line in enumerate(text.split("\n")):
+        s = line.strip()
+        if not s or s.startswith(("#", "//", "*", "/*", "import ", "from ", "def ", "class ", "@", "export {")) or \
+                re.match(r"(async\s+)?function\b", s):
+            continue
+        bare = re.sub(r"([\"'`])(?:\\.|(?!\1).)*\1", lambda m: " " * len(m.group(0)), line)  # never inside a string
+        for k, (rx, _, what) in enumerate(MUTATIONS):
+            m = rx.search(line if k == 1 else bare)
+            if not m:
+                continue
+            if k == 1:
+                new = line[:m.start()] + ("return None" if lang == "py" else "return undefined" + m.group(2))
+            elif k == 2:
+                new = line[:m.start()] + str(int(m.group(1)) + 1) + line[m.end():]
+            else:
+                new = line[:m.start()] + FLIP[m.group(1)] + line[m.end():]
+            found.append((i, new, what))
+            break
+    if len(found) <= limit:
+        return found
+    step = len(found) / limit
+    return [found[int(k * step)] for k in range(limit)]
+
+
+def _strip_tests(text, spans):
+    lines = text.split("\n")
+    for start, end in sorted(spans, reverse=True):
+        while end < len(lines) and not lines[end].strip() and (start == 0 or not lines[start - 1].strip()):
+            end += 1  # the blank line after it goes too, once
+        del lines[start:end]
+    return "\n".join(lines)
+
+
+def _file_sha(root, rel):
+    import hashlib
+    try:
+        with open(p(root, rel), "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+    except OSError:
+        return ""
+
+
+def cleanup_prove(root, cfg, path, prop, budget=1800, per_file=8, say=print):
+    """Break the code each candidate guards, on a scratch copy, and check that the tests still fail without it.
+    Candidates are proven one after another, each with the ones proven before it already removed, so any set of
+    proven candidates can go together."""
+    import hashlib
+    import tempfile
+    gates = [g for g in select_gates(cfg, event="commit") if not g.get("_skip") and g.get("evidence") != "e2e"]
+    if not gates:
+        sys.exit("There's no test gate to run (a commit gate that isn't a browser test), so nothing can be proven.")
+    deadline = time.monotonic() + budget
+    scratch = tempfile.mkdtemp(prefix=f"{SLUG}-cleanup-")
+    copy = os.path.join(scratch, "project")
+    heavy = {"node_modules", ".venv", "venv"}
+
+    def skip(d, names):  # compiled Python is left behind too: a break of the same length could reuse it
+        rel = os.path.relpath(d, root).replace("\\", "/")
+        out = {"__pycache__"} & set(names)
+        if rel == ".":
+            return out | {".git"} | (heavy & set(names))
+        return out | ({"worktrees", "cleanup"} & set(names) if rel == harness_dir(root) else set())
+    shutil.copytree(root, copy, symlinks=True, ignore=skip)
+    for h in heavy:
+        if os.path.isdir(os.path.join(root, h)):
+            try:
+                os.symlink(os.path.join(root, h), os.path.join(copy, h), target_is_directory=True)
+            except OSError:
+                shutil.copytree(os.path.join(root, h), os.path.join(copy, h), symlinks=True)
+    originals, last = {}, {}
+
+    def read(rel):
+        if rel not in originals:
+            with open(os.path.join(copy, rel), encoding="utf-8", newline="") as fh:
+                originals[rel] = fh.read()
+        return originals[rel]
+
+    def run(removed, mutation=None):
+        """Do the tests fail on the copy, with these candidates removed and this mutation made? None: out of time."""
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return None
+        changed = {}
+        for c in removed:
+            changed.setdefault(c["file"], []).append((c["start"], c["end"]))
+        written = {f: _strip_tests(read(f), spans) for f, spans in changed.items()}
+        if mutation:
+            src, i, new, _ = mutation
+            lines = read(src).split("\n")
+            lines[i] = new + ("\r" if lines[i].endswith("\r") and not new.endswith("\r") else "")
+            written[src] = "\n".join(lines)
+        try:
+            for f, text in written.items():
+                with open(os.path.join(copy, f), "w", encoding="utf-8", newline="") as fh:
+                    fh.write(text)
+            for g in gates:
+                code, last["out"] = run_shell(g["run"], copy, min(g.get("timeout", 900), max(1, int(left))),
+                                    env={**gate_env(root), "PYTHONDONTWRITEBYTECODE": "1"})
+                if code == 124 and time.monotonic() >= deadline:
+                    return None
+                if code != 0:
+                    return True
+            return False
+        finally:
+            for f in written:
+                with open(os.path.join(copy, f), "w", encoding="utf-8", newline="") as fh:
+                    fh.write(originals[f])
+
+    try:
+        say("Running the tests on a scratch copy of the project, unchanged…")
+        base = run([])
+        if base is None or base:
+            sys.exit("The tests don't pass on an unchanged copy of the project" + (" within the time budget" if base is None
+                     else "") + ", so nothing can be proven. Make them pass first, then run this again.\n\n"
+                     + "\n".join(last.get("out", "").strip().splitlines()[-15:]))
+        muts, full = {}, {}
+        removed, caught_so_far = [], []
+        for c in prop["candidates"]:
+            c.pop("mutations", None)
+            c["hashes"] = {f: _file_sha(root, f) for f in [c["file"]] + c["guards"]}
+            now = "\n".join(read(c["file"]).split("\n")[c["start"]:c["end"]]).replace("\r", "")
+            if hashlib.sha256(now.encode()).hexdigest() != c["body_sha"]:
+                c.update(status="not proven", proof="the test changed after the proposal was written. Run "
+                                                   "`regista.py tests cleanup` again for a new one.")
+                continue
+            if not c["guards"]:
+                c.update(status="not proven", proof="it couldn't tell which source file this test guards, so it "
+                                                   "couldn't break that code on purpose.")
+                continue
+            for src in c["guards"]:
+                if src not in muts:
+                    lang = TEST_LANG.get(os.path.splitext(src)[1].lower(), "js")
+                    muts[src] = [(src, i, new, f"{src} line {i + 1}: {what} (`{new.strip()[:70]}`)")
+                                 for i, new, what in mutations_for(read(src), lang, per_file)]
+            mine = [m for src in c["guards"] for m in muts[src]]
+            for m in mine:
+                if m not in full:
+                    full[m] = run([], m)
+            if any(full[m] is None for m in mine):
+                c.update(status="not proven", proof="the time budget ran out first.")
+                continue
+            caught = [m for m in mine if full[m]]
+            if not caught:
+                c.update(status="not proven", proof="none of the deliberate breaks in the code it guards made the "
+                                                   "tests fail, so there's nothing to compare.")
+                continue
+            say(f"{c['id']}: removing {c['name']} and breaking the code it guards {len(caught)} ways…")
+            ok = run(removed + [c])
+            if ok is None or ok:
+                c.update(status="not proven", proof="the time budget ran out first." if ok is None else
+                         "the tests don't pass once it's removed (other tests may need something it sets up).")
+                continue
+            check = caught + [m for m in caught_so_far if m not in caught]
+            results = {m: run(removed + [c], m) for m in check}
+            c["mutations"] = [{"what": m[3], "result": "the tests still fail without it" if results[m] else
+                               ("not checked: out of time" if results[m] is None else "NOT caught without it")}
+                              for m in caught]
+            if any(r is None for r in results.values()):
+                c.update(status="not proven", proof="the time budget ran out first.")
+            elif all(results.values()):
+                c.update(status="proven", proof=f"the code it guards was broken {len(caught)} ways the tests catch, "
+                                                "and the tests still caught every one without it.")
+                removed.append(c)
+                caught_so_far += [m for m in caught if m not in caught_so_far]
+            else:
+                missed = next(m[3] for m in check if not results[m])
+                c.update(status="not proven", proof=f"without it the tests no longer notice this break: {missed}.")
+        prop["proved"] = now_iso()
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    cleanup_save(path, prop)
+    proven = [c for c in prop["candidates"] if c["status"] == "proven"]
+    out = [f"{len(proven)} of {len(prop['candidates'])} candidates are proven to add nothing."]
+    out += [f"  {c['id']} {c['file']}, {c['name']}: not proven, because {c['proof']}"
+            for c in prop["candidates"] if c["status"] != "proven"]
+    out.append(f"The proof is in {os.path.relpath(os.path.splitext(path)[0] + '.md', root)}. "
+               + (f"To remove the proven ones: `regista.py tests cleanup --apply {os.path.basename(path)}`." if proven else ""))
+    return "\n".join(out)
+
+
+def cleanup_apply(root, cfg, path, prop, ids=None, confirm=None):
+    """Remove proven candidates after the user types yes, and commit them with what was removed and the proof."""
+    chosen = [c for c in prop["candidates"] if not ids or c["id"] in ids]
+    unknown = [x for x in ids or [] if x not in {c["id"] for c in prop["candidates"]}]
+    if unknown:
+        return False, [f"There's no candidate {', '.join(unknown)} in this proposal."]
+    weak = [c for c in chosen if c.get("status") != "proven"]
+    if ids and weak:
+        return False, [f"{c['id']} ({c['name']}) isn't proven to add nothing, so it stays." for c in weak]
+    chosen = [c for c in chosen if c.get("status") == "proven"]
+    if not chosen:
+        return False, ["No candidate is proven yet. Run `regista.py tests cleanup --prove "
+                       f"{os.path.basename(path)}` first."]
+    stale = sorted({f for c in chosen for f, h in (c.get("hashes") or {}).items() if _file_sha(root, f) != h})
+    if stale:
+        return False, [f"These files changed after the proof, so it no longer holds: {', '.join(stale)}. "
+                       f"Run `regista.py tests cleanup --prove {os.path.basename(path)}` again."]
+    files = sorted({c["file"] for c in chosen})
+    if git(root, "status", "--porcelain", "--", *files):
+        return False, [f"{', '.join(files)} have changes that aren't committed. Commit or undo them first, so this "
+                       "commit holds only the removal."]
+    if confirm is None:
+        if not sys.stdin.isatty():
+            return False, ["Removing tests needs your OK, typed in a terminal, so run this yourself (not through an agent)."]
+        confirm = input
+    print(f"These {len(chosen)} tests will be removed and committed:")
+    for c in chosen:
+        print(f"  {c['id']} {c['file']}, {c['name']}: {c['why']}. Kept: {c['keeper']}.")
+    if confirm("Type yes to remove them: ").strip().lower() != "yes":
+        return False, ["Nothing was removed."]
+    for f in files:
+        with open(p(root, f), encoding="utf-8", newline="") as fh:
+            text = fh.read()
+        with open(p(root, f), "w", encoding="utf-8", newline="") as fh:
+            fh.write(_strip_tests(text, [(c["start"], c["end"]) for c in chosen if c["file"] == f]))
+    for c in chosen:
+        c["status"] = "removed"
+    prop["applied"] = now_iso()
+    cleanup_save(path, prop)
+    md = os.path.splitext(path)[0] + ".md"
+    record = [os.path.relpath(x, root).replace("\\", "/") for x in (path, md)]
+    record = [x for x in record if subprocess.run(["git", "-C", root, "check-ignore", "-q", x]).returncode != 0]
+    msg = [f"Remove {len(chosen)} overlapping test{'s' if len(chosen) != 1 else ''}, proven to add nothing", "",
+           "The user approved this in `regista.py tests cleanup --apply`. Each test was removed only after the",
+           "harness broke the code it guards on purpose, on a scratch copy, and the remaining tests still failed.", ""]
+    for c in chosen:
+        msg.append(f"- {c['file']}, {c['name']}: {c['why']}. Kept: {c['keeper']}. Proof: {c['proof']}")
+    msg += ["", f"The whole proof: {record[-1] if record else os.path.relpath(md, root)}"]
+    sh_add = subprocess.run(["git", "-C", root, "add", "--", *files, *record], capture_output=True, text=True)
+    r = subprocess.run(["git", "-C", root, "commit", "-q", "-m", "\n".join(msg), "--", *files, *record],
+                       capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if sh_add.returncode or r.returncode:
+        return False, ["The tests were removed, but the commit failed: " + (r.stderr or sh_add.stderr).strip()[-400:]
+                       + " Commit them yourself, with the proof in the message."]
+    return True, [f"Removed {len(chosen)} tests and committed the change, with the proof in the commit message."]
+
+
+def tests_removed(root, cfg):
+    """Tests a commit would drop, compared with the last commit (plain-language list): fewer tests in the
+    changed test files than before. Renames and rewrites that keep the count aren't flagged."""
+    globs = cfg["roles"]["tests"] + [x for g in e2e_gates(cfg) for x in g.get("tests") or []]
+    before, after, gone = 0, 0, []
+    for f in changed_files(root):
+        lang = TEST_LANG.get(os.path.splitext(f)[1].lower())
+        if not lang or not matches(f, globs):
+            continue
+        old = subprocess.run(["git", "-C", root, "show", f"HEAD:{f}"], capture_output=True, text=True,
+                             encoding="utf-8", errors="replace")
+        was = find_tests(old.stdout, lang) if old.returncode == 0 else []
+        try:
+            with open(p(root, f), encoding="utf-8", errors="replace") as fh:
+                now = find_tests(fh.read(), lang)
+        except OSError:
+            now = []
+        before, after = before + len(was), after + len(now)
+        names = {t["name"] for t in now}
+        gone += [f"{f}, {t['name']}" for t in was if t["name"] not in names]
+    if after >= before:
+        return []
+    return [f"it removes {before - after} test{'s' if before - after != 1 else ''} ({'; '.join(gone[:5]) or 'renamed ones'}). "
+            "The building flow doesn't drop tests; the user removes overlapping ones with `regista.py tests cleanup`, "
+            "which first proves they add nothing"]
 
 
 # --- what the user typed --------------------------------------------------------------------
@@ -2291,13 +4460,14 @@ def queued_typed(root, cfg, data):
     tp = data.get("transcript_path") or ""
     if HOST["name"] != "claude" or not tp or "/subagents/" in tp.replace("\\", "/"):
         return []
-    lines = [ln for ln in transcript_tail(tp) or [] if '"queued_command"' in ln and QUEUED_SLUG.search(ln)]
+    lines = [(i, ln) for i, ln in enumerate(transcript_tail(tp) or [])
+             if '"queued_command"' in ln and (QUEUED_SLUG.search(ln) or OK_HINT.search(ln))]
     if not lines:
         return []
     seen_state = load_json(typed_path(root), {})
     seen = set(seen_state.get("seen") or [])
     notes, new = [], []
-    for ln in lines:
+    for i, ln in lines:
         try:
             d = json.loads(ln)
         except ValueError:
@@ -2312,11 +4482,194 @@ def queued_typed(root, cfg, data):
             continue
         seen.add(key)
         new.append(key)
+        if not typed_items(att.get("prompt") or ""):  # a plain "ok" to the checks the session had just asked for
+            notes += ok_reply_typed(root, cfg, data, att.get("prompt") or "", upto=i,
+                                    by="user (replied while the session was busy)")
+            continue
         notes += [n.replace(f"{DISPLAY_NAME} recorded", f"{DISPLAY_NAME} recorded (sent while you were working)", 1)
                   for n in record_typed(root, cfg, att.get("prompt") or "", "user (sent while the session was busy)")]
     if new:
         save_json(typed_path(root), {"seen": (seen_state.get("seen") or [])[-400:] + new})
     return notes
+
+
+# A plain reply to the session's question that named the checks: "ok", "all ok", "doc ok", or "1. All ok. 2. Yes"
+# to a numbered question whose item 1 named them. It's recorded only when the session's last message before it
+# held the ready-to-send `/<SLUG>:verify <ID> ok` lines, and only from a person's prompt.
+OK_HINT = re.compile(r"\b(ok|okay|good|fine|works|passed|verified)\b", re.I)
+OK_PHRASE = re.compile(r"(?:(.+?)\s+)?(ok|okay|good|fine|works|passed|verified)", re.I)
+HEDGES = {"not", "no", "mostly", "almost", "partly", "partially", "kinda", "kind", "sort", "sorta", "nearly", "half",
+          "semi", "somewhat", "barely", "probably", "maybe", "isn't", "isnt", "seems", "sounds"}
+VERIFY_ASKED = re.compile(r"[/$]" + TYPED_SLUG + r":verify\s+([A-Za-z][A-Za-z0-9_.]*-\d+)\s+ok\b", re.I)
+
+
+def reply_parts(prompt):
+    """A reply split by its item numbers: "1. All ok. 2. Yes" → {1: "All ok.", 2: "Yes"}; "ok" → {0: "ok"}."""
+    text = prompt.strip()
+    marks = list(re.finditer(r"(?:^|(?<=\s))(\d{1,2})[.)]\s+", text))
+    if not marks or marks[0].start() != 0:
+        return {0: text}
+    return {int(m.group(1)): text[m.end():marks[k + 1].start() if k + 1 < len(marks) else len(text)].strip()
+            for k, m in enumerate(marks)}
+
+
+def asked_checks(question):
+    """The checks a message asks the user for, as its `/<SLUG>:verify <ID> ok` lines: (outside any numbered item,
+    {item number: [IDs]}). An item runs until the next number, or a line that isn't indented after a blank line."""
+    outside, items, current, blank = [], {}, None, False
+    for line in question.splitlines():
+        m = re.match(r"(?:[*_]{1,2})?(\d{1,2})[.)]\s", line)
+        if m:
+            current = int(m.group(1))
+            items.setdefault(current, [])
+        elif line.strip() and blank and not line[:1].isspace():
+            current = None
+        blank = not line.strip()
+        ids = VERIFY_ASKED.findall(line)
+        (outside if current is None else items[current]).extend(x for x in ids if x not in outside + items.get(current, []))
+    return outside, items
+
+
+def ok_covers(text, named):
+    """The checks a short "ok" answer covers: all of `named` ("ok", "all ok"), the one it names ("UI-3 ok"), or the
+    only one asked when it names it some other way ("doc ok"). A hedge ("not ok", "mostly ok") covers none."""
+    m = OK_PHRASE.fullmatch(text.strip().rstrip(".!").strip())
+    if not m or not named:
+        return []
+    label = (m.group(1) or "").strip().lower()
+    if label in ("", "all", "everything", "both", "all of them", "all checks"):
+        return list(named)
+    hit = [x for x in named if x.lower() == label]
+    if hit:
+        return hit
+    return list(named) if len(named) == 1 and " " not in label and label not in HEDGES else []
+
+
+def ok_reply_checks(prompt, question):
+    """The checks a person's short reply approves, given the question the session asked just before it."""
+    if len(prompt) > 200 or not OK_HINT.search(prompt):
+        return []
+    outside, items = asked_checks(question)
+    parts = reply_parts(prompt)
+    if 0 in parts:  # an unnumbered reply to a numbered question can't say which item it answers
+        if len(items) > 1 and any(items.values()):
+            return []
+        return ok_covers(parts[0], outside + [x for ids in items.values() for x in ids])
+    out = []
+    for n, text in parts.items():
+        out += [x for x in ok_covers(text, items.get(n) or []) if x not in out]
+    return out
+
+
+def ok_reply_typed(root, cfg, data, prompt, upto=None, by="user (replied ok to the checks asked for)"):
+    """Record the checks a person's plain "ok" answers, when the session's last message before it named them
+    (`upto`: only transcript lines before that index). Returns the notes, or []."""
+    if len(prompt) > 200 or not OK_HINT.search(prompt):
+        return []
+    question = ""
+    for who, text, _, line in reversed(transcript_messages(data.get("transcript_path"))):
+        if upto is not None and line >= upto:
+            continue
+        if who == "assistant":
+            question = text
+            break
+        if text.strip() != prompt.strip():  # the user wrote something else since the session last spoke
+            return []
+    ids = ok_reply_checks(prompt, question) if question else []
+    if not ids:
+        return []
+    said = prompt.strip().replace("\n", " ")[:60]
+    return [n.replace(f"{DISPLAY_NAME} recorded", f"{DISPLAY_NAME} recorded (the user replied \"{said}\" to your "
+                                                  "question that named these checks)", 1)
+            for n in record_typed(root, cfg, "\n".join(f"/{SLUG}:verify {x} ok" for x in ids), by)]
+
+
+def typed_prompts(data):
+    """What a person typed in this session, from the host's transcript: in Claude Code the prompts it marks
+    as a person's (origin "human"), queued ones included; in Codex the user's messages. A subagent's
+    transcript has none."""
+    tp = data.get("transcript_path") or ""
+    if not tp or "/subagents/" in tp.replace("\\", "/"):
+        return []
+    out = []
+    try:
+        with open(tp, encoding="utf-8", errors="replace") as f:
+            for ln in f:
+                if '"human"' not in ln and '"user_message"' not in ln:
+                    continue
+                try:
+                    d = json.loads(ln)
+                except ValueError:
+                    continue
+                if not isinstance(d, dict):
+                    continue
+                text = None
+                if HOST["name"] == "codex":
+                    pl = d.get("payload") or {}
+                    if d.get("type") == "event_msg" and isinstance(pl, dict) and pl.get("type") == "user_message":
+                        text = pl.get("message")
+                elif d.get("type") == "user" and not d.get("isSidechain") and not d.get("isMeta") and \
+                        (d.get("origin") or {}).get("kind") == "human":
+                    content = (d.get("message") or {}).get("content")
+                    if isinstance(content, list):
+                        content = "\n".join(b.get("text", "") for b in content
+                                            if isinstance(b, dict) and b.get("type") == "text")
+                    text = content
+                elif d.get("type") == "attachment":
+                    att = d.get("attachment") or {}
+                    if att.get("type") == "queued_command" and (att.get("origin") or {}).get("kind") == "human":
+                        text = att.get("prompt")
+                if isinstance(text, str) and person_prompt(text):
+                    out.append(text)
+    except OSError:
+        return []
+    return out
+
+
+def quoted_from(quote, prompts):
+    """Is the quote whole sentences of one of the prompts? Case and spacing don't matter; a part of a
+    sentence doesn't count, so "add dark mode" can't be cut out of "don't add dark mode"."""
+    def norm(s):
+        s = re.sub(r"</?command-(?:message|name|args)>", "\n", s)
+        return re.sub(r"[ \t]+", " ", re.sub(r"[ \t]*\n\s*", "\n", s)).strip()
+    q = norm(quote).strip("\"'“”‘’").rstrip(".!?;: ").strip()
+    if not q:
+        return False
+    for text in prompts:
+        t = norm(text)
+        for m in re.finditer(re.escape(q), t, re.I):
+            before, after = t[:m.start()], t[m.end():]
+            if re.search(r"(^|[.!?;:\n\"“])\s*(?:(?:[-*•]|\d+[.)])\s+)?$", before) and re.match(r"\s*($|[.!?;:\n\"”])", after):
+                return True
+    return False
+
+
+def typed_change_check(root, data):
+    """`regista.py change from-transcript "<quote>"`: the orchestrator or overseer records a change the user
+    asked for in plain words, only when the quote is whole sentences the user typed in this session.
+    Returns a refusal reason or None."""
+    eff = effects_of(root, data)
+    if not eff or not runs_cli(eff, "change", "from-transcript"):
+        return None
+    if role_of(data, root) != "main":
+        return (f"{DISPLAY_NAME}: only the orchestrator records a change the user asked for. Report back what they "
+                "asked.")
+    quotes = []
+    for words in eff["runs"]:
+        for k, w in enumerate(words):
+            if w.replace("\\", "/").endswith(("regista.py", "scripts/regista")) and "from-transcript" in words[k + 1:]:
+                rest = words[words.index("from-transcript", k + 1) + 1:]
+                quotes.append(None if any(x.startswith("-") for x in rest) else " ".join(rest))
+    if not quotes or None in quotes:
+        return (f"{DISPLAY_NAME}: run it straight from the shell with only the quote after it: `{PY} \"{DD}\" change "
+                "from-transcript \"<the user's words>\"`.")
+    prompts = typed_prompts(data)
+    for q in quotes:
+        if not quoted_from(q, prompts):
+            return (f"{DISPLAY_NAME}: \"{q[:120]}\" isn't something the user typed in this session, word for word and in "
+                    "whole sentences, so it can't be recorded as their change. Quote their own sentences exactly, or ask "
+                    f"them to send `{cmd_name('change')} <what they want>`.")
+    return None
 
 
 # --- changes to what gets built -----------------------------------------------------------
@@ -2661,12 +5014,16 @@ def integrity_check(root, cfg, data):
     rel = tool_path(root, ti) if tool in EDIT_TOOLS else None
     eff = effects_of(root, data)
     writes = eff["writes"] if eff else []
-    if (eff and (runs_cli(eff, "verify-manual") or runs_cli(eff, "try", "--ask"))) or (
+    if (eff and (runs_cli(eff, "verify-manual", root=root) or runs_cli(eff, "try", "--ask", root=root))) or (
             tool == "Skill" and re.search(r"(^|:)verify$", str(ti.get("skill") or ti.get("name") or ""))):
         return "deny", (f"{DISPLAY_NAME}: manual checks are the user's call. Show them the steps "
                         f"(`regista.py try`) and ask them to record what they saw: `{cmd_name('verify')} <ID> ok` "
                         "or `fail <what happened>`, or `regista.py try --ask` in their own terminal.")
-    if (eff and runs_cli(eff, "change", "add")) or (
+    if eff and runs_cli(eff, "tests", "cleanup", root=root):
+        return "deny", (f"{DISPLAY_NAME}: which tests may go is the user's call, never an agent's. If the gates take too "
+                        "long, tell the user they can run `regista.py tests cleanup` in their own terminal: it lists "
+                        "overlapping tests, proves each adds nothing, and removes them only with their OK.")
+    if (eff and runs_cli(eff, "change", "add", root=root)) or (
             tool == "Skill" and re.search(r"(^|:)change$", str(ti.get("skill") or ti.get("name") or ""))):
         return "deny", (f"{DISPLAY_NAME}: what gets built is the user's call. If you think the plan needs a change, ask them; "
                         f"they record it with `{cmd_name('change')} <what they want>`.")
@@ -2684,6 +5041,16 @@ def integrity_check(root, cfg, data):
     fleet_files = [harness_rel("fleet", "**", root=root), harness_rel("worker.json", root=root)]
     if (rel and matches(rel, fleet_files)) or under(root, writes, fleet_files):
         return "deny", f"{DISPLAY_NAME}: the overseer's and workers' records are written only by the harness."
+    approvals = [harness_rel("approvals.json", root=root)]
+    if (rel and matches(rel, [harness_rel("cleanup", "**", root=root)])) or under(root, writes, [harness_rel("cleanup", "**", root=root)]):
+        return "deny", (f"{DISPLAY_NAME}: the test cleanup proposals and their proofs are written only by "
+                        "`regista.py tests cleanup`, which the user runs.")
+    if (rel and matches(rel, approvals)) or under(root, writes, approvals):
+        return "deny", (f"{DISPLAY_NAME}: the user's approvals are recorded only by the harness, from what the user "
+                        "typed. Ask the user instead.")
+    if eff and opens_session(eff):
+        return "deny", (f"{DISPLAY_NAME}: opening a new session is the user's call. Give them the command to run in "
+                        f"their own terminal: `{PY} \"{DD}\" open <folder> <name>`.")
     worktrees = harness_rel("worktrees", root=root)
     if (rel and rel.startswith(worktrees + "/")) or under(root, writes, [worktrees + "/**"]):
         return "deny", (f"{DISPLAY_NAME}: that's a worker's worktree. Send the worker what to change (SendMessage), or take "
@@ -2702,7 +5069,13 @@ def integrity_check(root, cfg, data):
                         "the gates. Run `regista.py gate` instead.")
     if (rel == config) or under(root, writes, [config]):
         if role == "main":
-            return "ask", f"{DISPLAY_NAME}: changing the harness config (gates, thresholds, roles) needs the user's OK."
+            # Adding a gate or a protected path loosens nothing: only a change that loosens a check needs the user.
+            loose = config_write_loosens(root, tool, ti) if rel == config and not writes else None
+            if loose == []:
+                return None, None
+            return "ask", (f"{DISPLAY_NAME}: this change to the harness config loosens its checks ({'; '.join(loose)}), "
+                           "which needs the user's OK." if loose else
+                           f"{DISPLAY_NAME}: changing the harness config (gates, thresholds, roles) needs the user's OK.")
         return "deny", f"{DISPLAY_NAME}: agents don't change the harness config. Report what you'd change and why."
     # The hosts' own settings decide whether the hooks, the agents and compaction run at all.
     host_files = [".codex/**", ".claude/settings.json", ".claude/settings.local.json"]
@@ -2726,12 +5099,15 @@ def role_check(root, cfg, data):
     is_test = bool(rel and matches(rel, tests))
     eff = effects_of(root, data)
     writes = eff["writes"] if eff else []
+    why = plan_guard(root, cfg, data) or typed_change_check(root, data)
+    if why:
+        return why
 
     # The verdict file and its recorder belong to the reviewer alone.
     if role != "reviewer":
         if tool in EDIT_TOOLS and rel and rel.startswith(harness_rel("reviews", root=root) + "/"):
             return f"{DISPLAY_NAME}: only the reviewer agent writes reviews. Spawn {agent_name('reviewer', root)}."
-        if eff and (runs_cli(eff, "review-record") or under(root, writes, [harness_rel("reviews", "**", root=root)])):
+        if eff and (runs_cli(eff, "review-record", root=root) or under(root, writes, [harness_rel("reviews", "**", root=root)])):
             return f"{DISPLAY_NAME}: only the reviewer agent records reviews. Spawn {agent_name('reviewer', root)}."
 
     if role == "main":
@@ -2747,12 +5123,13 @@ def role_check(root, cfg, data):
     # Every subagent: no nested agents, no commits or pushes (the orchestrator commits after review).
     if tool in ("Agent", "Task"):
         return f"{DISPLAY_NAME}: subagents don't start other agents. Report back; the orchestrator decides who works next."
-    if eff and any(g["sub"] in ("commit", "push") for g in eff["git"]):
+    if eff and any(g["sub"] in ("commit", "push") and works_here(root, g["cwd"]) for g in eff["git"]):
         return f"{DISPLAY_NAME}: only the orchestrator commits, after the review. Report back instead."
-    if eff and (runs_cli(eff, "run", "start") or runs_cli(eff, "run", "end") or runs_cli(eff, "change", "done")
-                or runs_cli(eff, "deploy")):
-        return (f"{DISPLAY_NAME}: only the orchestrator starts or ends a build-all run, deploys, or marks a change as "
-                "planned. Report back instead.")
+    if eff and (runs_cli(eff, "run", "start", root=root) or runs_cli(eff, "run", "end", root=root)
+                or runs_cli(eff, "change", "done", root=root) or runs_cli(eff, "deploy", root=root)
+                or runs_cli(eff, "release", root=root)):
+        return (f"{DISPLAY_NAME}: only the orchestrator starts or ends a build-all run, deploys, releases, or marks a "
+                "change as planned. Report back instead.")
 
     if role == "builder":
         if tool in EDIT_TOOLS and is_test:
@@ -2884,11 +5261,14 @@ def ask(reason, item=None):
     """Claude Code asks the user itself. Codex has no 'ask' answer for hooks (it would count as a failed
     hook and let the action through), so the action is refused, the agent asks in the chat, and the
     user's own reply, seen by the UserPromptSubmit hook that only a person's input fires, allows that
-    exact action once."""
-    if HOST["name"] == "claude":
+    exact action once.
+    A worker does the same on both hosts, since the user may not be watching it: the question also goes to the
+    overseer as "waiting for your OK", and the user's yes can come through the overseer (`fleet allow`)."""
+    root, data = HOOK_CTX.get("root"), item or HOOK_CTX.get("data") or {}
+    home = overseer_root(root)
+    if HOST["name"] == "claude" and not home:
         emit({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "ask",
                                      "permissionDecisionReason": reason}})
-    root, data = HOOK_CTX.get("root"), item or HOOK_CTX.get("data") or {}
     ti = data.get("tool_input") or {}
     key = f"{data.get('tool_name')}:{ti.get('file_path') or ti.get('command') or ''}"[:400]
     session = (HOOK_CTX.get("data") or {}).get("session_id", "")
@@ -2898,10 +5278,20 @@ def ask(reason, item=None):
         st.pop("granted")
         save_json(approvals_path(root), st)
         return  # approved once by the user's own reply
+    asked_before = (st.get("pending") or {}).get("key") == key
     st["pending"] = {"key": key, "reason": reason, "session": session, "at": time.time()}
     save_json(approvals_path(root), st)
-    deny(reason + " Ask the user now, in one short question, and end your turn. If they reply yes, run "
-                  "exactly the same action again: their reply allows it once.")
+    if not home:
+        deny(reason + " Ask the user now, in one short question, and end your turn. If they reply yes, run "
+                      "exactly the same action again: their reply allows it once.")
+    name = worker_info(root).get("name", "")
+    if not asked_before:
+        what = reason[len(DISPLAY_NAME) + 2:] if reason.startswith(DISPLAY_NAME + ": ") else reason
+        fleet_event(home, name, "ask", what, action=key[:300])
+    deny(reason + " You're a worker, and the user may not be watching you, so the overseer has been told you're "
+                  "waiting for their OK. Tell it too, with SendMessage: one plain line on what you want to do and why. "
+                  "Meanwhile carry on with work that doesn't need it, or end your turn. When the overseer says the user "
+                  "approved (or the user says yes here), run exactly the same action again: it's allowed once.")
 
 
 YES = re.compile(r"^\s*(yes|y|yep|ok|okay|sure|approve[d]?|go ahead|do it|da)\b", re.I)
@@ -2909,7 +5299,8 @@ NO = re.compile(r"^\s*(no|n|nope|don'?t|stop|cancel|nu)\b", re.I)
 
 
 def user_reply_to_ask(root, data):
-    """Codex: the user's answer to a pending question from ask(). Returns a note, or None."""
+    """Codex, or a worker on either host: the user's answer to a pending question from ask(). Returns a note, or
+    None. Only a person's prompt may reach it."""
     st = load_json(approvals_path(root), {})
     pend = st.get("pending")
     if not pend or pend.get("session") != data.get("session_id", ""):
@@ -3156,7 +5547,8 @@ def expand(word, env):
         return m.group(0) if val is None else val
     word = re.sub(r"\$env:([A-Za-z_]\w*)|\$\{([A-Za-z_]\w*)\}|\$([A-Za-z_]\w*)", var, word)
     if word.startswith("~"):
-        word = os.path.expanduser(word)
+        home = env.get("HOME", "~") if re.match(r"^~(/|$)", word) else "~"  # export HOME=$H moves it
+        word = os.path.expanduser(word) if home in ("~", None) else home + word[1:]
     return word
 
 
@@ -3186,13 +5578,14 @@ def positionals(words, value_opts=()):
     return out
 
 
-def agent_script(path, cwd):
+def agent_script(path, cwd, home=None):
     """A script file an agent wrote outside the project (a scratch file): its code is judged like
-    inline code. The project's own scripts and the harness's are code under review, not probes."""
+    inline code. The project's own scripts and the harness's are code under review, not probes.
+    home: the session's project, which counts even when the command cd'd elsewhere (`cd /tmp`)."""
     root = find_root(cwd)
     plug = os.path.abspath(PLUGIN_ROOT).replace("\\", "/")
     ap = os.path.abspath(path).replace("\\", "/")
-    if ap.startswith(plug + "/") or (root and rel_to_root(root, ap) is not None):
+    if ap.startswith(plug + "/") or any(r and rel_to_root(r, ap) is not None for r in (root, home)):
         return False
     head = read(ap, 300) if os.path.basename(ap) in ("regista.py", "dd.py") else ""  # dd.py: the old name
     if '"""Core of the harness' in head or f'"""{OLD_DISPLAY_NAME} core' in head:  # another copy (old name: 0.8's first line)
@@ -3216,22 +5609,462 @@ def path_literals(code):
 
 def shell_effects(cmd, cwd, powershell=False):
     """What a shell command does: {"writes", "reads"} (absolute paths, `cd` and simple variables
-    followed), "runs" (each command's words), "code" (inline source it runs), "git" (git
-    subcommands with their repo and arguments)."""
-    eff = {"writes": [], "reads": [], "runs": [], "code": [], "git": []}
+    followed), "runs" (each command's words), "where" (for each run, the project folder it works on
+    when the command chose one: CLAUDE_PROJECT_DIR set or unset, else None for the session's own),
+    "code" (inline source it runs), "opaque" (inline code whose processes couldn't be read), "git"
+    (git subcommands with their repo and arguments)."""
+    eff = {"writes": [], "reads": [], "runs": [], "where": [], "code": [], "opaque": [], "git": [],
+           "home": find_root(cwd)}
     if powershell:
         cmd = cmd.replace("\\", "/").replace("`", "'")  # PowerShell paths and its escape character
     _effects(cmd, cwd.replace("\\", "/"), {}, eff, {}, 0)
     return eff
 
 
-def _code_effects(code, cwd, eff):
+TRIPLE_QUOTED = re.compile(r"""('''|\"\"\")(?:\\.|(?!\1).)*?\1""", re.S)
+UNKNOWN = "${?}"  # a part of a path that inline code computes in a way the guards can't follow
+PROJECT_VAR = "CLAUDE_PROJECT_DIR"
+
+
+def _code_effects(code, cwd, eff, lang=None, env=None, scripts=None, depth=0):
+    """Inline code's effects. Python is read from its syntax tree and JavaScript from its file calls: only
+    the paths passed to calls that write count as writes. Where a call's path can't be followed, or for
+    other languages, every path-like string counts, as before, except the text in triple quotes (data).
+    Returns whether a write's target couldn't be followed (its arguments may then be what it writes)."""
     eff["code"].append(code)
-    paths = [resolve(x, cwd) for x in path_literals(code)]
-    if WRITE_API.search(code):
-        eff["writes"] += paths
-    if READ_API.search(code):
-        eff["reads"] += paths
+    data_free = TRIPLE_QUOTED.sub('""', code)
+    facts = py_code_facts(code) if lang == "python" else js_code_facts(code) if lang == "js" else None
+    literals = [resolve(x, cwd) for x in path_literals(data_free)]
+    if facts is None:
+        if WRITE_API.search(data_free):
+            eff["writes"] += literals
+        if READ_API.search(data_free):
+            eff["reads"] += literals
+        eff["opaque"].append(data_free)
+        return bool(WRITE_API.search(data_free))
+    eff["writes"] += [resolve(x, cwd) for x in facts["writes"]] + (literals if facts["unsure_write"] else [])
+    if lang == "python":
+        eff["reads"] += [resolve(x, cwd) for x in facts["reads"]] + (literals if facts["unsure_read"] else [])
+    elif READ_API.search(data_free):
+        eff["reads"] += literals
+    if facts["unsure_spawn"]:
+        eff["opaque"].append(data_free)
+    for sp in facts.get("spawns", []):
+        senv = dict(env or {})
+        if sp["project"] is not None:
+            senv[PROJECT_VAR] = sp["project"] or None  # "" = the code removed it: the folder decides
+        scwd = resolve(sp["cwd"], cwd) if sp["cwd"] else cwd
+        _effects(sp["cmd"], scwd, senv, eff, scripts if scripts is not None else {}, depth + 1)
+    return facts["unsure_write"]
+
+
+def py_code_facts(code):
+    """What inline Python writes, reads and starts, read from its syntax tree: {"writes", "reads" (paths,
+    UNKNOWN where a part can't be followed), "spawns" (shell command lines with their cwd and project
+    folder), "unsure_write", "unsure_read", "unsure_spawn" (a call whose target can't be followed)}. None
+    when the code isn't Python."""
+    import ast
+    import shlex
+    try:
+        tree = ast.parse(code)
+    except (SyntaxError, ValueError):
+        return None
+    env, lists, aliases = {}, {}, {}
+    facts = {"writes": [], "reads": [], "spawns": [], "unsure_write": False, "unsure_read": False,
+             "unsure_spawn": False}
+
+    def qual(f):
+        parts = []
+        while isinstance(f, ast.Attribute):
+            parts.append(f.attr)
+            f = f.value
+        if not isinstance(f, ast.Name):
+            return "." + ".".join(reversed(parts)) if parts else ""  # a method of a computed value
+        parts.append(aliases.get(f.id, f.id))
+        return ".".join(reversed(parts))
+
+    def combine(*parts):
+        out = [""]
+        for part in parts:
+            out = [a + b for a in out for b in part][:16]
+        return out
+
+    def joined(parts):
+        out = [""]
+        for part in parts:
+            out = [b if b.startswith("/") or not a else a.rstrip("/") + "/" + b for a in out for b in part][:16]
+        return out
+
+    def ev(node, d=0):
+        """The string values an expression can have, UNKNOWN for parts that can't be followed; None if
+        nothing about it is known."""
+        if d > 20 or node is None:
+            return None
+        if isinstance(node, ast.Constant):
+            return [node.value] if isinstance(node.value, str) else None
+        if isinstance(node, ast.JoinedStr):
+            return combine(*[(ev(v.value if isinstance(v, ast.FormattedValue) else v, d + 1) or [UNKNOWN])
+                             for v in node.values])
+        if isinstance(node, ast.Name):
+            return env.get(node.id)
+        if isinstance(node, ast.BinOp):
+            left, right = ev(node.left, d + 1), ev(node.right, d + 1)
+            if left is None and right is None:
+                return None
+            if isinstance(node.op, ast.Add):
+                return combine(left or [UNKNOWN], right or [UNKNOWN])
+            if isinstance(node.op, ast.Div):
+                return joined([left or [UNKNOWN], right or [UNKNOWN]])
+            if isinstance(node.op, ast.Mod) and left:
+                return [re.sub(r"%[-#0 +]*\d*(?:\.\d+)?[sdirf]", lambda m: UNKNOWN, x) for x in left]
+            return None
+        if isinstance(node, ast.IfExp):
+            a, b = ev(node.body, d + 1), ev(node.orelse, d + 1)
+            return None if a is None and b is None else (a or [UNKNOWN]) + (b or [UNKNOWN])
+        if isinstance(node, ast.Attribute) and node.attr == "parent":
+            v = ev(node.value, d + 1)
+            return [os.path.dirname(x.rstrip("/")) or "." for x in v] if v else None
+        if isinstance(node, ast.Call):
+            q, a = qual(node.func), node.args
+            last = q.rsplit(".", 1)[-1]
+            kw = {k.arg: k.value for k in node.keywords if k.arg}
+            if q in ("os.path.join", "posixpath.join", "ntpath.join") or last in ("Path", "PurePath", "PosixPath",
+                                                                                 "WindowsPath", "PurePosixPath"):
+                if not a:
+                    return ["."]
+                parts = [ev(x, d + 1) for x in a]
+                return None if all(x is None for x in parts) else joined([x or [UNKNOWN] for x in parts])
+            if last == "joinpath" and isinstance(node.func, ast.Attribute):
+                parts = [ev(node.func.value, d + 1)] + [ev(x, d + 1) for x in a]
+                return None if all(x is None for x in parts) else joined([x or [UNKNOWN] for x in parts])
+            if q in ("os.path.abspath", "os.path.realpath", "os.path.normpath", "os.path.expanduser", "str",
+                     "os.fspath", "shutil.which") and a:
+                v = ev(a[0], d + 1)
+                return [os.path.expanduser(x) for x in v] if v and q == "os.path.expanduser" else v
+            if q == "os.path.dirname" and a:
+                v = ev(a[0], d + 1)
+                return [os.path.dirname(x) or "." for x in v] if v else None
+            if q in ("tempfile.mkdtemp", "tempfile.mkstemp", "tempfile.TemporaryDirectory",
+                     "tempfile.NamedTemporaryFile", "tempfile.gettempdir"):
+                base = ev(kw.get("dir"), d + 1) or [tempfile_dir()]
+                return base if q.endswith("gettempdir") else [x.rstrip("/") + "/mktemp" for x in base]
+            if q in ("os.getcwd", "pathlib.Path.cwd", "Path.cwd"):
+                return ["."]
+            if q in ("pathlib.Path.home", "Path.home"):
+                return [os.path.expanduser("~")]
+            if isinstance(node.func, ast.Attribute):
+                if last in ("resolve", "absolute", "expanduser", "as_posix", "strip", "rstrip"):
+                    return ev(node.func.value, d + 1)
+                if last == "format":
+                    v = ev(node.func.value, d + 1)
+                    return [re.sub(r"\{[^{}]*\}", lambda m: UNKNOWN, x) for x in v] if v else None
+                if last in ("with_name", "with_suffix") and a:
+                    v, w = ev(node.func.value, d + 1), ev(a[0], d + 1) or [UNKNOWN]
+                    if not v:
+                        return None
+                    return [(os.path.dirname(x) + "/" + y if last == "with_name" else os.path.splitext(x)[0] + y)
+                            for x in v for y in w][:16]
+        return None
+
+    def bind(name, vals):
+        env[name] = vals if name not in env else (None if env[name] is None or vals is None else
+                                                    (env[name] + [v for v in vals if v not in env[name]])[:16])
+
+    def iter_values(node):
+        """The values a for loop's variable takes, where they can be followed."""
+        if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+            vals = [ev(x) for x in node.elts]
+            return None if any(v is None for v in vals) else [x for v in vals for x in v]
+        if isinstance(node, ast.Call):
+            q, a = qual(node.func), node.args
+            last = q.rsplit(".", 1)[-1]
+            if last in ("sorted", "list", "reversed", "set", "tuple") and a:
+                return iter_values(a[0])
+            if q in ("glob.glob", "glob.iglob", "glob") and a:
+                return ev(a[0])
+            if q in ("os.listdir", "os.scandir"):
+                return None  # names only: the folder they're joined to decides
+            if last in ("glob", "rglob", "iterdir") and isinstance(node.func, ast.Attribute):
+                v = ev(node.func.value)
+                pat = ev(a[0]) if a else ["*"]
+                return [x.rstrip("/") + "/" + y for x in v for y in (pat or [UNKNOWN])][:16] if v else None
+        return None
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            for n in node.names:
+                aliases[n.asname or n.name] = node.module + "." + n.name
+        elif isinstance(node, ast.Import):
+            for n in node.names:
+                if n.asname:
+                    aliases[n.asname] = n.name
+    order = sorted((n for n in ast.walk(tree) if isinstance(n, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.For,
+                                                                  ast.With, ast.NamedExpr))),
+                   key=lambda n: (n.lineno, n.col_offset))
+    for node in order:
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for t in targets:
+                if isinstance(t, ast.Name):
+                    bind(t.id, ev(node.value))
+                    if isinstance(node.value, (ast.List, ast.Tuple)):
+                        lists[t.id] = node.value
+                elif isinstance(t, (ast.Tuple, ast.List)) and isinstance(node.value, (ast.Tuple, ast.List)) \
+                        and len(t.elts) == len(node.value.elts):
+                    for tt, vv in zip(t.elts, node.value.elts):
+                        if isinstance(tt, ast.Name):
+                            bind(tt.id, ev(vv))
+                else:
+                    for n in ast.walk(t):
+                        if isinstance(n, ast.Name):
+                            bind(n.id, None)
+        elif isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name):
+            cur, add = env.get(node.target.id), ev(node.value)
+            bind(node.target.id, combine(cur or [UNKNOWN], add or [UNKNOWN])
+                 if isinstance(node.op, ast.Add) and (cur or add) else None)
+        elif isinstance(node, ast.For):
+            vals = iter_values(node.iter)
+            for n in ast.walk(node.target):
+                if isinstance(n, ast.Name):
+                    bind(n.id, vals if isinstance(node.target, ast.Name) else None)
+        elif isinstance(node, ast.With):
+            for item in node.items:
+                if isinstance(item.optional_vars, ast.Name):
+                    q = qual(item.context_expr.func) if isinstance(item.context_expr, ast.Call) else ""
+                    bind(item.optional_vars.id, ev(item.context_expr) if q.startswith("tempfile.") else None)
+
+    def target(node, kind):
+        vals = ev(node)
+        if vals is None:
+            facts["unsure_" + kind] = True
+        else:
+            facts[kind + "s"] += vals
+
+    def opens_for_writing(mode):
+        if mode is None:
+            return False
+        vals = ev(mode)
+        return vals is None or any(re.search(r"[wax+]", v) for v in vals)
+
+    drops = re.search(r"""(?:!=|\bnot\s+in|\.pop\(|\bdel\s+[\w.]+\[|unsetenv\()\s*['"]""" + PROJECT_VAR, code)
+    sets = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Dict):
+            for k, v in zip(node.keys, node.values):
+                if isinstance(k, ast.Constant) and k.value == PROJECT_VAR:
+                    sets = {"value": (ev(v) or [UNKNOWN])[0]}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        q, a = qual(node.func), node.args
+        last = q.rsplit(".", 1)[-1]
+        kw = {k.arg: k.value for k in node.keywords if k.arg}
+        method = isinstance(node.func, ast.Attribute)
+        recv = node.func.value if method else None
+        module_call = not q.startswith(".") and "." in q and q.split(".")[0] in (
+            "os", "shutil", "io", "codecs", "gzip", "bz2", "lzma", "tarfile", "zipfile", "pathlib", "builtins",
+            "subprocess", "asyncio", "pty", "runpy", "importlib", "sys", "tempfile", "glob", "json")
+        if q in ("open", "io.open", "codecs.open", "gzip.open", "bz2.open", "lzma.open", "tarfile.open",
+                 "builtins.open", "zipfile.ZipFile"):
+            path = a[0] if a else kw.get("file") or kw.get("name") or kw.get("filename")
+            mode = a[1] if len(a) > 1 else kw.get("mode")
+            target(path, "write" if opens_for_writing(mode) else "read")
+        elif q == "os.open" and a:
+            target(a[0], "write" if len(a) < 2 or re.search(r"O_(WRONLY|RDWR|CREAT|TRUNC|APPEND)",
+                                                            ast.dump(a[1])) else "read")
+        elif method and last == "open" and not module_call:  # Path(...).open(mode)
+            mode = a[0] if a else kw.get("mode")
+            target(recv, "write" if opens_for_writing(mode) else "read")
+        elif q in ("os.remove", "os.unlink", "os.rmdir", "os.removedirs", "os.mkdir", "os.makedirs", "os.truncate",
+                   "shutil.rmtree", "os.mkfifo") and (a or kw.get("path")):
+            target(a[0] if a else kw["path"], "write")
+        elif q in ("os.rename", "os.replace", "os.renames", "shutil.move") and len(a) >= 2:
+            target(a[0], "write")
+            target(a[1], "write")
+        elif q in ("shutil.copy", "shutil.copy2", "shutil.copyfile", "shutil.copytree", "shutil.copymode",
+                   "shutil.copystat", "os.link", "os.symlink", "shutil.unpack_archive") and len(a) >= 2:
+            target(a[0], "read")
+            target(a[1], "write")
+        elif method and not module_call and last in ("write_text", "write_bytes", "touch", "unlink", "mkdir",
+                                                       "rmdir", "symlink_to", "hardlink_to"):
+            target(recv, "write")
+        elif method and not module_call and (last == "rename" or (last == "replace" and len(a) == 1
+                                                                 and not node.keywords)):
+            target(recv, "write")
+            target(a[0] if a else None, "write")
+        elif method and not module_call and last in ("read_text", "read_bytes"):
+            target(recv, "read")
+        elif q in ("runpy.run_path", "importlib.util.spec_from_file_location",
+                   "importlib.machinery.SourceFileLoader") and a:
+            target(a[-1] if len(a) <= 2 else a[1], "read")
+        elif q in ("sys.path.insert", "sys.path.append") and a:
+            target(a[-1], "read")  # importing from a folder reads it
+        elif q in PY_SPAWNS or q.startswith(("os.exec", "os.spawn")):
+            if q.startswith("os.exec") or q.startswith("os.spawn"):
+                argv = a[2:] if q.startswith("os.spawn") else a[1:]
+                cmd = argv[0] if len(argv) == 1 and isinstance(argv[0], (ast.List, ast.Tuple, ast.Name)) else \
+                    ast.List(elts=list(argv), ctx=ast.Load())
+            else:
+                cmd = a[0] if a else kw.get("args")
+            if last == "create_subprocess_exec":
+                cmd = ast.List(elts=list(a), ctx=ast.Load())
+            if isinstance(cmd, ast.Name) and cmd.id in lists:
+                cmd = lists[cmd.id]
+            shell = last in ("system", "popen", "getoutput", "getstatusoutput", "create_subprocess_shell") or (
+                isinstance(kw.get("shell"), ast.Constant) and kw["shell"].value)
+            if isinstance(cmd, (ast.List, ast.Tuple)):
+                words = [UNKNOWN if isinstance(e, ast.Starred) else (ev(e) or [UNKNOWN])[0] for e in cmd.elts]
+                line = " ".join(shlex.quote(w) for w in words) if words else None
+            else:
+                v = ev(cmd)
+                line = (v[0] if shell else shlex.quote(v[0])) if v else None
+            if not line:
+                facts["unsure_spawn"] = True
+                continue
+            project = None  # the session's own, inherited
+            if "env" in kw or re.search(r"""os\.environ\.pop\(\s*['"]""" + PROJECT_VAR + "|unsetenv", code):
+                project = sets.get("value", "") if (sets or drops) else None
+            cwd = ev(kw.get("cwd"))
+            facts["spawns"].append({"cmd": line, "cwd": cwd[0] if cwd else None, "project": project})
+    return facts
+
+
+PY_SPAWNS = {"subprocess.run", "subprocess.call", "subprocess.check_call", "subprocess.check_output", "subprocess.Popen",
+             "subprocess.getoutput", "subprocess.getstatusoutput", "os.system", "os.popen", "pty.spawn",
+             "asyncio.create_subprocess_exec", "asyncio.create_subprocess_shell"}
+JS_WRITE_CALL = re.compile(
+    r"\b(?:(?:fs|fsp|fsPromises|promises)\.)?(writeFileSync|writeFile|appendFileSync|appendFile|createWriteStream|"
+    r"rmSync|rmdirSync|unlinkSync|mkdirSync|truncateSync|renameSync|copyFileSync|cpSync|symlinkSync|linkSync)\s*\(|"
+    r"\b(?:fs|fsp|fsPromises|promises)\.(rm|rmdir|unlink|mkdir|truncate|rename|copyFile|cp|symlink|link)\s*\(|"
+    r"\bDeno\.(writeTextFile|writeFile|remove|mkdir|rename|copyFile)\s*\(|\bBun\.(write)\s*\(")
+
+
+def js_code_facts(code):
+    """What inline JavaScript writes: the paths passed to the file system's writing calls (writeFileSync,
+    rmSync, renameSync's both paths, copyFileSync's destination, …), followed through simple constants,
+    template strings and path.join. {"writes", "unsure_write"}."""
+    facts = {"writes": [], "unsure_write": False, "unsure_spawn": True}
+
+    def args_at(i):
+        """The top-level arguments of the call whose '(' is just before i."""
+        out, depth, cur, q = [], 0, "", None
+        while i < len(code):
+            ch = code[i]
+            if q:
+                cur += ch
+                if ch == "\\" and i + 1 < len(code):
+                    cur += code[i + 1]
+                    i += 1
+                elif ch == q:
+                    q = None
+            elif ch in "'\"`":
+                q = ch
+                cur += ch
+            elif ch in "([{":
+                depth += 1
+                cur += ch
+            elif ch in ")]}":
+                if depth == 0:
+                    break
+                depth -= 1
+                cur += ch
+            elif ch == "," and depth == 0:
+                out.append(cur.strip())
+                cur = ""
+            else:
+                cur += ch
+            i += 1
+        return out + ([cur.strip()] if cur.strip() else [])
+
+    def ev(expr, d=0):
+        expr = expr.strip()
+        if d > 10 or not expr:
+            return None
+        m = re.fullmatch(r"""(['"])((?:\\.|(?!\1).)*)\1""", expr, re.S)
+        if m:
+            return [m.group(2)]
+        m = re.fullmatch(r"`([^`]*)`", expr, re.S)
+        if m:
+            return [re.sub(r"\$\{([^}]*)\}", lambda x: (ev(x.group(1), d + 1) or [UNKNOWN])[0], m.group(1))]
+        if re.fullmatch(r"[A-Za-z_$][\w$]*", expr):
+            vals = []
+            for dm in re.finditer(r"\b(?:const|let|var)\s+" + re.escape(expr) + r"\s*=\s*([^;\n]+)", code):
+                v = ev(dm.group(1), d + 1)
+                if v is None:
+                    return None
+                vals += v
+            return vals or None
+        m = re.fullmatch(r"(?:(?:path|posix|node:path)\.)?(?:join|resolve)\s*\((.*)\)", expr, re.S)
+        if m:
+            parts = [ev(x, d + 1) for x in args_at_text(m.group(1))]
+            if not parts or all(x is None for x in parts):
+                return None
+            out = [""]
+            for part in parts:
+                out = [b if b.startswith("/") or not a else a.rstrip("/") + "/" + b
+                       for a in out for b in (part or [UNKNOWN])][:16]
+            return out
+        if re.fullmatch(r"(?:os\.)?tmpdir\(\)", expr):
+            return [tempfile_dir()]
+        m = re.fullmatch(r"(?:fs\.)?mkdtempSync\((.*)\)", expr, re.S)
+        if m:
+            v = ev(m.group(1), d + 1)
+            return [x + "mktemp" for x in v] if v else [tempfile_dir() + "/mktemp"]
+        parts = split_plus(expr)
+        if len(parts) > 1:
+            vals = [ev(x, d + 1) for x in parts]
+            if all(x is None for x in vals):
+                return None
+            out = [""]
+            for v in vals:
+                out = [a + b for a in out for b in (v or [UNKNOWN])][:16]
+            return out
+        return None
+
+    def args_at_text(text):
+        nonlocal code
+        saved, code = code, text + ")"
+        try:
+            return args_at(0)
+        finally:
+            code = saved
+
+    def split_plus(expr):
+        parts, depth, cur, q = [], 0, "", None
+        for ch in expr:
+            if q:
+                q = None if ch == q else q
+            elif ch in "'\"`":
+                q = ch
+            elif ch in "([{":
+                depth += 1
+            elif ch in ")]}":
+                depth -= 1
+            elif ch == "+" and depth == 0:
+                parts.append(cur)
+                cur = ""
+                continue
+            cur += ch
+        return parts + [cur]
+
+    for m in JS_WRITE_CALL.finditer(code):
+        fn = next(g for g in m.groups() if g)
+        args = args_at(m.end())
+        two = re.match(r"(rename|copyFile|cp|symlink|link)", fn)
+        for k in ((0, 1) if fn.startswith("rename") else (1,) if two else (0,)):
+            vals = ev(args[k]) if k < len(args) else None
+            if vals is None:
+                facts["unsure_write"] = True
+            else:
+                facts["writes"] += vals
+    return facts
+
+
+def loop_value(items):
+    """A for loop's variable: one of the items, so its folder when they share one (`for f in tests/*.py`
+    → tests/…), else unknown."""
+    dirs = {os.path.dirname(x) for x in items}
+    return (dirs.pop() + "/" if dirs != {""} else "") + UNKNOWN if len(dirs) == 1 else None
 
 
 def _effects(cmd, cwd, env, eff, scripts, depth):
@@ -3243,15 +6076,38 @@ def _effects(cmd, cwd, env, eff, scripts, depth):
     for seg in segs:
         raw = list(seg["words"])
         words = [expand(w, env) for w in raw]
-        while words and ASSIGN.match(words[0]):
+        local = {}  # VAR=value before a command: that command's environment only
+        if len(words) > 1 and words[0] in ("for", "select") and re.match(r"^[A-Za-z_]\w*$", words[1]):
+            env[words[1]] = loop_value(words[3:] if words[2:3] == ["in"] else [])
+            continue
+        while words and (ASSIGN.match(words[0]) or words[0] in KEYWORDS):
+            if words[0] in KEYWORDS:  # `do d=$S/x; …`: the assignment after the keyword
+                words, raw = words[1:], raw[1:]
+                continue
             name, val = ASSIGN.match(words[0]).groups()
-            env[name] = os.path.join(tempfile_dir(), "mktemp") if "mktemp" in raw[0] else val
+            local[name] = os.path.join(tempfile_dir(), "mktemp") if "mktemp" in raw[0] else val
             words, raw = words[1:], raw[1:]
+        if words:
+            env.update({k: v for k, v in local.items() if k not in (PROJECT_VAR, "HOME")})
+        else:
+            env.update(local)  # a bare assignment stays for the commands after it
         while words and (words[0] in KEYWORDS or os.path.basename(words[0]) in PREFIX_CMDS):
             head = os.path.basename(words.pop(0))
             raw.pop(0)
             while words and (words[0].startswith("-") or ASSIGN.match(words[0]) or
                              (head == "timeout" and re.match(r"^\d+(\.\d+)?[smhd]?$", words[0]))):
+                if head == "env":  # env -u NAME, env -i, env NAME=value: the command's environment
+                    if words[0] in ("-u", "--unset") and len(words) > 1:
+                        local[words[1]] = None
+                        words, raw = words[1:], raw[1:]
+                    elif words[0].startswith(("--unset=", "-u")) and len(words[0]) > 2:
+                        local[words[0].split("=", 1)[-1] if "=" in words[0] else words[0][2:]] = None
+                    elif words[0] in ("-i", "--ignore-environment", "-"):
+                        local.update({PROJECT_VAR: None, "HOME": None})
+                    elif words[0] in ("-C", "--chdir", "-S", "--split-string") and len(words) > 1:
+                        words, raw = words[1:], raw[1:]
+                    elif ASSIGN.match(words[0]):
+                        local.update([ASSIGN.match(words[0]).groups()])
                 if head in ("sudo", "doas") and words[0] in ("-u", "-g", "-C"):
                     words, raw = words[1:], raw[1:]
                 words, raw = words[1:], raw[1:]
@@ -3261,6 +6117,8 @@ def _effects(cmd, cwd, env, eff, scripts, depth):
         if not words:
             continue
         eff["runs"].append(words)
+        project = local[PROJECT_VAR] if PROJECT_VAR in local else env.get(PROJECT_VAR, False)
+        eff["where"].append(None if project is False else cwd if project is None else resolve(project, cwd))
         name = os.path.basename(words[0]).lower()
         name = re.sub(r"\.(exe|cmd|bat|ps1)$", "", name)
         args = words[1:]
@@ -3268,6 +6126,15 @@ def _effects(cmd, cwd, env, eff, scripts, depth):
             target = next((a for a in args if not a.startswith("-")), None)
             if target and target != "-":
                 cwd = resolve(target, cwd)
+            continue
+        if name in ("export", "unset", "declare", "typeset") and args:
+            drop = name == "unset" or "-n" in args
+            for a in positionals(args):
+                m = ASSIGN.match(a)
+                if m and not drop:
+                    env[m.group(1)] = m.group(2)
+                elif not m and drop:
+                    env[a] = None
             continue
         if INTERPRETER.match(name):
             code_flags = {"-c"} if name.startswith(("py", "pypy")) else {"-r"} if name == "php" else \
@@ -3281,38 +6148,46 @@ def _effects(cmd, cwd, env, eff, scripts, depth):
                 if a.startswith("--eval="):
                     code = a.split("=", 1)[1]
                     break
+            lang = "python" if name.startswith(("py", "pypy")) else "js" if re.match(
+                r"^(node|nodejs|deno|bun|tsx|ts-node)$", name) else None
+            run = dict(env, **local)
             if code is not None:
-                _code_effects(code, cwd, eff)
-                if name == "perl" and any(re.match(r"^-\w*i", a) for a in args):
-                    eff["writes"] += [resolve(f, cwd) for f in files]  # perl -pi -e … files
-            for body in seg["heredocs"]:
-                _code_effects(body, cwd, eff)
+                unsure = _code_effects(code, cwd, eff, lang, run, scripts, depth)
+                if unsure or (name == "perl" and any(re.match(r"^-\w*i", a) for a in args)):
+                    eff["writes"] += [resolve(f, cwd) for f in files]  # perl -pi -e … files; open(sys.argv[1], "w")
             script = next((a for a in positionals(args, ("-m", "-W", "-X", "--input-type", "-r", "--require",
                                                           "--import", "--loader"))
                            if a != "-"), None) if code is None else None
-            if script:
+            if code is None and not script and "-m" not in args:  # `python3 - <<EOF`: the heredoc is the code
+                for body in seg["heredocs"]:
+                    _code_effects(body, cwd, eff, lang, run, scripts, depth)
+            if script:  # a heredoc here is the script's input: data
                 sp = resolve(script, cwd)
                 body = scripts.get(sp)
-                if body is None and agent_script(sp, cwd):
+                if body is None and agent_script(sp, cwd, eff.get("home")):
                     body = read(sp)
-                if body:
-                    _code_effects(body, cwd, eff)
+                if body and _code_effects(body, cwd, eff, lang, run, scripts, depth):
+                    rest = args[args.index(script) + 1:] if script in args else []
+                    eff["writes"] += [resolve(f, cwd) for f in positionals(rest)]  # it may write its arguments
             continue
         if SHELL_CMD.match(name):
+            script = None
             for k, a in enumerate(args):
                 if a in ("-c", "-Command", "-command") and k + 1 < len(args):
-                    _effects(args[k + 1], cwd, dict(env), eff, scripts, depth + 1)
+                    script = True
+                    _effects(args[k + 1], cwd, dict(env, **local), eff, scripts, depth + 1)
                     break
             else:
-                script = next(iter(positionals(args)), None)
+                script = None if "-s" in args else next(iter(positionals(args)), None)
                 sp = resolve(script, cwd) if script else None
                 body = scripts.get(sp) if sp else None
-                if sp and body is None and agent_script(sp, cwd):
+                if sp and body is None and agent_script(sp, cwd, eff.get("home")):
                     body = read(sp)
                 if body:
-                    _effects(body, cwd, dict(env), eff, scripts, depth + 1)
-            for body in seg["heredocs"]:
-                _effects(body, cwd, dict(env), eff, scripts, depth + 1)
+                    _effects(body, cwd, dict(env, **local), eff, scripts, depth + 1)
+            if not script:  # `bash <<EOF`: the heredoc is the script; after a script or -c it's input
+                for body in seg["heredocs"]:
+                    _effects(body, cwd, dict(env, **local), eff, scripts, depth + 1)
             continue
         if name == "eval":
             _effects(" ".join(args), cwd, env, eff, scripts, depth + 1)
@@ -3398,18 +6273,24 @@ def _effects(cmd, cwd, env, eff, scripts, depth):
             eff["reads"] += [resolve(x, cwd) for x in pos]
 
 
+UNKNOWN_VAR = re.compile(r"\$\{[^}]*\}|\$\([^)]*\)|\$[\w@*#?!$-]+")  # a variable or substitution left unexpanded
+
+
 def under(root, paths, globs):
     """The paths (absolute, from shell_effects) that fall under the globs, or are folders holding
     something that does, as project-relative paths. A path with an unknown variable is judged by
-    what follows the variable."""
+    what follows each variable (`$S/tests/$f` as tests/…). Nothing, or only a glob, after the last
+    variable (`$S/$f`, `$D/*.log`) leaves that part unknown: it never stands for the project folder."""
     hits, folders = [], prefixes(globs)
     for ap in paths:
         cands = [ap]
         if "$" in ap:
-            tail = re.split(r"\$\{?\w+\}?/?", ap)[-1]
-            cands.append(tail)
+            for tail in UNKNOWN_VAR.split(ap)[1:]:
+                tail = re.sub(r"^(\./|/)+", "", tail)
+                if tail.strip("*?/."):
+                    cands.append(tail)
         for c in cands:
-            rel = rel_to_root(root, c) if os.path.isabs(c) else c.lstrip("./") or "."
+            rel = rel_to_root(root, c)
             if rel is None:
                 continue
             if rel == "." or matches(rel, globs) or matches(rel.rstrip("/") + "/x", globs) or any(f.startswith(rel.rstrip("/") + "/") for f in folders) or (
@@ -3429,25 +6310,72 @@ def in_project(root, paths, allowed=()):
     return out
 
 
-def runs_cli(eff, *subcommand):
-    """Does the command run `regista.py <subcommand…>`, from the shell or from inline code?"""
-    for words in eff["runs"]:
+def works_here(root, where):
+    """Does a command that runs in the folder `where` work on this project (and not on another
+    repository or a scratch project)? None: the session's own project."""
+    return where is None or (rel_to_root(root, where) is not None and find_root(where) in (None, root))
+
+
+def runs_cli(eff, *subcommand, root=None):
+    """Does the command run `regista.py <subcommand…>`, from the shell or from inline code? With root,
+    only runs that work on that project count: the CLI works on CLAUDE_PROJECT_DIR when the command
+    keeps the session's, else on the folder it runs in."""
+    where = eff.get("where") or []
+    for i, words in enumerate(eff["runs"]):
+        if root and i < len(where) and not works_here(root, where[i]):
+            continue
         for k, w in enumerate(words):
             if w.replace("\\", "/").endswith(("regista.py", "scripts/regista")) and all(s in words[k + 1:] for s in subcommand):
                 return True
-    return any(SPAWN_API.search(c) and "regista.py" in c and all(s in c for s in subcommand) for c in eff["code"])
+    # Inline code whose processes couldn't be read: the CLI's name and each subcommand as a word in it.
+    return any(SPAWN_API.search(c) and "regista.py" in c and all(
+        re.search(r"(?<=['\"\s,\[])" + re.escape(s) + r"(?=['\"\s,\]])", c) for s in subcommand)
+        for c in eff.get("opaque", eff["code"]))
+
+
+CLAUDE_TOOLS = ("plugin", "plugins", "mcp", "agents", "doctor")  # `claude <these>` manage the install, no session
+
+
+def starts_session(words):
+    """Do these words start a Claude Code or Codex session? `claude plugin validate`, `claude mcp list`,
+    `claude --version` and the like don't."""
+    name = re.sub(r"\.(exe|cmd|ps1)$", "", os.path.basename(words[0].replace("\\", "/")).lower())
+    if name not in ("claude", "codex") or any(re.match(r"^--?(version|help|v|V|h)$", a) for a in words[1:]):
+        return False
+    return not (name == "claude" and len(words) > 1 and words[1] in CLAUDE_TOOLS)
+
+
+SESSION_IN_CODE = re.compile(r"""(?:[\[(=]\s*|\bwhich\(\s*|^\s*)(['"`])((?:[^'"`\s]*/)?(?:claude|codex)(?:\.exe)?)\1"""
+                             r"""(?:\s*,\s*(['"`])([^'"`]*)\3)?|(['"`])((?:[^'"`\s]*/)?(?:claude|codex)(?:\.exe)?\s[^'"`]*)\5""",
+                             re.M)
+
+
+def opens_session(eff):
+    """Does the command run `regista.py open …` (a new session for the user), from the shell or inline code?"""
+    for words in eff["runs"]:
+        for k, w in enumerate(words):
+            if w.replace("\\", "/").endswith(("regista.py", "scripts/regista")) and words[k + 1:k + 2] == ["open"]:
+                return True
+    return any(SPAWN_API.search(c) and re.search(r"""regista\.py['"]?(\s*,\s*|\s+)['"]?open\b""", c) for c in eff["code"])
 
 
 def nested_agent(eff):
     """Starting Claude Code or Codex from the shell or from inline code: it would run outside the role."""
     for words in eff["runs"]:
         name = re.sub(r"\.(exe|cmd|ps1)$", "", os.path.basename(words[0].replace("\\", "/")).lower())
-        if name in ("claude", "codex") and not any(re.match(r"^--?(version|help|V|h)$", a) for a in words[1:]):
+        if starts_session(words):
             return True
         if name in ("npx", "pnpx", "bunx") and any(re.match(r"^@(openai/codex|anthropic-ai/claude-code)\b", a)
                                                    for a in words[1:]):
             return True
-    return any(SPAWN_API.search(c) and re.search(r"""['"`](?:\S*/)?(claude|codex)['"` ]""", c) for c in eff["code"])
+    # Inline code whose processes couldn't be read: the program as a list's first item or a command line.
+    for c in eff.get("opaque", eff["code"]):
+        if SPAWN_API.search(c):
+            for m in SESSION_IN_CODE.finditer(c):
+                words = [m.group(2)] + ([m.group(4)] if m.group(4) else []) if m.group(2) else m.group(6).split()
+                if starts_session(words):
+                    return True
+    return False
 
 
 def commit_no_verify(args):
@@ -3512,6 +6440,41 @@ def protected_hits(root, cfg, paths):
     return sorted(set(hits + under(root, paths, rel_globs)))
 
 
+APPROVE = re.compile(r"^\s*(yes|y|yep|ok|okay|sure|allow|let (it|them)|approve[ds]?|go ahead|do it|da)\b", re.I)
+
+
+def allow_refusal(root, data, eff):
+    """`fleet allow <worker>` passes the user's OK to a worker, so the overseer runs it only right after the user
+    typed it: in the overseer's transcript, the user's latest message says yes, came after the worker asked, and
+    answers a question about that worker (it or the overseer's message before it names the worker). Returns the
+    refusal, or None (also when nothing waits: the command says so itself)."""
+    names = [words[k + 3] for words in eff["runs"] for k, x in enumerate(words)
+             if x.replace("\\", "/").endswith(("regista.py", "scripts/regista"))
+             and words[k + 1:k + 3] == ["fleet", "allow"] and len(words) > k + 3]
+    if not names:
+        return f"{DISPLAY_NAME}: run it as `{PY} \"{DD}\" fleet allow <worker>`, on its own."
+    name = names[0]
+    w = load_workers(root).get(name)
+    pend = worker_pending(root, w) if w else None
+    if not pend:
+        return None
+    ask_user = (f"Ask the user, in plain words, whether {name} may go ahead ({pend.get('reason', '')}), and run this "
+                "only after they reply yes.")
+    said = transcript_messages(data.get("transcript_path"))
+    person = [k for k, m in enumerate(said) if m[0] == "person"]
+    if not person:
+        return f"{DISPLAY_NAME}: only the user can approve what a worker asks, and this session has no reply from them. {ask_user}"
+    _, text, at, _ = said[person[-1]]
+    before = next((m[1] for m in reversed(said[:person[-1]]) if m[0] == "assistant"), "")
+    when = iso_epoch(at)
+    if not APPROVE.match(text) or when is None or when < pend.get("at", 0):
+        return f"{DISPLAY_NAME}: the user's latest message isn't a yes to what {name} asked. {ask_user}"
+    if name.lower() not in text.lower() and name.lower() not in before.lower():
+        return (f"{DISPLAY_NAME}: the user's yes doesn't answer a question about {name}: neither it nor your message "
+                f"before it names {name}. {ask_user}")
+    return None
+
+
 def fleet_guard(root, cfg, data):
     """Only the overseer (the main session in the project folder) starts, merges and stops workers; it
     alone deploys and pushes while it has workers. Notes who the overseer is, for the workers."""
@@ -3523,14 +6486,45 @@ def fleet_guard(root, cfg, data):
         if (w or role != "main") and any(runs_cli(eff, "fleet", x) for x in FLEET_WRITES):
             deny(f"{DISPLAY_NAME}: only the overseer starts, merges and stops workers." +
                  (" Tell it what you need (SendMessage)." if w else " Report what you need to the orchestrator."))
+        if role != "main" and runs_cli(eff, "fleet", "sync"):
+            deny(f"{DISPLAY_NAME}: the worker's own session brings the project's work into its branch (`regista.py fleet "
+                 "sync`), not its agents. Report what you need to the orchestrator.")
         if role == "main" and not w:
             os.makedirs(fleet_dir(root), exist_ok=True)
             save_json(os.path.join(fleet_dir(root), "overseer.json"),
                       {"session_id": data.get("session_id", ""), "permission_mode": data.get("permission_mode", ""),
                        "at": now_iso()})
-    if w and (runs_cli(eff, "deploy") or any(g["sub"] == "push" for g in eff["git"])):
-        deny(f"{DISPLAY_NAME}: a worker doesn't push or deploy: the overseer does, after merging your branch. Tell it when "
+        if runs_cli(eff, "fleet", "allow"):
+            why = allow_refusal(root, data, eff)
+            if why:
+                deny(why)
+    if w and (runs_cli(eff, "deploy") or runs_cli(eff, "release") or any(g["sub"] == "push" for g in eff["git"])):
+        deny(f"{DISPLAY_NAME}: a worker doesn't push, deploy or release: the overseer does, after merging your branch. Tell it when "
              "your work is ready.")
+
+
+def plan_guard(root, cfg, data):
+    """The plan is the overseer's (or the orchestrator's): a worker's sessions and agents don't edit it, since
+    the commit hook ticks a worker's steps on its branch and the overseer's merge carries the ticks over;
+    and agents don't run the plan command. Returns a refusal reason or None."""
+    role, tool = role_of(data, root), data.get("tool_name", "")
+    eff = effects_of(root, data)
+    if eff and (runs_cli(eff, "plan", "tick") or runs_cli(eff, "plan", "add-milestone")):
+        if worker_info(root):
+            return (f"{DISPLAY_NAME}: the plan is the overseer's, so a worker doesn't change it. Your steps are ticked "
+                    "when you commit them; for anything else in the plan, tell the overseer (SendMessage).")
+        if role != "main":
+            return f"{DISPLAY_NAME}: only the orchestrator changes the plan. Report back what it should change."
+    if not worker_info(root):
+        return None
+    plan = plan_rel(root, cfg)
+    rel = tool_path(root, data.get("tool_input") or {}) if tool in EDIT_TOOLS else None
+    # a command on the whole folder (`git checkout -- .`) isn't an edit of the plan
+    if rel == plan or (eff and [x for x in under(root, eff["writes"], [plan]) if x not in (".", "./")]):
+        return (f"{DISPLAY_NAME}: a worker doesn't edit the plan ({plan}): it's the overseer's. The harness ticks your "
+                "step in your branch's plan when you commit it, and the overseer's merge carries the tick over. For "
+                "anything else in the plan (a new step, a changed gate), tell the overseer (SendMessage).")
+    return None
 
 
 def hook_pre_bash(root, cfg, data):
@@ -3543,6 +6537,13 @@ def hook_pre_bash(root, cfg, data):
     if runs_deploy_command(cfg, effects_of(root, data)):
         deny(f"{DISPLAY_NAME}: deploy with `{PY} \"{DD}\" deploy`: it ships the commit and then runs the live checks, "
              "so a deploy that serves something else than the repository gets caught.")
+    gate = runs_gate_command(root, cfg, effects_of(root, data))
+    if gate:
+        deny(f"{DISPLAY_NAME}: this runs the '{gate['name']}' gate's command directly, outside the harness's gate lock, "
+             "so it could run at the same time as another gate run and share its test database or ports. Run it "
+             f"through the harness instead: `{PY} \"{DD}\" gate {gate['name']}`. It waits its turn, reuses a pass on "
+             "exactly these files (add --fresh to run it again anyway) and prints the last lines of a failure.")
+    release_guard(root, cfg, data)
     for g in eff["git"]:
         if g["sub"] == "commit":
             if rel_to_root(root, g["cwd"]) is None or find_root(g["cwd"]) not in (None, root):
@@ -3555,6 +6556,13 @@ def hook_pre_bash(root, cfg, data):
                 deny(f"{DISPLAY_NAME}: pushing is disabled for this project (config push=block). Ask the user to push.")
             if cfg["push"] == "ask":
                 ask(f"{DISPLAY_NAME}: pushes need the user's go-ahead.")
+    if gh_publishes(effects_of(root, data)):
+        if cfg["push"] == "block":
+            deny(f"{DISPLAY_NAME}: this publishes on GitHub, and pushing is disabled for this project (config push=block). "
+                 "Ask the user to do it.")
+        if cfg["push"] == "ask":
+            ask(f"{DISPLAY_NAME}: merging a pull request or publishing a release on GitHub goes out like a push, so it "
+                "needs the user's go-ahead.")
 
 
 def commit_check(root, cfg):
@@ -3569,7 +6577,10 @@ def commit_check(root, cfg):
     gates = [] if harness_only(root, cfg, files) else select_gates(cfg, event="commit", files=files)
     results = []
     if gates:
-        results = run_gates(root, cfg, gates, budget=HOOK_GATE_BUDGET)
+        results = run_gates(root, cfg, scope_e2e_gates(root, cfg, gates, files), budget=HOOK_GATE_BUDGET)
+        over = budget_note(cfg, gates, results)
+        if over:
+            HOOK_CTX.setdefault("notes", []).append(f"{DISPLAY_NAME}: {over}")
         failed = [r for r in results if r["status"] == "fail"]
         if failed:
             tails = "\n\n".join(f"[{r['name']}]\n{r.get('tail', '')}" for r in failed)
@@ -3580,7 +6591,8 @@ def commit_check(root, cfg):
         deny(why)
     if results:
         record_requirements(root, cfg, results)
-    loose = config_loosened(root, cfg)
+    HOOK_CTX.setdefault("notes", []).extend(tick_committed_steps(root, cfg, files))
+    loose = config_loosened(root, cfg) + tests_removed(root, cfg)
     if loose:
         ask(f"{DISPLAY_NAME}: this commit loosens the harness's checks compared with the last commit: " + "; ".join(loose)
             + ". That needs the user's OK, whichever way the config was changed.")
@@ -3682,9 +6694,14 @@ def hook_user_prompt(root, cfg, data):
         if re.match(r"\s*[$/]?" + TYPED_SLUG + r":(verify|change)\b", prompt, re.I):
             notes += record_typed(root, cfg, re.sub(r"^\s*(" + TYPED_SLUG + ":)", r"$\1", prompt, flags=re.I),
                                   "user (typed in Codex)")
-        reply = user_reply_to_ask(root, data)
+    prompt = data.get("prompt") or ""
+    reply = None
+    if HOST["name"] == "codex" or (worker_info(root) and person_prompt(prompt)):
+        reply = user_reply_to_ask(root, data)  # in a Claude Code worker, too: its asks wait for a typed yes
         if reply:
             notes.append(reply)
+    if not reply and (HOST["name"] == "codex" or person_prompt(prompt)):
+        notes += ok_reply_typed(root, cfg, data, prompt)
     pct, _ = context_pct(cfg, data)
     if pct is not None and pct >= pause_at(cfg):
         st = ctx_state(root, data.get("session_id", ""))
@@ -3745,6 +6762,8 @@ def hook_stop(root, cfg, data):
         nudge = run_nudge(root, cfg, data)
         if nudge and nudge.get("decision") == "block":
             emit(nudge)
+        if waits_on_agents(root, data):
+            return  # still working: its agents' notices wake it, and the overseer hears when it really pauses
         tell = worker_tell(root, data, during_run=False, extra=(nudge or {}).get("systemMessage", ""))
         if tell or nudge:
             emit(tell or nudge)
@@ -3752,7 +6771,7 @@ def hook_stop(root, cfg, data):
     nudge = run_nudge(root, cfg, data)
     if nudge:
         emit(nudge)
-    if again or cfg["stop"] == "off":
+    if again or cfg["stop"] == "off" or waits_on_agents(root, data):
         return
     unsaved = unsaved_commits(root, cfg)
     if not unsaved:
@@ -3770,15 +6789,20 @@ def hook_session_start(root, cfg, data):
     seen[HOST["name"]] = dt.datetime.now().isoformat(timespec="seconds")
     save_json(hosts_seen_path(root), seen)
     text = resume_text(root, cfg)
+    longs = detached_text(root, cfg, collect=True)
+    if longs:
+        text += "\n\n" + longs
     src = data.get("source", "startup")
     if src == "compact":
         lead = (f"{DISPLAY_NAME}: the context was compacted to stay under {cfg['context']['limit_pct']}% of the window. "
                 "Re-read the saved state below, check it against git, and carry on with the task you were doing. "
                 "The user doesn't need to clear or resume anything.\n\n")
     else:
-        lead = (f"This project runs on the {DISPLAY_NAME} harness. Before other work, reply with three lines: "
-                "Where we are / Next / Blocked on, from the state below (verify against git if they disagree), "
-                "unless the user already gave a command.\n\n")
+        lead = (f"This project runs on the {DISPLAY_NAME} harness. Before other work, unless the user already gave a "
+                "command, tell them where things stand from the state below (check it against git if they disagree), "
+                "written for a person coming back to it cold: what's done, what's next, and what needs them, a "
+                "sentence or two each in plain words. Milestone codes, commit hashes and dated gate results go in a "
+                "short Details line at the end, only if they help.\n\n")
     if worker_info(root):
         lead = worker_note(root, cfg) + "\n\n" + lead
     elif load_workers(root):
@@ -3819,26 +6843,54 @@ def agents_dir(root):
     return harness_path(root, "agents")
 
 
+AGENT_STALE = 2 * 3600  # seconds: an agent that started longer ago and never reported finishing no longer counts
+
+
 def hook_subagent_start(root, cfg, data):
+    """Every agent's start is recorded (with the session that started it), so a build-all run knows its
+    session is waiting on agents; ours also get their role's rules."""
     role = role_of(data, root)
+    save_json(os.path.join(agents_dir(root), f"{data.get('agent_id', 'unknown')}.json"),
+              {"role": role, "type": data.get("agent_type") or "", "session": data.get("session_id") or "",
+               "started": time.time()})
     if role not in ROLES:
         return
-    save_json(os.path.join(agents_dir(root), f"{data.get('agent_id', 'unknown')}.json"),
-              {"role": role, "started": time.time()})
     emit_context("SubagentStart", agent_note(root, cfg, role))
 
 
 def hook_subagent_stop(root, cfg, data):
-    """A reviewer can't finish without recording a verdict (once: stop_hook_active ends the loop)."""
-    if role_of(data, root) != "reviewer" or data.get("stop_hook_active"):
-        return
-    st = load_json(os.path.join(agents_dir(root), f"{data.get('agent_id', 'unknown')}.json"), {})
-    started = st.get("started", 0)
-    recorded = [f for f in glob.glob(harness_path(root, "reviews", "*.json"))
-                if os.path.basename(f) != "draft.json" and os.path.getmtime(f) > started]
-    if not recorded:
-        emit({"decision": "block", "reason": f"{DISPLAY_NAME}: record your verdict before finishing: write {review_draft(root)} "
-                                              f"and run `{PY} \"{DD}\" review-record`."})
+    """A reviewer can't finish without recording a verdict (once: stop_hook_active ends the loop).
+    Every agent that finishes is recorded as finished."""
+    path = os.path.join(agents_dir(root), f"{data.get('agent_id', 'unknown')}.json")
+    st = load_json(path, {})
+    if role_of(data, root) == "reviewer" and not data.get("stop_hook_active"):
+        started = st.get("started", 0)
+        recorded = [f for f in glob.glob(harness_path(root, "reviews", "*.json"))
+                    if os.path.basename(f) != "draft.json" and os.path.getmtime(f) > started]
+        if not recorded:
+            emit({"decision": "block", "reason": f"{DISPLAY_NAME}: record your verdict before finishing: write {review_draft(root)} "
+                                                  f"and run `{PY} \"{DD}\" review-record`."})
+    if data.get("agent_id"):
+        save_json(path, {**st, "finished": time.time()})
+
+
+def agents_running(root, data):
+    """The agents this session started that haven't finished: their start is recorded, their finish isn't,
+    and they started less than AGENT_STALE ago (an agent that was killed never reports finishing)."""
+    session = data.get("session_id") or ""
+    if not session:
+        return []
+    now, out = time.time(), []
+    for f in glob.glob(os.path.join(agents_dir(root), "*.json")):
+        try:
+            if now - os.path.getmtime(f) > AGENT_STALE:
+                continue
+        except OSError:
+            continue
+        st = load_json(f, {})
+        if st.get("session") == session and not st.get("finished") and now - st.get("started", 0) <= AGENT_STALE:
+            out.append(st.get("type") or st.get("role") or "an agent")
+    return out
 
 
 def hook(event):
@@ -3881,6 +6933,13 @@ SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "env", "__pycache__", "dis
 WEB_DEPS = ("next", "react", "vue", "svelte", "@sveltejs/kit", "vite", "express", "fastify", "nuxt", "astro",
             "@remix-run/react", "hono", "koa", "@angular/core")
 PY_WEB = ("fastapi", "flask", "django", "starlette", "streamlit", "gradio")
+# Database servers the tests may share between worktrees (an SQLite file lives in each worktree: not listed).
+DB_DEPS = {"pg": "PostgreSQL", "postgres": "PostgreSQL", "pg-promise": "PostgreSQL", "mysql": "MySQL",
+           "mysql2": "MySQL", "mongodb": "MongoDB", "mongoose": "MongoDB", "@prisma/client": "a database",
+           "knex": "a database", "sequelize": "a database", "typeorm": "a database", "redis": "Redis", "ioredis": "Redis"}
+PY_DB = {"psycopg": "PostgreSQL", "psycopg2": "PostgreSQL", "asyncpg": "PostgreSQL", "pymysql": "MySQL",
+         "mysqlclient": "MySQL", "pymongo": "MongoDB", "motor": "MongoDB", "sqlalchemy": "a database",
+         "django": "a database", "redis": "Redis"}
 SECRETS = [".env", ".env.local", ".env.*.local", ".env.production", "*.pem", "*.key", "**/secrets/**"]
 
 
@@ -3904,7 +6963,7 @@ def detect(root):
     text = lambda rel: read(p(root, rel), 200_000)  # noqa: E731
     stack, gates, notes, src, tests_globs = [], [], [], [], list(DEFAULTS["roles"]["tests"])
     kind = "unknown"
-    pm = None
+    pm, db = None, None
 
     if "package.json" in has:
         try:
@@ -3939,6 +6998,14 @@ def detect(root):
         elif any(re.fullmatch(r"cypress\.config\.(ts|js|mjs|cjs)", f) for f in has):
             gates.append({"name": "e2e", "run": "npx cypress run", "when": ["commit"], "timeout": 1200,
                           "evidence": "e2e", "tests": ["cypress/e2e/**"]})
+        else:  # the project's own end-to-end script
+            e2e = next((k for k in ("e2e", "test:e2e", "test-e2e") if scripts.get(k)), None)
+            if e2e:
+                tdir = next((d for d in ("tests/e2e", "test/e2e", "e2e") if any(f.startswith(d + "/") for f in files)),
+                            "tests/e2e")
+                gates.append({"name": "e2e", "run": f"{pm} run {e2e}", "when": ["commit"], "timeout": 1200,
+                              "evidence": "e2e", "tests": [f"{tdir}/**"]})
+        db = next((DB_DEPS[d] for d in deps if d in DB_DEPS), db)
         src += [f"{d}/**" for d in ("src", "app", "pages", "components", "lib", "server", "api", "routes")
                 if d in top]
 
@@ -3951,6 +7018,7 @@ def detect(root):
         plain = f"{PY} -m "
         runner = "uv run " if "uv.lock" in has else "poetry run " if "poetry.lock" in has else plain
         stack.append("Python" + (" (uv)" if runner == "uv run " else " (poetry)" if runner == "poetry run " else ""))
+        db = db or next((v for k, v in PY_DB.items() if re.search(r"(?<![\w-])" + re.escape(k) + r"(?!\w)", alldeps)), None)
         if any(w in alldeps for w in PY_WEB):
             kind = "web app" if kind == "unknown" else kind
         elif "[project.scripts]" in pyproject or "console_scripts" in alldeps:
@@ -4004,12 +7072,26 @@ def detect(root):
                                            "command on sample input.",
                       }.get(kind, "No end-to-end check yet: Milestone 0 adds one that runs the real program the "
                                   "way a user would."))
+    elif db:
+        notes.append(worker_database_note(root, db))
     return {"stack": stack or ["none yet"], "kind": kind, "package_manager": pm, "gates": gates,
             "roles": {"source": sorted(set(src)) or ["src/**"], "tests": tests_globs},
             "review": {"required_for": sorted(set(src)) or ["src/**"]},
             "fleet": {"setup": worktree_setup(root)},
             "protected": SECRETS, "test_files": len(test_files), "notes": notes,
             "git": os.path.isdir(os.path.join(root, ".git"))}
+
+
+def worker_database_note(root, db):
+    """The proposal for an end-to-end gate that uses a database server: one database per worker, so workers
+    building side by side don't reset each other's data and their gate runs needn't take turns."""
+    name = re.sub(r"[^a-z0-9]+", "_", os.path.basename(root).lower()).strip("_") or "app"
+    return (f"The end-to-end tests use {db}. When workers build side by side they would share one test database, "
+            "so their gate runs take turns, and anything else that runs the tests could reset it under another "
+            f"run. Give each worker its own: have the tests' setup name the database after {ENV_PREFIX}SLOT, "
+            f"which the harness sets for gate runs (0 in the project folder, 1, 2, … in the workers), for "
+            f"example `{name}_test_${{{ENV_PREFIX}SLOT:-0}}`, and create it when it's missing. Then set "
+            "fleet.isolated_gates to true in the config, and the workers' gate runs no longer wait for each other.")
 
 
 def worktree_setup(root):
@@ -4161,6 +7243,43 @@ def old_plugin_warning(root):
               for host, name in found if host == "codex"]
     return (f"both {DISPLAY_NAME} and {OLD_DISPLAY_NAME} (its old name) are enabled; uninstall {OLD_DISPLAY_NAME}: "
             + "; ".join(fixes) + ".")
+
+
+MARKETPLACE = "ciprianrosca/regista"  # where the plugin is published (README: Install)
+
+
+def plugin_swap_text(root):
+    """When the old plugin is still enabled: the exact commands that swap it for this one, in Claude Code and in
+    Codex, for the user to run in a terminal. Else ""."""
+    claude, scope = {}, {}
+    for path, where in ((os.path.join(os.path.expanduser("~"), ".claude", "settings.json"), ""),
+                        (os.path.join(root, ".claude", "settings.json"), " --scope project"),
+                        (os.path.join(root, ".claude", "settings.local.json"), " --scope local")):
+        settings = load_json(path, {})
+        plugins = settings.get("enabledPlugins") if isinstance(settings, dict) else None
+        for k, v in (plugins.items() if isinstance(plugins, dict) else []):
+            if k.startswith((OLD_SLUG + "@", SLUG + "@")):  # as in Claude Code, the most specific file wins
+                claude[k], scope[k] = v, where
+    found = old_plugin_enabled(root)
+    if not found:
+        return ""
+    cmds = []
+    olds = [name for host, name in found if host == "claude"]
+    if olds:
+        cmds += [f"claude plugin uninstall {name}{scope.get(name, '')}" for name in olds]
+        if not any(k.startswith(SLUG + "@") and v is True for k, v in claude.items()):
+            cmds += [f"claude plugin marketplace add {MARKETPLACE}", f"claude plugin install {SLUG}@{SLUG}"]
+    codex = [name for host, name in found if host == "codex"]
+    config = os.path.join(codex_home(), "config.toml")
+    if codex and not codex_plugins(read(config), SLUG):
+        cmds += [f"codex plugin marketplace add {MARKETPLACE}", f"codex plugin add {SLUG}@{SLUG}"]
+    lines = [f"{OLD_DISPLAY_NAME}, the old plugin, is still enabled. Swap it for {DISPLAY_NAME} by running these in a "
+             "terminal, then start a new session:"] + [f"  {c}" for c in cmds]
+    if codex:
+        lines.append(f"In Codex, also remove the [plugins.\"{codex[0]}\"] table from {config}"
+                     + (f" (and those of {', '.join(codex[1:])})" if codex[1:] else "")
+                     + ", then trust the new hooks in /hooks.")
+    return "\n".join(lines)
 
 
 def codex_wanted(root):
@@ -4355,6 +7474,27 @@ def doctor_codex(root, cfg):
     return good, bad, info
 
 
+def live_gates(cfg):
+    """Gates that check what's served: run on deploy, or named or pointed at live checks (tests/live/, say)."""
+    return [g for g in cfg["gates"] if "deploy" in (g.get("when") or []) or re.search(
+        r"\blive\b", " ".join([str(g.get("name", "")), str(g.get("run", ""))] + [str(x) for x in g.get("tests") or []]),
+        re.I)]
+
+
+def deploy_guess(root):
+    """The project's own deploy command, if one is plain to see: a deploy script, or a deploy target in
+    package.json or the Makefile. Else ""."""
+    for rel in ("deploy.sh", "deploy/deploy.sh", "scripts/deploy.sh", "bin/deploy"):
+        if os.path.isfile(p(root, rel)):
+            return f"bash {rel}"
+    pkg = load_json(p(root, "package.json"), {})
+    if isinstance(pkg, dict) and isinstance(pkg.get("scripts"), dict) and pkg["scripts"].get("deploy"):
+        return "npm run deploy"
+    if re.search(r"^deploy\s*:", read(p(root, "Makefile")), re.M):
+        return "make deploy"
+    return ""
+
+
 def doctor(root, cfg):
     """(ok, lines): does the harness work here? Plain language, with the fix for each problem."""
     good, bad, info = [], [], []
@@ -4365,6 +7505,13 @@ def doctor(root, cfg):
         bad.append(f"no `sh` on PATH: Claude Code starts the {DISPLAY_NAME} hooks with it → install a POSIX shell")
     if git(root, "rev-parse", "--is-inside-work-tree") == "true":
         good.append("git repository")
+        who = {k: git(root, "config", f"user.{k}") or os.environ.get(f"GIT_AUTHOR_{k.upper()}", "") for k in ("name", "email")}
+        if all(who.values()):
+            good.append(f"git author: {who['name']} <{who['email']}>")
+        else:
+            bad.append("git doesn't know who commits (no user." + " or user.".join(k for k, v in who.items() if not v)
+                       + "), so every commit fails → `git config --global user.name \"Your Name\"` and "
+                         "`git config --global user.email you@example.com`")
     else:
         bad.append("not a git repository → run `git init` here: every finished step is saved as a commit")
     bash = find_bash()
@@ -4376,6 +7523,15 @@ def doctor(root, cfg):
     if not cfg["gates"]:
         bad.append(f"no checks configured → run setup again, or add a gate to {harness_rel('config.json', root=root)}")
     for g in cfg["gates"]:
+        if detached(g):
+            if not (g.get("start") and g.get("status")):
+                bad.append(f"long check '{g['name']}' needs a \"start\" and a \"status\" command")
+            else:
+                good.append(f"long check '{g['name']}', run elsewhere: `{g['start']}`")
+            if "commit" in g.get("when", ["commit"]):
+                info.append(f"long check '{g['name']}' runs elsewhere, so commits don't wait for it: give it "
+                            "\"when\": [\"milestone\"] or [\"release\"] so something does")
+            continue
         run = g.get("run", "")
         if "replace with your test command" in run:
             bad.append(f"check '{g['name']}' is still the placeholder → set its real command")
@@ -4389,6 +7545,14 @@ def doctor(root, cfg):
         good.append(f"check '{g['name']}': `{run}`")
     if (cfg.get("deploy") or {}).get("run") and not select_gates(cfg, event="deploy"):
         info.append("deploys run no live checks: add a gate with \"when\": [\"deploy\"] that looks at what's served")
+    live = live_gates(cfg)
+    if live and not (cfg.get("deploy") or {}).get("run"):
+        later = [g["name"] for g in live if "deploy" not in (g.get("when") or [])]
+        info.append(f"there are live checks ({', '.join(g['name'] for g in live)}) but no deploy section, so deploys are "
+                    f"done by hand and nothing runs the live checks after them → add to {harness_rel('config.json', root=root)}: "
+                    f"\"deploy\": {{\"run\": \"{deploy_guess(root) or '<your deploy command>'}\", \"timeout\": 1200}}"
+                    + (f", and set \"when\": [\"deploy\"] on {', '.join(later)}" if later else "")
+                    + f". Then `{PY} \"{DD}\" deploy` ships the last commit and runs them.")
     if cfg["requirements"].get("milestone_needs_e2e", True) and not e2e_gates(cfg):
         info.append("no end-to-end check yet: milestones can't be closed until one exists (Milestone 0 adds it)")
     if compacting(cfg):
@@ -4423,7 +7587,8 @@ def doctor(root, cfg):
     return not bad, lines
 
 
-LOCAL_STATE = ["gates/last.json", "gates/history.jsonl", "gates/passed.json", "gates/.lock", "context.json",
+LOCAL_STATE = ["gates/last.json", "gates/history.jsonl", "gates/passed.json", "gates/.lock", "gates/detached.json",
+               "context.json",
                "compactions.jsonl", "hosts.json", "approvals.json", "hooks.log", "agents/", "reviews/draft.json",
                "run.json", "typed.json", "worker.json", "fleet/", "worktrees/"]
 
@@ -5029,6 +8194,9 @@ def migrate(check=False):
         return 1
     if not is_old_project(root):
         print(f"This project already uses {PROJECT_DIR}/: nothing to do.")
+        swap = plugin_swap_text(root)
+        if swap and not check:
+            print("\n" + swap)
         return 0
     use_project(root)
     blockers = migration_blockers(root)
@@ -5092,6 +8260,9 @@ def migrate(check=False):
         return 1
     print(f"This project now uses {PROJECT_DIR}/. One commit, \"{MOVE_MESSAGE}\", holds the move:\n"
           + "\n".join("- " + line for line, _ in changes[:-1]) + by_hand)
+    swap = plugin_swap_text(root)
+    if swap:
+        print("\n" + swap)
     return 0
 
 
@@ -5108,6 +8279,11 @@ def main():
     sub.add_parser("doctor", help="check that the harness works here, in plain language")
     mg = sub.add_parser("migrate", help=f"move a project from {OLD_PROJECT_DIR}/ to {PROJECT_DIR}/ in one commit")
     mg.add_argument("--check", action="store_true", help="list the changes and what's in the way; change nothing")
+    op = sub.add_parser("open", help="(you, in a terminal) start a Claude Code session in a folder, in tmux with "
+                                     "Remote Control under a name, past the folder-trust question")
+    op.add_argument("folder")
+    op.add_argument("name", help="the session's name in the Claude app")
+    op.add_argument("--mode", default="", help="its permission mode (default: your Claude Code settings)")
     sub.add_parser("resume")
     sub.add_parser("status")
     g = sub.add_parser("gate")
@@ -5115,6 +8291,9 @@ def main():
     g.add_argument("--all", action="store_true", help="include manual-only gates")
     g.add_argument("--accept", action="store_true", help="store passing metrics as the new baseline")
     g.add_argument("--fresh", action="store_true", help="run every gate even if it passed on exactly these files")
+    g.add_argument("--start", action="store_true", help="start a long check elsewhere, on a commit (kind: detached)")
+    g.add_argument("--collect", action="store_true", help="ask the long checks started elsewhere for their results")
+    g.add_argument("--ref", default="HEAD", help="(--start) the commit to check (default: the last commit)")
     s = sub.add_parser("snapshot")
     s.add_argument("--reason", default="manual")
     sub.add_parser("review-record", help=f"the reviewer agent: validate and stamp {review_draft()}")
@@ -5125,25 +8304,54 @@ def main():
     rn.add_argument("action", nargs="?", choices=["status", "start", "end"], default="status")
     rn.add_argument("--reason", default="", help="(end) why the run ends: all done, or what waits on the user")
     sub.add_parser("deploy", help="deploy HEAD with config deploy.run, then run the live checks (gates when: deploy)")
+    rl = sub.add_parser("release", help="raise the version, check the changelog and the gates, commit, tag, push "
+                                        "(with the user's OK), publish the notes and deploy")
+    rl.add_argument("level", nargs="?", choices=LEVELS, help="which number to raise (default patch); above patch: the user only")
+    rl.add_argument("--check", action="store_true", help="say what the release would do and what's missing; change nothing")
+    rl.add_argument("--no-push", action="store_true", help="commit and tag here only: no push, no release page, no deploy")
     chg = sub.add_parser("change", help="changes to what gets built: list them, add one (the user), or mark one planned")
-    chg.add_argument("action", nargs="?", choices=["list", "add", "done"], default="list")
-    chg.add_argument("what", nargs="*", help="(add) the change, in words; (done) its number")
+    chg.add_argument("action", nargs="?", choices=["list", "add", "done", "from-transcript"], default="list")
+    chg.add_argument("what", nargs="*", help="(add) the change, in words; (done) its number; (from-transcript) the "
+                                             "user's own sentences, as they typed them in this session")
     chg.add_argument("--where", default="", help="(done) where it went in the plan, e.g. M9")
     chg.add_argument("--by", default="user (terminal)", help="(add) who asked for it")
+    pl = sub.add_parser("plan", help="change the plan: add a milestone, or tick a step")
+    pl.add_argument("action", choices=["add-milestone", "tick"])
+    pl.add_argument("args", nargs="*", help="(add-milestone) its title; (tick) the milestone, then the step's number "
+                                            "or text")
+    pl.add_argument("--after", default="", help="(add-milestone) build it after these milestones (M3, or M3,M5) or \"all\"")
+    pl.add_argument("--files", default="", help="(add-milestone) the files it changes, as globs (\"src/pages/**, "
+                                                "tests/test_pages.py\")")
+    pl.add_argument("--gate", action="append", default=[], help="(add-milestone) a gate criterion; repeat for more")
+    pl.add_argument("--step", action="append", default=[], help="(add-milestone) a step; repeat for more")
     fl = sub.add_parser("fleet", help="the overseer's workers: list them, start one, merge, stop, resume, remove, "
-                                      "show its screen, or read their news")
+                                      "show its screen, or read their news; pass on the user's OK to one; in a worker, sync brings in the project's work")
     fl.add_argument("action", nargs="?", default="status",
-                    choices=["status", "spawn", "merge", "stop", "resume", "remove", "show", "news"])
+                    choices=["status", "spawn", "merge", "stop", "resume", "remove", "show", "news", "sync", "allow"])
     fl.add_argument("target", nargs="?", default="", help="(spawn) a milestone, e.g. M3; (others) the worker's name")
+    fl.add_argument("once", nargs="?", choices=["once"], help="(allow) the user's OK covers that one action, once")
     fl.add_argument("--name", default="", help="(spawn) the worker's name (default: the milestone)")
     fl.add_argument("--task", default="", help="(spawn) a task in words, instead of or on top of a milestone")
     fl.add_argument("--force", action="store_true", help="start a milestone that isn't ready, merge a busy worker, "
                                                          "or remove one with unmerged work")
     fl.add_argument("--all", action="store_true", help="(news) every event, not just the new ones")
+    fl.add_argument("--when-idle", type=float, nargs="?", const=600, default=None, metavar="SECONDS",
+                    help="(merge) wait up to SECONDS (600 if not given) for a busy worker to finish its turn; "
+                         "by default the merge waits fleet.merge_wait (60)")
     vm = sub.add_parser("verify-manual", help="(the user only) mark a manual requirement as verified")
     vm.add_argument("id")
     vm.add_argument("--note", required=True, help="what you checked, and how")
     vm.add_argument("--fail", action="store_true", help="record it as failing instead")
+    ts = sub.add_parser("tests", help="(the user only) `tests cleanup`: find overlapping tests, prove they add nothing, "
+                                      "remove them with your OK")
+    ts.add_argument("action", choices=["cleanup"])
+    ts.add_argument("ids", nargs="*", help="(--apply) the candidates to remove, e.g. c1 c3 (default: every proven one)")
+    ts.add_argument("--prove", metavar="PROPOSAL", help="break the code each candidate guards, on a scratch copy, and "
+                                                        "check the other tests still fail")
+    ts.add_argument("--apply", metavar="PROPOSAL", help="remove proven candidates after you type yes, and commit")
+    ts.add_argument("--budget", type=int, default=30, help="(--prove) minutes it may take (default 30)")
+    ts.add_argument("--mutations", type=int, default=8, help="(--prove) breaks per source file (default 8)")
+    ts.add_argument("--similar", type=float, default=0.8, help="how alike two tests must be, 0 to 1 (default 0.8)")
     tr = sub.add_parser("try", help="what you can try yourself, and the checks only you can record")
     tr.add_argument("which", nargs="?", help="a milestone (M1) or a requirement ID")
     tr.add_argument("--ask", action="store_true", help="(the user, in a terminal) walk through each check and record it")
@@ -5169,6 +8377,10 @@ def main():
         return
     if a.cmd == "migrate":
         sys.exit(migrate(a.check))
+    if a.cmd == "open":
+        ok, lines = open_session(a.folder, a.name, a.mode)
+        print("\n".join(lines))
+        sys.exit(0 if ok else 1)
     if a.cmd == "detect":
         print(json.dumps(detect(find_root() or os.path.abspath(os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())),
                          indent=2, ensure_ascii=False))
@@ -5191,18 +8403,41 @@ def main():
     cfg = load_config(root)
     if a.cmd in ("resume", "status"):
         print(resume_text(root, cfg, detailed=a.cmd == "status"))
+    elif a.cmd == "gate" and (a.start or a.collect):
+        longs = {g["name"]: g for g in cfg["gates"] if detached(g)}
+        if a.start:
+            if len(a.names) != 1 or a.names[0] not in longs:
+                sys.exit("Name one long check to start: " + (", ".join(longs) or
+                         "there are none (a gate with \"kind\": \"detached\")") + ".")
+            ok, lines = detached_start(root, cfg, longs[a.names[0]], a.ref, a.fresh)
+            print("\n".join(lines))
+            sys.exit(0 if ok else 1)
+        lines = detached_collect(root, cfg, a.names or None, accept=a.accept)
+        print("Long checks run elsewhere:\n" + "\n".join(lines) if lines else "No long check is running elsewhere.")
     elif a.cmd == "gate":
         gates = select_gates(cfg, names=a.names or None, include_manual=a.all)
         if not gates:
             sys.exit(f"No gates selected. Configure them in {harness_rel('config.json', root=root)} → gates.")
+        pending = work_changes(root, cfg)  # before the run: what the tests write doesn't count
         results = run_gates(root, cfg, gates, accept=a.accept, reuse=not a.fresh)
         print(format_results(results))
-        pending = work_changes(root, cfg)
+        over = budget_note(cfg, gates, results)
+        if over:
+            print("\n" + over)
         if pending:
             print(f"\nRequirement results not updated: {len(pending)} uncommitted file(s). They describe committed "
                   "code, so the commit hook records them (or a gate run on a clean tree).")
-        else:
-            record_requirements(root, cfg, results)
+        else:  # a clean tree: the results describe the last commit, and go in a commit of their own
+            before = load_json(requirements_path(root), {})
+            changed = results_changed(before, record_requirements(root, cfg, results))
+            rels = [harness_rel("gates", "requirements.json", root=root)]
+            if a.accept:
+                rels.append(harness_rel("gates", "baseline.json", root=root))
+            what = (["Accept the new gate baseline"] if a.accept else []) + \
+                ([f"Requirement results after a gate run: {changed}"] if changed else [])
+            note = commit_records(root, rels, "; ".join(what) or "Record the requirement results of a gate run")
+            if note:
+                print("\n" + note)
         for r in results:
             if r.get("tail"):
                 print(f"\n[{r['name']}] last lines:\n{r['tail']}")
@@ -5211,6 +8446,7 @@ def main():
         specs, problems = load_specs(root)
         cov = coverage(root, cfg, specs)
         state = load_json(requirements_path(root), {})
+        unmarked = []
         for s in specs:
             print(f"{s['_file']} · {s.get('milestone', '?')} · {s.get('state', 'active')} · {s.get('title', '')}")
             for r in s.get("requirements") or []:
@@ -5222,7 +8458,11 @@ def main():
                              "waits for the user (`regista.py try`)")
                 else:
                     where = ", ".join(c.get("tests", []) + c.get("e2e", [])) or "not covered by any test yet"
+                    if c.get("mentions") and not (c.get("tests") or c.get("e2e")):
+                        unmarked.append(f"{r['id']}:{mention_hint(r['id'], c)}")
                 print(f"  {'PASS' if st.get('passes') else 'open'}  {r['id']:<14} {r.get('verify', 'test'):<6} {where}")
+        for x in unmarked:
+            print("warning:", x)
         for x in problems:
             print("problem:", x)
         sys.exit(1 if problems else 0)
@@ -5245,6 +8485,10 @@ def main():
         ok, lines = deploy(root, cfg)
         print("\n".join(lines))
         sys.exit(0 if ok else 1)
+    elif a.cmd == "release":
+        ok, lines = release(root, cfg, a.level, a.check, push=not a.no_push)
+        print("\n".join(lines))
+        sys.exit(0 if ok else 1)
     elif a.cmd == "change":
         if a.action == "add":
             print(change_from_user(root, " ".join(a.what), a.by))
@@ -5256,10 +8500,31 @@ def main():
             hit.update(state="planned", where=a.where, planned=dt.datetime.now().isoformat(timespec="minutes"))
             save_json(changes_path(root), items)
             print(f"Change {hit['n']} is in the plan" + (f" ({a.where})." if a.where else "."))
+        elif a.action == "from-transcript":  # the hook checked that the user typed these words in this session
+            text, home, w = " ".join(a.what), overseer_root(root), worker_info(root)
+            by = "user (typed in the session; recorded from its transcript)"
+            if home:  # a worker's changes are recorded in the overseer's project, like typed ones
+                print(change_from_user(home, text, f"{by}, in the worker {w.get('name')}"))
+                fleet_event(home, w.get("name"), "change", text)
+            else:
+                print(change_from_user(root, text, by))
         else:
             items = load_json(changes_path(root), [])
             print("\n".join(f"{c['n']}. [{'open' if c['state'] == 'open' else 'in the plan: ' + (c.get('where') or '?')}] "
                             f"{c['at'].replace('T', ' ')} {c['text']}" for c in items) or "No changes recorded.")
+    elif a.cmd == "plan":
+        if worker_info(root):
+            sys.exit("The plan is the overseer's, so a worker doesn't change it. Your steps are ticked when you commit "
+                     "them; for anything else, tell the overseer (SendMessage).")
+        if a.action == "add-milestone":
+            ok, lines = plan_add_milestone(root, cfg, " ".join(a.args), a.after, a.files, a.gate, a.step)
+        elif len(a.args) < 2:
+            ok, lines = False, ["Say which step: `regista.py plan tick M3 2` or `regista.py plan tick M3 \"<its text>\"`."]
+        else:
+            ok, msg = plan_tick(root, a.args[0], " ".join(a.args[1:]), cfg)
+            lines = [msg]
+        print("\n".join(lines))
+        sys.exit(0 if ok else 1)
     elif a.cmd == "fleet":
         if a.action == "status":
             print(fleet_text(root, cfg))
@@ -5278,6 +8543,14 @@ def main():
         if a.action == "show":
             print(fleet_show(root, a.target))
             return
+        why = outside_project(root) if a.action in FLEET_FROM_PROJECT else ""
+        if why:
+            print(why)
+            sys.exit(1)
+        if a.action == "sync":
+            ok, lines = fleet_sync(root, cfg)
+            print("\n".join(lines))
+            sys.exit(0 if ok else 1)
         if a.action != "spawn" and not a.target:
             sys.exit(f"Name the worker: `regista.py fleet {a.action} <name>` (`regista.py fleet` lists them).")
         if a.action == "spawn":
@@ -5285,11 +8558,13 @@ def main():
             ok, lines = fleet_spawn(root, cfg, milestone=a.target if is_m else "",
                                     name=a.name or ("" if is_m else a.target), task=a.task, force=a.force)
         elif a.action == "merge":
-            ok, lines = fleet_merge(root, cfg, a.target, a.force)
+            ok, lines = fleet_merge(root, cfg, a.target, a.force, wait=a.when_idle)
         elif a.action == "stop":
             ok, lines = fleet_stop(root, cfg, a.target)
         elif a.action == "resume":
             ok, lines = fleet_resume(root, cfg, a.target)
+        elif a.action == "allow":
+            ok, lines = fleet_allow(root, cfg, a.target)
         else:
             ok, lines = fleet_remove(root, cfg, a.target, a.force)
         print("\n".join(lines))
@@ -5301,6 +8576,22 @@ def main():
             sys.exit(f"{a.id} isn't a manual requirement in {harness_rel('specs', root=root)}/.")
         record_manual(root, a.id, not a.fail, a.note, "user")
         print(f"{a.id}: recorded as {'failing' if a.fail else 'verified'}.")
+    elif a.cmd == "tests":
+        if a.prove:
+            path, prop = cleanup_load(root, a.prove)
+            print(cleanup_prove(root, cfg, path, prop, budget=a.budget * 60, per_file=a.mutations))
+        elif a.apply:
+            path, prop = cleanup_load(root, a.apply)
+            ok, lines = cleanup_apply(root, cfg, path, prop, a.ids)
+            print("\n".join(lines))
+            sys.exit(0 if ok else 1)
+        else:
+            path, prop = cleanup_propose(root, cfg, a.similar)
+            print(f"{len(prop['candidates'])} tests could go and {len(prop['suggestions'])} browser checks could move "
+                  f"down to unit tests. Nothing was touched. The list, with why each could go: "
+                  f"{os.path.relpath(os.path.splitext(path)[0] + '.md', root)}"
+                  + (f"\nNext, prove them: `regista.py tests cleanup --prove {os.path.basename(path)}`"
+                     if prop["candidates"] else ""))
     elif a.cmd == "try":
         if a.ask:
             try_ask(root, cfg, a.which)

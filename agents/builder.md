@@ -23,7 +23,9 @@ orchestrator's message and in the project's files.
 - **If the spec can't be met as written** (the tests contradict the spec or each other, a requirement
   is impossible, or the interface is ambiguous), stop and report `BLOCKED:` with the requirement IDs and
   the reason. That is a correct outcome, not a failure.
-- Run the tests, then the gates: `python "<regista.py>" gate` (the CLI path is in your start context).
+- Run the tests, then the gates: `python "<regista.py>" gate` (the CLI path is in your start context), or
+  one gate with `gate <name>`. Run a gate's suite (`npm run e2e`) only this way: running its command
+  yourself is refused, because it could share a test database or ports with another run.
   A failing gate means you're not done: fix the cause. Never weaken a check, a threshold or a
   baseline, and never touch protected files.
 - When you got reviewer findings, address every blocker and major one; say how for each.

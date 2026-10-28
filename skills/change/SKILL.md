@@ -24,4 +24,6 @@ mark it as planned, session start and every build-all nudge show it.
 4. **Mark it planned:** `python "<regista.py>" change done <n> --where "M9"`. Then confirm to the user in one
    line where it went, and carry on.
 
-Only the user adds changes. If you think the plan needs one, ask them.
+Only the user adds changes. If you think the plan needs one, ask them. When the user asked for a change
+in plain words in this session, you may record it with `python "<regista.py>" change from-transcript
+"<their sentences, word for word>"`: the hook accepts only whole sentences they typed.

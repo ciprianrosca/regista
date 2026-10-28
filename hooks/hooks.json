@@ -59,7 +59,6 @@
     ],
     "SubagentStart": [
       {
-        "matcher": "^regista:",
         "hooks": [
           {
             "type": "command",
@@ -71,7 +70,6 @@
     ],
     "SubagentStop": [
       {
-        "matcher": "^regista:",
         "hooks": [
           {
             "type": "command",

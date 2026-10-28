@@ -45,6 +45,10 @@ you can, choose the defaults, and ask only what only they know. Plain words thro
      `M0 — Safety net`:** a test runner with one real test, and one end-to-end check that runs the real
      program the way a user would (Playwright for a web app, a script that runs the command on sample
      input for a CLI). Once M0 exists, add its gates to `config.json` (the user confirms the change).
+   - **If `detected.notes` proposes a database per worker** (the end-to-end tests use a database
+     server), add a step to the first milestone: the tests' setup names its database after
+     `REGISTA_SLOT` and creates it when missing; then `fleet.isolated_gates` becomes true. Workers
+     building side by side then neither reset each other's data nor wait for each other's test runs.
    - If the real spec lives elsewhere (a doc, an issue tracker), link it at the top of `plan.md`.
 8. **Check it works.** Run `python "${CLAUDE_PLUGIN_ROOT}/scripts/regista.py" doctor` and fix what you can.
    Install a missing tool only after the user says yes. If gates exist, run

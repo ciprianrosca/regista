@@ -39,12 +39,14 @@ start hook tells each one the project root, the CLI path and its own rules.
    depends on an open decision on the board, stop and run `decide`. Never guess a decision that
    belongs to the user. Write `.regista/specs/<step>.json`:
    ```json
-   {"step": "stats", "milestone": "M1", "title": "Mean and median",
+   {"step": "stats", "milestone": "M1", "title": "Mean and median", "plan_step": "Mean and median of a list",
     "interface": "calc.stats.mean(xs: list[float]) -> float; median(xs) -> float",
     "requirements": [
       {"id": "STATS-1", "text": "WHEN xs is empty, mean SHALL raise ValueError", "verify": "test"},
       {"id": "STATS-2", "text": "WHEN `calc mean 1 2 3` runs, it SHALL print 2.0", "verify": "e2e"}]}
    ```
+   `plan_step` is the step's text exactly as the plan writes it (or its number in the milestone): when
+   the step's commit goes through, the commit hook ticks that step in the plan, and says so.
    One requirement per observable behaviour, in testable form (WHEN … SHALL …), IDs unique across the
    project. `verify`: `test` (unit or integration), `e2e` (the real program, run by the e2e gate) or
    `manual` (only the user can check it). A milestone needs at least one `e2e` requirement. Keep it to
@@ -55,7 +57,12 @@ start hook tells each one the project root, the CLI path and its own rules.
 4. **Research (only if needed).** One `regista:researcher` per open question. Pass the question
    and why it matters. Keep its answer, not its reading.
 5. **Tests first.** Spawn `regista:test-writer` with the spec's path and the interface. It can't see
-   the code, so the interface must be explicit. Its tests name the IDs they cover (`covers: STATS-1`).
+   the code, so the interface must be explicit. Its tests mark the IDs they cover (`covers: STATS-1`).
+   Remind it to cover each requirement once, at the cheapest level that proves it: browser tests only for
+   what needs a browser, and at least one for every page and main path a user takes. Commits run the
+   current milestone's browser tests; the whole suite runs when the milestone closes, at merges and before
+   deploys. If a gate run says it went over the project's time budget, tell the user and suggest
+   `regista.py tests cleanup`; don't run it yourself.
 6. **Build.** Spawn `regista:builder` with the spec's path, the test files to satisfy, and the
    relevant rules and lessons (or tell it which memory files to read). It returns `DONE` or
    `BLOCKED: <IDs> — <why>`.
@@ -69,12 +76,15 @@ start hook tells each one the project root, the CLI path and its own rules.
    - `changes`: spawn a **new** builder with the findings (file:line and the issue), then a **new**
      reviewer. After `review.max_rounds` rounds (default 3) without approval, stop and ask the user.
 8. **Commit.** `git add -A && git commit -m "<type>: <step>"`. The commit hook checks that every
-   active requirement is named by a test, runs the gates, records which requirements pass, and checks
+   active requirement is marked by a test, runs the gates, records which requirements pass, and checks
    that an approving review matches exactly this change set. If it blocks, read why and fix it through
    the agents; don't work around it. Commit the spec and `.regista/reviews/<fingerprint>.json` with
    the change: they are the audit trail.
-9. **Checkpoint.** Tick the step in the status file and update "Latest results". **Whether a
-   requirement passes, and whether a milestone is done, is the harness's call, not yours:** copy it from
+9. **Checkpoint.** The commit hook ticked the step in the plan; if it said nothing about a tick (the spec
+   didn't name the step), tick it yourself: `regista.py plan tick M<n> <number or text>`. In a worker, never
+   edit the plan: the overseer's merge carries your ticks over. Tick the step in the status file and
+   update "Latest results". **Whether a requirement passes, and whether a milestone is done, is the
+   harness's call, not yours:** copy it from
    `python "${CLAUDE_PLUGIN_ROOT}/scripts/regista.py" requirements` and `… milestone M<n>` (exit 0 = done).
    Never write "done" for a milestone the harness says is open. Record lessons with `/regista:learn`.
    If the milestone now waits only on manual checks, run `/regista:try` and let the user check it.
@@ -99,8 +109,10 @@ context says so).
 
 1. **Resume** (`/regista:start`) and read the plan and any spec it links. If the plan doesn't cover
    the linked spec yet (milestones missing, steps missing), add them first, each milestone with its
-   gate and at least one end-to-end requirement. Show the plan to the user only where it changes or
-   leaves out something the spec asks for.
+   gate and at least one end-to-end requirement:
+   `regista.py plan add-milestone "<title>" [--after M<n>] --files "<globs>" --gate "<criterion>" --step "<step>" …`
+   (repeat `--gate` and `--step`) writes it in the plan's format; `--files` names the files it will change.
+   Show the plan to the user only where it changes or leaves out something the spec asks for.
 2. **Start the run:** `python "${CLAUDE_PLUGIN_ROOT}/scripts/regista.py" run start`. While the run is active, the
    Stop hook sends you back to work each time you try to end your turn, as long as you've committed
    something since its last nudge. A run that stops twice without a new commit ends itself, so it can
@@ -125,17 +137,25 @@ context says so).
    - **A change from the user** (`/regista:change`, shown at session start and in every nudge): fold it
      into the plan before the next step, as the change skill says, then `regista.py change done <n> --where M<n>`.
      "Build this last" or "after What-if" becomes an `After: all` or `After: M8` line on the milestone.
+     When the user asks for a change in plain words instead, record it first with
+     `regista.py change from-transcript "<their sentences, word for word>"`: the hook accepts it only when
+     they typed those whole sentences in this session.
+   - **Waiting on agents:** stopping while your agents work in the background is fine during a run: the
+     harness records when each agent starts and finishes, doesn't count that stop as stalling, and their
+     completion notices wake you.
    - **Deploying** (when `config.json` has a `deploy` section): deploy only with `regista.py deploy`, which runs
      the live checks after it; never run the deploy command yourself. Deploy after a milestone that
-     changes what's live, and before the final report.
+     changes what's live, and before the final report. When the project deploys tagged releases only
+     (`deploy.ref: "tag"`), deploy with `regista.py release` (a patch, unless the user asked for more).
    - **Never push.** Pushing stays the user's call (the hook asks anyway).
 4. **End the run** when every milestone's gate is met, when everything left waits on the user, or
    when the user asks you to stop (no change from the user may be left open): `/regista:save`, then
    `python "${CLAUDE_PLUGIN_ROOT}/scripts/regista.py" run end --reason "<all milestones done | what waits on the user>"`.
 5. **Final report**, in plain words: the milestones done (copied from the harness, not from notes),
    what's built but still has an open gate, and a numbered list of what the user needs to do: each
-   decision with your recommendation, the checks to try (`/regista:try`), the steps that stayed
-   blocked and why. Say that nothing was pushed.
+   decision with your recommendation, the checks to try (their steps from `/regista:try`, ending with
+   the ready-to-send `/regista:verify <ID> ok` lines), the steps that stayed blocked and why. Say that
+   nothing was pushed.
 
 ## Prompts to agents
 - Self-contained: the agent has none of this conversation. Name files by path.

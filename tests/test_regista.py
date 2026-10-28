@@ -67,7 +67,10 @@ class Project:
         return json.loads(r.stdout) if r.stdout.strip() else None
 
     def cli(self, *args):
-        return subprocess.run([PY, TOOL, *args], cwd=self.root, capture_output=True, text=True, encoding="utf-8")
+        # without the session's project variables: they would point the harness at the real project
+        env = {k: v for k, v in os.environ.items() if k not in regista.HOST_PROJECT_VARS}
+        return subprocess.run([PY, TOOL, *args], cwd=self.root, capture_output=True, text=True, encoding="utf-8",
+                              env=env)
 
     def cleanup(self):
         shutil.rmtree(self.root, ignore_errors=True)
@@ -816,6 +819,215 @@ class ShellReading(unittest.TestCase):
         self.assertIsNone(self.check(None, f"echo hi > {self.tmp}/note.txt", **extra))
 
 
+class ParallelBuildRefusals(unittest.TestCase):
+    """The refusals of the parallel builds (FPL and Regista's own rename, 26 to 28 October 2026) that
+    0.9.0 still made wrongly: paths ending in a variable, text inside scripts, commands in other
+    repositories and `claude plugin`. Each case keeps what tripped the check. The refusals that were
+    right stay refused, and so do the routes these fixes must not open."""
+
+    def setUp(self):
+        self.p = Project(protected=[".env", "*.pem"])
+        self.tmp = tempfile.mkdtemp(prefix="regista-scratch-")
+        os.makedirs(os.path.join(self.p.root, "tests", "fixtures", "news"))
+        os.makedirs(os.path.join(self.p.root, "src", "core"))
+
+    def tearDown(self):
+        self.p.cleanup()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def check(self, role, cmd):
+        return decision(self.p.hook("pre-tool", as_agent(role, "Bash", command=cmd)))
+
+    def test_paths_ending_in_a_variable_are_unknown_not_the_project(self):
+        t, root = self.tmp, self.p.root
+        for role, cmd in [
+            ("reviewer", f'S={t}; mkdir -p "$S/alt/src/core"; for f in $(ls {root}/src/core); do '
+                         f'cat "{root}/src/core/$f" > "$S/alt/src/core/$f"; done; cd "$S/alt/src/core" && '
+                         "perl -pi -e 's/a/b/' live.js"),
+            ("test-writer", "cd tests/fixtures/news && for f in *.html; do echo \"$f: $(grep -o '<title[^>]*>' $f "
+                            "| head -1)\"; done"),
+            ("test-writer", f"S={t}/ref; mkdir -p $S/src/core $S/tests && cd $S && cat > src/core/planner.js <<'EOF'\n"
+                            f"export const f = 1;\nEOF\nfor f in a.test.js b.test.js; do cp {root}/tests/$f tests/$f; done"),
+            ("test-writer", f"S={t}/chk; W={root}; mkdir -p $S/tests && for f in a.test.js b.test.js; do "
+                            f"sed -e \"s#'../../src/#'$S/src/#\" $W/tests/unit/$f > $S/tests/$f; done; cd $S && node --test tests/"),
+            ("test-writer", "grep -on \"client\\.[a-zA-Z]*(\" tests/*.test.js | awk -F: '{print $3}' | sort | uniq -c"),
+            ("test-writer", f"S={t}; for f in $S/*.log; do echo \"== $f\"; grep -E '^# (pass|fail)' $f; done"),
+            ("reviewer", f"S={t}; rm -rf $S/cmp && mkdir -p $S/cmp && for n in proj 'Café'; do for v in old new; do "
+                         f"d=$S/cmp/$v/r; rm -rf $d; mkdir -p $d; (cd $d && env -u CLAUDE_PROJECT_DIR python3 {TOOL} "
+                         "init --name \"$n\" >/dev/null 2>&1); done; diff -r $S/cmp/old/r $S/cmp/new/r && echo same; done"),
+        ]:
+            with self.subTest(cmd=cmd[:70]):
+                self.assertIsNone(self.check(role, cmd))
+
+    def test_text_inside_scripts_is_data(self):
+        t = self.tmp
+        for role, cmd in [
+            ("builder", f"cat > {t}/shots.mjs <<'EOF'\nimport {{ spawn }} from 'node:child_process';\n"
+                        "import { mkdtempSync, writeFileSync } from 'node:fs';\nimport { tmpdir } from 'node:os';\n"
+                        "import { join } from 'node:path';\nconst dir = mkdtempSync(join(tmpdir(), 'shots-'));\n"
+                        "writeFileSync(join(dir, 'rules.json'), '{}');\n"
+                        "for (const p of ['home', 'live']) writeFileSync(`${dir}/${p}.html`, '');\n"
+                        f"spawn('node', ['src/poller/main.js'], {{ cwd: '{self.p.root}', env: {{ TZ: 'Europe/Bucharest' }} }});\n"
+                        f"EOF\nnode {t}/shots.mjs"),
+            ("builder", "python3 - <<'EOF'\np='src/client.js'\ns=open(p).read()\n"
+                        "new=\"\"\"    summary: (playerId) => get(`/element-summary/${playerId}/`),\n\"\"\"\n"
+                        "open(p,'w').write(s+new)\nEOF"),
+            ("researcher", "cd tests/fixtures && ls -la; python3 -I -c \"\nimport json\n"
+                           "b=json.load(open('bootstrap-static.json'))\nprint({k:b[k] for k in ['id','web_name']})\n\""),
+            ("reviewer", "python3 -c \"\nimport json\nd=json.load(open('.regista/reviews/abc.json'))\n"
+                         "json.dump(d,open('.regista/reviews/draft.json','w'),indent=2)\n\""),
+            ("test-writer", "python3 - <<'EOF'\np='tests/live/home.test.js'\ns=open(p).read()\n"
+                            "new='''test(`every mockup page ${name} answers 404`, async () => {\n"
+                            "  await page.goto(`${SITE}/`, { timezoneId: 'Europe/Bucharest' });\n"
+                            "});\n'''\nopen(p,'w').write(s+new)\nEOF"),
+            ("test-writer", "git mv tests/test_dd.py tests/test_regista.py && python3 - <<'EOF'\n"
+                            "p = \"tests/test_regista.py\"\nt = open(p).read()\n"
+                            "t = t.replace(\"src/dd\\\"\", \"src/regista\\\"\")\nopen(p, \"w\").write(t)\nEOF"),
+            ("test-writer", f"cat > {t}/edits.py <<'PYEOF'\nimport sys\np = sys.argv[1]\nt = open(p).read()\n"
+                            "t = t.replace('''x''', '''subprocess.run([\"claude\", \"-p\", \"/regista:verify UI-1 ok\"])\n"
+                            "codex exec hi''')\nopen(p, \"w\").write(t)\nPYEOF\n"
+                            f"python3 {t}/edits.py tests/test_regista.py && python3 -m py_compile tests/test_regista.py"),
+            ("test-writer", "python3 - <<'EOF'\np = \"tests/test_docs.py\"\ns = open(p).read()\n"
+                            "s += '''\n    r = subprocess.run([PY, TOOL, \"change\", \"add\", \"x\"])  # regista.py change add\n'''\n"
+                            "open(p, \"w\").write(s)\nEOF"),
+            ("builder", "python3 - <<'EOF'\np = \"src/README.md\"\ns = open(p, encoding=\"utf-8\").read()\n"
+                        "s = s.replace(\"\"\"old\"\"\", \"\"\"The gates live in\n`.regista/`, the launcher in\n"
+                        "`src/regista`.\"\"\")\nopen(p, \"w\", encoding=\"utf-8\").write(s)\nEOF"),
+            (None, "git rm -q .regista/specs/m3-old.json && python3 - <<'PY'\nimport json\nS=\".regista/specs/\"\n"
+                   "text = \"\"\"Spec:\n`.regista/` holds the config that names the gates.\"\"\"\n"
+                   "json.dump({\"title\": text}, open(S + \"m3-new.json\", \"w\"))\nPY"),
+            ("test-writer", "python3 - <<'EOF'\np = \"tests/e2e.sh\"\ns = open(p).read()\n"
+                            "s = s.replace('''# helpers''', '''# A home of our own: `~/.claude/settings.json`, "
+                            "`.claude/settings.json` and `.codex/config.toml` may enable the old plugin;\n"
+                            "grep -c old \"$ROOT/src/a.py\"''')\nopen(p, \"w\").write(s)\nEOF"),
+            ("builder", f"cat > {t}/check.py <<'EOF'\nimport os, sys, tempfile\n"
+                        f"sys.path.insert(0, \"{self.p.root}/tests\")\nt = tempfile.mkdtemp()\n"
+                        "os.makedirs(os.path.join(t, \"a\", \"x\"))\nopen(os.path.join(t, \"a\", \"x\", \"f\"), \"w\").write(\"\")\n"
+                        "os.symlink(os.path.join(t, \"a\", \"target\"), os.path.join(t, \"a\", \"x\", \"link\"))\n"
+                        "print(\".regista/worktrees/target\", \".claude/settings.json\", \".regista/fleet/workers.json\")\n"
+                        f"EOF\npython3 {t}/check.py"),
+            ("builder", "python3 - <<'EOF'\np=\"src/a.py\"\nb=open(p,\"rb\").read()\n"
+                        "old=b\"\"\"'\\\"\\\"\\\"Daedalus core' in head\"\"\"\nnew=b\"\"\"f'core' in head\"\"\"\n"
+                        "open(p,\"wb\").write(b.replace(old,new))\nEOF\nclaude plugin validate . 2>&1 | tail -2"),
+            (None, "python3 - <<'EOF'\np='.regista/status.md'\ns=open(p).read()\n"
+                   "s=s.replace(\"_Last updated_\\n\",\"\"\"_Last updated: 2026-10-28_\n\n"
+                   "The harness notes moved from `.daedalus/` to `.regista/`, at Ciprian's yes.\n\"\"\",1)\n"
+                   "open(p,'w').write(s)\nEOF\ncat > .regista/state/2026-10-28-moved.md <<'EOF'\n# Handoff\n"
+                   "- Ran the gates and committed .regista/gates/requirements.json.\nEOF"),
+        ]:
+            with self.subTest(role=role, cmd=cmd[:70]):
+                self.assertIsNone(self.check(role, cmd))
+
+    def test_commands_in_other_repositories_follow_that_repository(self):
+        t = self.tmp
+        for role, cmd in [
+            ("test-writer", f"S={t}; P=$(mktemp -d -p $S proj-XXXX); cd $P && git init -q -b main && git config "
+                            "user.email t@e.com && git config user.name T && echo 'print(1)' > app.py && git add -A && "
+                            f"git commit -qm first && env -u CLAUDE_PROJECT_DIR python3 {TOOL} init --auto >/dev/null"),
+            ("test-writer", f"cat > {t}/proto.py <<'EOF'\nimport json, os, subprocess, sys, tempfile\n"
+                            f"D = \"{TOOL}\"\nenv = {{k: v for k, v in os.environ.items() if k != \"CLAUDE_PROJECT_DIR\"}}\n"
+                            "P = tempfile.mkdtemp(dir=sys.argv[1])\n"
+                            "def sh(*a): subprocess.run(a, cwd=P, check=True)\n"
+                            "open(os.path.join(P, \"app.py\"), \"w\").write(\"print(1)\\n\"); sh(\"git\", \"commit\", \"-qm\", \"first\")\n"
+                            "for h in (None, \"codex\"):\n"
+                            "    subprocess.run([sys.executable, D, \"hook\", \"session-start\", *([\"--host\", h] if h else [])], "
+                            "cwd=P, env=env, input=json.dumps({\"cwd\": P}))\n"
+                            f"EOF\npython3 {t}/proto.py {t}"),
+            ("test-writer", "python3 - <<'EOF'\nimport os, subprocess, sys, tempfile\nP = tempfile.mkdtemp()\n"
+                            "env = {k: v for k, v in os.environ.items() if k != 'CLAUDE_PROJECT_DIR'}\n"
+                            f"subprocess.run([sys.executable, '{TOOL}', 'run', 'start'], cwd=P, env=env)\nEOF"),
+            ("test-writer", f"mkdir -p {t}/p && cd {t}/p && git init -q -b main && git add -A && git commit -qm first && "
+                            f"env -u CLAUDE_PROJECT_DIR python3 {TOOL} init --auto; cat .regista/config.json"),
+            ("test-writer", f"cd {t} && rm -rf probe && mkdir probe && cd probe && git init -q -b main && echo x > a.txt && "
+                            f"git add -A && git commit -qm first && export -n CLAUDE_PROJECT_DIR; T={TOOL}; "
+                            "env -u CLAUDE_PROJECT_DIR python3 $T doctor 2>&1 | head -30"),
+            ("reviewer", f"SP={t}; cat > $SP/probe.sh <<'EOF'\nset -u\nSP=$1; TOOL=$2\nH=$(mktemp -d -p $SP); "
+                         "P=$(mktemp -d -p $SP)\nexport HOME=$H CODEX_HOME=$H/.codex\nunset CLAUDE_PROJECT_DIR\n"
+                         "cd $P && git init -q -b main\npython3 $TOOL init --name Demo >/dev/null\n"
+                         "mkdir -p ~/.claude && echo '{}' > ~/.claude/settings.json\ngit add -A && git commit -qm init\n"
+                         "python3 $TOOL verify-manual UI-1 --note probe; python3 $TOOL run start\nEOF\n"
+                         f"bash $SP/probe.sh $SP {TOOL}"),
+            ("test-writer", f"S={t}; cat > $S/probe.sh <<'EOF'\nset -e\nd=$(mktemp -d -p \"$1\")\ncd $d && git init -q -b main\n"
+                            "HOME=$d/home CLAUDE_PROJECT_DIR=$d python3 \"$2\" init --name Demo >/dev/null\n"
+                            "for f in .gitignore .regista/.gitignore; do echo \"== $f\"; cat $f 2>/dev/null || true; done\n"
+                            f"git status --porcelain --ignored\nEOF\nbash $S/probe.sh $S {TOOL}"),
+            ("builder", "d=$(mktemp -d) && cd $d && git init -q -b main && mkdir -p .regista/s && echo a > .regista/s/x && "
+                        "git add -A && git commit -qm i && git mv .regista .daedalus && git status --porcelain; rm -rf $d"),
+            ("reviewer", f"S={t}; rm -rf $S/p $S/h; mkdir -p $S/p $S/h; cd $S/p && git init -q -b main && git add -A && "
+                         "git commit -qm first; run(){ env -u CLAUDE_PROJECT_DIR HOME=$S/h CODEX_HOME=$S/h/.codex "
+                         f"python3 {TOOL} \"$@\"; }}; run gate; echo rc=$?"),
+            ("test-writer", f"cd {t} && d=$(mktemp -d) && cd $d && git init -q -b main && HOME=$d/home CLAUDE_PROJECT_DIR=$d "
+                            f"python3 {TOOL} init --name Demo >/dev/null && CLAUDE_PROJECT_DIR=$d python3 {TOOL} "
+                            "verify-manual UI-1 --note probe; git -C $d commit -qm x"),
+        ]:
+            with self.subTest(role=role, cmd=cmd[:70]):
+                self.assertIsNone(self.check(role, cmd))
+
+    def test_claude_plugin_commands_arent_sessions(self):
+        for role, cmd in [(None, "which claude; claude plugin validate . 2>&1 | tail -3"),
+                          ("builder", f"cd {self.p.root}; claude plugin validate . 2>&1 | tail -5; "
+                                      "env -u CLAUDE_PROJECT_DIR python3 -m unittest discover -s tests 2>&1 | tail -4"),
+                          (None, "claude mcp list"), (None, "claude agents"), (None, "claude doctor"),
+                          (None, "claude --version"), (None, "claude plugin install regista@regista"),
+                          ("builder", "python3 -c \"import subprocess; subprocess.run(['claude', 'plugin', 'validate', '.'])\"")]:
+            with self.subTest(cmd=cmd[:70]):
+                self.assertIsNone(self.check(role, cmd))
+
+    def test_right_refusals_stay(self):
+        t, root = self.tmp, self.p.root
+        denied = [
+            # From the builds: records of the gates moved or overwritten, the test writer reading or linking source,
+            # a manual check recorded by the agent.
+            (None, f"python3 -c \"import json; json.dump({{}}, open('{t}/merged.json', 'w'))\" && cp {t}/merged.json "
+                   ".regista/gates/requirements.json && git add .regista/gates/requirements.json"),
+            (None, "git checkout --theirs -- .regista/gates/requirements.json && git add .regista/gates/requirements.json"),
+            (None, f"mv .regista/gates/requirements.json {t}/requirements-stale.json && git status --short"),
+            ("test-writer", f"S={t}/tree; R={root}; mkdir -p $S/src && ln -sfn $R/src/db $S/src/db && "
+                            "ln -sf $R/src/core/forecast.js $S/src/core/forecast.js"),
+            ("test-writer", "grep -n \"^export\" src/core/planner.js src/core/news.js"),
+            ("test-writer", "grep -n \"odds_usage\" -i src/db/*.sql src/db/*.js 2>/dev/null | head"),
+            ("test-writer", "python3 - <<'EOF'\nsrc=open(\"src/a.py\",encoding=\"utf-8\").read()\n"
+                            "i=src.index('\"\"\"'); print(repr(src[i:i+200]))\nEOF"),
+            ("test-writer", f"S={t}/mut && rm -rf $S && mkdir -p $S && cd {root} && cp -r src tests $S/ && "
+                            "sed -i 's/>/>=/' $S/src/core/prices.js && cd $S && node --test tests/"),
+            (None, f"for id in UI-1 UI-2; do python3 {TOOL} verify-manual $id --note 'confirmed'; done"),
+            # Routes the fixes must not open.
+            ("builder", "for f in tests/*.py; do echo x > $f; done"),
+            ("builder", "echo x > $S/tests/$f"),
+            (None, "echo {} > .regista/gates/$name.json"),
+            (None, "echo {} > $D/.regista/gates/baseline.json"),
+            ("builder", f"cat > {t}/w.py <<'EOF'\nimport sys\nopen(sys.argv[1], 'w').write('')\nEOF\n"
+                        f"python3 {t}/w.py tests/test_a.py"),
+            ("builder", "node -e \"require('fs').writeFileSync(process.argv[1], 'x')\" tests/a.test.js"),
+            ("builder", "python3 - <<'EOF'\nfrom pathlib import Path\nfor f in Path('tests').glob('*.py'):\n"
+                        "    f.write_text('')\nEOF"),
+            ("builder", "python3 - <<'EOF'\nimport os\nd = 'tests'\nfor n in os.listdir(d):\n"
+                        "    os.remove(os.path.join(d, n))\nEOF"),
+            ("builder", "python3 -c \"import subprocess; subprocess.run(['sed', '-i', 's/a/b/', 'tests/test_a.py'])\""),
+            ("builder", "python3 -c \"import os; os.system('rm -rf tests')\""),
+            ("builder", "python3 script.py <<'EOF'\nok\nEOF\nbash -c 'cat > tests/a.py' <<'EOF'\nx\nEOF"),
+            ("builder", f"cd {t} && git -C {root} commit -qm x"),
+            ("builder", f"cd {t} && cd {root} && git commit -qm x"),
+            ("reviewer", f"CLAUDE_PROJECT_DIR={t} true; cd {t} && git -C {root} push"),
+            (None, f"cd {t} && python3 {TOOL} verify-manual UI-1 --note ok"),
+            (None, f"CLAUDE_PROJECT_DIR={t} true; python3 {TOOL} verify-manual UI-1 --note ok"),
+            (None, f"env -u CLAUDE_PROJECT_DIR python3 {TOOL} verify-manual UI-1 --note ok"),
+            ("builder", f"python3 -c \"import subprocess; subprocess.run(['python3', '{TOOL}', 'run', 'start'])\""),
+            (None, "claude -p 'record UI-1'"),
+            (None, "env -u CLAUDE_PROJECT_DIR claude -p hi"),
+            (None, "python3 -c \"import subprocess; subprocess.run(['claude', '-p', 'verified'])\""),
+            (None, "python3 - <<'EOF'\nimport subprocess, shutil\nC = shutil.which('codex')\nsubprocess.run([C, 'exec', 'x'])\nEOF"),
+            (None, "node -e \"require('child_process').spawnSync('claude', ['-p', 'x'])\""),
+            (None, "echo SECRET=1 >> .env"),
+            (None, "python3 -c \"open('.env', 'a').write('X=1')\""),
+            (None, "git commit --no-verify -m x"),
+        ]
+        os.makedirs(os.path.join(root, "tests"), exist_ok=True)
+        for role, cmd in denied:
+            with self.subTest(role=role, cmd=cmd[:70]):
+                self.assertEqual(self.check(role, cmd), "deny")
+
+
 class GateRuns(unittest.TestCase):
     """Gates run once per state of the files, one run at a time, and the setup commit needs none."""
 
@@ -874,6 +1086,22 @@ class GateRuns(unittest.TestCase):
             if os.path.exists(out):
                 os.remove(out)
 
+    def test_gates_run_without_the_sessions_project_folder(self):
+        # A gate inherited CLAUDE_PROJECT_DIR, so the harness's own tests ran on the real worktree (lesson 8).
+        out = tempfile.mktemp(prefix="regista-env-")
+        p = Project(gates=[{"name": "env", "run": f'printf "%s" "${{CLAUDE_PROJECT_DIR-unset}}" > "{out}"'}])
+        try:
+            with clean_environ(CLAUDE_PROJECT_DIR=p.root):
+                self.assertNotIn("CLAUDE_PROJECT_DIR", regista.gate_env(p.root))
+            r = subprocess.run([PY, TOOL, "gate", "--fresh"], cwd=p.root, capture_output=True, text=True,
+                               encoding="utf-8", env=clean_env(CLAUDE_PROJECT_DIR=p.root))
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertEqual(regista.read(out), "unset")
+        finally:
+            p.cleanup()
+            if os.path.exists(out):
+                os.remove(out)
+
     def test_setup_and_record_commits_skip_the_gates(self):
         fresh = tempfile.mkdtemp(prefix="regista-fresh-")
         try:
@@ -885,13 +1113,16 @@ class GateRuns(unittest.TestCase):
             c["gates"] = [{"name": "tests", "run": "npm test"}]  # no package.json yet: it can't pass
             regista.save_json(cfgfile, c)
             r = subprocess.run([PY, TOOL, "hook", "pre-tool"], capture_output=True, text=True, cwd=fresh, input=json.dumps(
-                {"cwd": fresh, **bash("git add -A && git commit -m 'chore: set up Regista'")}))
+                {"cwd": fresh, **bash("git add -A && git commit -m 'chore: set up Regista'")}),
+                env={**os.environ, "CLAUDE_PROJECT_DIR": fresh})
             self.assertEqual(r.stdout.strip(), "", r.stdout)
         finally:
             shutil.rmtree(fresh, ignore_errors=True)
         self.p = Project(gates=[{"name": "tests", "run": "exit 1"}], no_gates_for=["docs/**"])
         self.p.write(".regista/status.md", "done\n")
         self.p.write("docs/spec.md", "spec\n")
+        self.p.write(".regista/gates/requirements.json", "{}\n")  # what a gate run or a deploy commits on its own
+        self.p.write(".regista/gates/deployed.json", "{}\n")
         self.assertIsNone(decision(self.commit()))
         self.p.write("src/a.py", "x = 1\n")
         self.assertEqual(decision(self.commit()), "deny")
@@ -929,6 +1160,37 @@ class GateRuns(unittest.TestCase):
         self.p.write("src/a.py", "x = 1\n")
         self.assertIsNone(decision(self.commit()))
         self.assertEqual(regista.read(regista.requirements_path(self.p.root)), before)  # same result: no rewrite
+
+
+    def test_a_gate_run_on_a_clean_folder_commits_its_record(self):
+        # Gate runs left requirements.json uncommitted, so merges and the folder move refused (lesson 3).
+        self.p.write(".regista/specs/stats.json", json.dumps({**SPEC, "requirements": [SPEC["requirements"][0]]}))
+        self.p.write("tests/test_stats.py", "# covers: STATS-1\n")
+        sh(self.p.root, "git", "add", "-A")
+        sh(self.p.root, "git", "commit", "-q", "-m", "stats")
+        head = sh(self.p.root, "git", "rev-parse", "HEAD").strip()
+        self.p.write(".regista/status.md", "notes\n")
+        sh(self.p.root, "git", "add", ".regista/status.md")  # staged by someone else: stays out of the record's commit
+        r = self.p.cli("gate")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("Committed the updated records", r.stdout)
+        self.assertEqual(sh(self.p.root, "git", "rev-list", "--count", f"{head}..HEAD").strip(), "1")
+        files = sh(self.p.root, "git", "show", "--name-only", "--format=", "HEAD").split()
+        self.assertEqual(files, [".regista/gates/requirements.json"])
+        self.assertIn("STATS-1 now passes", sh(self.p.root, "git", "log", "-1", "--format=%s"))
+        self.assertEqual(sh(self.p.root, "git", "status", "--porcelain", "--untracked-files=no").strip(),
+                         "M  .regista/status.md")
+        cfg = regista.load_config(self.p.root)
+        self.assertTrue(regista.harness_only(self.p.root, cfg, files))  # a records-only commit: no gates, no review
+        self.assertFalse(any("now passes" in c for c in regista.commits_since(self.p.root, cfg, 0)))  # not new work
+        # the same result again: nothing to record, nothing to commit
+        self.assertNotIn("Committed", self.p.cli("gate", "--fresh").stdout)
+        self.assertEqual(sh(self.p.root, "git", "rev-list", "--count", f"{head}..HEAD").strip(), "1")
+        # with work in progress the record is left alone, and the output says so
+        self.p.write("tests/test_stats.py", "# covers: STATS-1\nmore\n")
+        r = self.p.cli("gate", "--fresh")
+        self.assertIn("Requirement results not updated", r.stdout)
+        self.assertNotIn("Committed", r.stdout)
 
 
 class FailClosed(unittest.TestCase):
@@ -1034,6 +1296,49 @@ class Requirements(unittest.TestCase):
         self.assertTrue(self.state()["STATS-1"]["passes"])
         self.assertTrue(self.state()["STATS-2"]["passes"])
         self.assertEqual(self.p.cli("milestone", "M1").returncode, 0)
+
+    def test_the_same_result_by_another_gate_keeps_the_record(self):
+        # NAV-1 flipped between "checked live" and "checked by the end-to-end tests" with the same pass (lesson 3).
+        live = {"name": "live", "run": "echo ok", "when": ["deploy"], "evidence": "e2e", "tests": ["e2e/**"]}
+        self.p = Project(gates=[{"name": "tests", "run": "echo ok"}, E2E_GATE, live])
+        self.p.write(".regista/specs/stats.json", json.dumps({**SPEC, "requirements": [SPEC["requirements"][1]]}))
+        self.p.write("e2e/cli_test.sh", "# covers: STATS-2\n")
+        cfg = regista.load_config(self.p.root)
+        run = lambda name, status: regista.record_requirements(  # noqa: E731
+            self.p.root, cfg, [{"name": name, "status": status}])
+        self.assertEqual(run("live", "pass")["STATS-2"]["evidence"], ["live"])
+        text = regista.read(regista.requirements_path(self.p.root))
+        run("e2e", "pass")
+        self.assertEqual(regista.read(regista.requirements_path(self.p.root)), text)  # same pass: untouched
+        self.assertFalse(run("e2e", "fail")["STATS-2"]["passes"])  # a different result is recorded
+        self.assertEqual(self.state()["STATS-2"]["evidence"], ["e2e"])
+
+    def test_only_a_covers_marker_counts(self):
+        # NAME-1 showed as covered because an old test checked the text "must look like NAME-1" (lesson 10).
+        self.p.write("tests/test_stats.py", 'assert error == "must look like STATS-1"  # recovers: STATS-2\n')
+        self.p.write("e2e/cli_test.sh", "# see STATS-2\n")
+        out = self.commit()
+        self.assertEqual(decision(out), "deny")
+        reason = out["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertIn("no test is marked `covers: STATS-1`", reason)
+        self.assertIn("tests/test_stats.py names it without marking it", reason)
+        self.assertIn("e2e/cli_test.sh, tests/test_stats.py name it without marking it", reason)
+        r = self.p.cli("requirements")
+        self.assertIn("not covered by any test yet", r.stdout)
+        self.assertIn("warning: STATS-1: tests/test_stats.py names it", r.stdout)
+        self.p.write("tests/test_stats.py", 'test("empty list (covers: STATS-1)", () => {})\n')
+        self.p.write("e2e/cli_test.sh", "# Covers:STATS-2\n")
+        self.assertIsNone(decision(self.commit()))
+
+    def test_marker_forms(self):
+        cfg = regista.load_config(self.p.root)
+        spec = {**SPEC, "requirements": [{"id": f"STATS-{n}", "text": "x", "verify": "test"} for n in range(1, 8)]}
+        self.p.write("tests/a.py", "# covers: STATS-1, STATS-2\n'covers: STATS-3 STATS-4'\n")
+        self.p.write("tests/b.js", "// covers: STATS-5,STATS-6\n/* STATS-7 is checked elsewhere */\n")
+        cov = regista.coverage(self.p.root, cfg, [spec])
+        self.assertEqual({rid for rid, c in cov.items() if c["tests"]}, {f"STATS-{n}" for n in range(1, 7)})
+        self.assertEqual(cov["STATS-7"], {"tests": [], "e2e": [], "mentions": ["tests/b.js"]})
+        self.assertEqual(cov["STATS-1"]["mentions"], [])
 
     def test_a_failing_gate_fails_its_requirements(self):
         self.p = Project(gates=[{"name": "tests", "run": "exit 1"}, E2E_GATE])
@@ -1162,6 +1467,69 @@ class BuildAll(unittest.TestCase):
             self.assertIsNone(decision(self.p.hook("pre-tool", as_agent(None, "Bash", command=cmd))))
 
 
+class AgentsAtWork(unittest.TestCase):
+    """Build-all runs ended as "stalled" while the session waited on its agents (FPL and Regista, October 2026)."""
+
+    def setUp(self):
+        self.p = Project(gates=[{"name": "tests", "run": "echo ok"}])
+        self.p.commit(".regista/plan.md", PLAN, "docs: plan")
+        self.p.cli("run", "start")
+
+    def tearDown(self):
+        self.p.cleanup()
+
+    def stop(self, again=False, session="s1"):
+        return self.p.hook("stop", {"session_id": session, **({"stop_hook_active": True} if again else {})})
+
+    def agent(self, event, agent_id="b1", kind="regista:builder", session="s1", **extra):
+        return self.p.hook(event, {"session_id": session, "agent_id": agent_id, "agent_type": kind, **extra})
+
+    def run_state(self):
+        return regista.load_json(regista.run_path(self.p.root), {})
+
+    def test_a_stop_while_agents_work_is_quiet_and_not_a_stall(self):
+        self.agent("subagent-start")
+        self.agent("subagent-start", "x1", "Explore")  # every agent counts, not only ours
+        for again in (False, True, True):  # it stopped twice and more without a commit: still not stalled
+            self.assertIsNone(self.stop(again))
+        self.assertTrue(self.run_state()["active"])
+        self.agent("subagent-stop")
+        self.assertIsNone(self.stop(True))  # the Explore agent still works
+        self.agent("subagent-stop", "x1", "Explore")
+        self.assertEqual(self.stop()["decision"], "block")  # nothing running: the usual nudge
+        out = self.stop(True)
+        self.assertIn("stopped", out["systemMessage"])
+        self.assertEqual(self.run_state()["outcome"], "stalled")
+
+    def test_only_this_sessions_agents_count(self):
+        self.agent("subagent-start", session="other")
+        self.assertEqual(self.stop()["decision"], "block")
+
+    def test_an_agent_that_never_reports_finishing_stops_counting(self):
+        self.agent("subagent-start")
+        path = os.path.join(self.p.root, ".regista", "agents", "b1.json")
+        st = jload(path)
+        st["started"] -= regista.AGENT_STALE + 60
+        jsave(path, st)
+        self.assertEqual(self.stop()["decision"], "block")
+
+    def test_without_a_run_nothing_changes(self):
+        self.p.cli("run", "end", "--reason", "done")
+        self.agent("subagent-start")
+        out = self.stop()
+        self.assertEqual(out["decision"], "block")  # the save reminder still applies outside a run
+        self.assertIn("since the last handoff", out["reason"])
+
+    def test_a_reviewer_still_records_its_verdict_before_it_finishes(self):
+        self.agent("subagent-start", "r1", "regista:reviewer")
+        out = self.agent("subagent-stop", "r1", "regista:reviewer")
+        self.assertEqual(out["decision"], "block")
+        self.assertIsNone(self.stop())  # it's still working
+        self.assertIsNone(self.agent("subagent-stop", "r1", "regista:reviewer", stop_hook_active=True))
+        self.assertTrue(jload(os.path.join(self.p.root, ".regista", "agents", "r1.json"))["finished"])
+        self.assertEqual(self.stop()["decision"], "block")
+
+
 class TryItYourself(unittest.TestCase):
     def setUp(self):
         self.p = Project(gates=[{"name": "tests", "run": "echo ok"}])
@@ -1217,7 +1585,8 @@ class TryItYourself(unittest.TestCase):
         self.assertIsNone(self.typed("UI-1 ok", agent_id="a1", agent_type="regista:builder"))
 
     def test_terminal_walkthrough_needs_a_person(self):
-        r = subprocess.run([PY, TOOL, "try", "--ask"], cwd=self.p.root, input="y\n\n", capture_output=True, text=True)
+        r = subprocess.run([PY, TOOL, "try", "--ask"], cwd=self.p.root, input="y\n\n", capture_output=True, text=True,
+                           env={k: v for k, v in os.environ.items() if k != "CLAUDE_PROJECT_DIR"})
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("run it yourself in a terminal", r.stderr)
         self.assertEqual(self.state(), {})
@@ -1355,6 +1724,207 @@ class Changes(unittest.TestCase):
         self.assertIn("Next in build order: M3.", out)
 
 
+PLAN_WITH_SCOPE = """# Demo: plan
+
+## M1 — Stats
+Steps:
+- [x] mean
+- [ ] median
+- [ ] **Mode** of the numbers
+
+## M2 — CLI
+Steps:
+- [ ] cli
+
+## Out of scope
+- graphs
+"""
+
+
+class PlanCommand(unittest.TestCase):
+    """The FPL overseer kept the plan by hand with scripts, and a lost tick held a milestone back (October 2026)."""
+
+    def setUp(self):
+        self.p = Project(gates=[{"name": "tests", "run": "echo ok"}], review={"required_for": []},
+                         roles={"source": ["src/**"], "tests": ["tests/**"]})
+        self.p.commit(".regista/plan.md", PLAN_WITH_SCOPE, "docs: plan")
+        self.plan = os.path.join(self.p.root, ".regista", "plan.md")
+
+    def tearDown(self):
+        self.p.cleanup()
+
+    def text(self):
+        with open(self.plan, encoding="utf-8", newline="") as f:
+            return f.read()
+
+    def milestones(self):
+        return {m["id"]: m for m in regista.plan_milestones(self.p.root, regista.load_config(self.p.root))}
+
+    def test_add_milestone_writes_the_plans_own_format(self):
+        r = self.p.cli("plan", "add-milestone", "Charts", "--after", "m2", "--files", "src/charts/**, tests/test_charts.py",
+                       "--gate", "a chart renders in under 1 s", "--step", "bar chart", "--step", "line chart")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("Added M3 — Charts to .regista/plan.md, built after M2.", r.stdout)
+        text = self.text()
+        self.assertIn("## M3 — Charts\nAfter: M2\nFiles: src/charts/**, tests/test_charts.py\n\nGate:\n"
+                      "- a chart renders in under 1 s\n\nSteps:\n- [ ] bar chart\n- [ ] line chart\n\n## Out of scope", text)
+        m = self.milestones()["M3"]
+        self.assertEqual((m["after"], m["files"], m["open_steps"]), (["M2"], ["src/charts/**", "tests/test_charts.py"], 2))
+        r = self.p.cli("plan", "add-milestone", "Polish", "--after", "all")
+        self.assertIn("Added M4 — Polish", r.stdout)
+        self.assertIn("Write its gate (what must be true, measurably) and its steps", r.stdout)
+        self.assertIn("names no files", r.stdout)
+        self.assertEqual(self.milestones()["M4"]["after"], "all")
+        r = self.p.cli("plan", "add-milestone", "Ghost", "--after", "M9")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("M9 isn't one", r.stdout)
+
+    def test_a_plan_with_windows_line_endings_keeps_them(self):
+        self.p.commit(".regista/plan.md", PLAN_WITH_SCOPE.replace("\n", "\r\n"), "crlf")
+        self.assertEqual(self.p.cli("plan", "add-milestone", "Charts", "--step", "bar").returncode, 0)
+        self.assertEqual(self.p.cli("plan", "tick", "M1", "2").returncode, 0)
+        text = self.text()
+        self.assertNotIn("\n", text.replace("\r\n", ""))
+        self.assertIn("- [x] median\r\n", text)
+        self.assertIn("## M3 — Charts\r\n", text)
+
+    def test_tick_by_number_or_by_text(self):
+        r = self.p.cli("plan", "tick", "M1", "2")
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertEqual(r.stdout.strip(), "Ticked M1, step 2: median")
+        self.assertIn("already ticked", self.p.cli("plan", "tick", "M1", "median").stdout)
+        self.assertIn("Ticked M1, step 3", self.p.cli("plan", "tick", "m1", "mode").stdout)  # a part only one step has
+        self.assertIn("- [x] **Mode** of the numbers", self.text())
+        r = self.p.cli("plan", "tick", "M2", "graphs")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("no step has that text", r.stdout)
+        self.assertIn("1. [ ] cli", r.stdout)
+        self.assertIn("has 1 step, not 4", self.p.cli("plan", "tick", "M2", "4").stdout)
+        self.assertIn("no milestone M7", self.p.cli("plan", "tick", "M7", "1").stdout)
+        ok, msg = regista.plan_tick(self.p.root, "M2", "cli")  # what a merge calls
+        self.assertTrue(ok, msg)
+        self.assertEqual(self.milestones()["M2"]["open_steps"], 0)
+
+    def test_only_the_orchestrator_runs_the_plan_command(self):
+        for cmd in (f'python "{TOOL}" plan tick M1 2', f'python "{TOOL}" plan add-milestone "More"'):
+            self.assertEqual(decision(self.p.hook("pre-tool", as_agent("builder", "Bash", command=cmd))), "deny", cmd)
+            self.assertIsNone(decision(self.p.hook("pre-tool", as_agent(None, "Bash", command=cmd))), cmd)
+
+    def spec(self, **extra):
+        self.p.write(".regista/specs/median.json", json.dumps({"step": "median", "milestone": "M1", "title": "Median",
+                                                               "requirements": [{"id": "MED-1", "text": "median works",
+                                                                                 "verify": "test"}], **extra}))
+        self.p.write("tests/test_median.py", "# covers: MED-1\n")
+
+    def commit_hook(self):
+        return self.p.hook("pre-tool", bash('git add -A && git commit -m "feat: median"'))
+
+    def test_the_commit_hook_ticks_the_step_its_spec_names(self):
+        self.spec(plan_step="median")
+        self.p.write("src/median.py", "def median(xs): ...\n")
+        out = self.commit_hook()
+        self.assertIsNone(decision(out))
+        self.assertIn("Ticked M1, step 2: median", out["hookSpecificOutput"]["additionalContext"])
+        self.assertIn("- [x] median", self.text())
+        self.assertIn(".regista/plan.md", sh(self.p.root, "git", "diff", "--cached", "--name-only"))  # in this commit
+
+    def test_the_step_by_its_number_or_by_the_specs_title(self):
+        self.spec(plan_step=3)
+        self.p.write("src/mode.py", "def mode(xs): ...\n")
+        self.commit_hook()
+        self.assertIn("- [x] **Mode** of the numbers", self.text())
+        self.assertIn("- [ ] median", self.text())
+        sh(self.p.root, "git", "checkout", "-q", "HEAD", "--", ".regista/plan.md")
+        self.spec()  # no plan_step: the title "Median" is the step's text
+        self.commit_hook()
+        self.assertIn("- [x] median", self.text())
+
+    def test_no_tick_when_it_cant_tell(self):
+        for extra in ({"plan_step": "med"}, {"title": "Median of a list", "step": "median-calc"},
+                      {"plan_step": "median", "state": "planned"}):
+            self.spec(**extra)
+            self.p.write("src/median.py", "def median(xs): ...\n")
+            out = self.commit_hook()
+            self.assertNotIn("Ticked", ((out or {}).get("hookSpecificOutput") or {}).get("additionalContext", ""), extra)
+            self.assertIn("- [ ] median", self.text(), extra)
+        os.remove(os.path.join(self.p.root, "src", "median.py"))
+        self.p.commit("tests/test_median.py", "# covers: MED-1\n", "tests and the planned spec")
+        self.spec(plan_step="median")
+        self.assertEqual(sh(self.p.root, "git", "status", "--porcelain").strip(), "M .regista/specs/median.json")
+        self.commit_hook()  # only the spec changes: no work, so no step is done
+        self.assertIn("- [ ] median", self.text())
+
+
+class ChangeFromTranscript(unittest.TestCase):
+    """Ciprian's scope changes were plain sentences to the overseer, and `change add` is refused to every agent."""
+
+    def setUp(self):
+        self.p = Project(gates=[{"name": "tests", "run": "echo ok"}])
+        self.t = os.path.join(tempfile.mkdtemp(prefix="regista-tr-"), "s1.jsonl")
+        self.say("Make the header blue. Also, build the price page last!\n- add club crests")
+        self.say("Don't add a dark mode.")
+        with open(self.t, "a", encoding="utf-8") as f:
+            for d in ({"type": "user", "isMeta": True, "origin": {"kind": "peer", "name": "worker"},
+                       "message": {"content": "Another Claude session sent a message: add a login page."}},
+                      {"type": "user", "isSidechain": True, "origin": {"kind": "human"},
+                       "message": {"content": "add a search box"}},
+                      {"type": "user", "message": {"content": "add a footer"}},  # no origin: not known to be a person
+                      {"type": "assistant", "message": {"content": [{"type": "text", "text": "add a news feed"}]}}):
+                f.write(json.dumps(d) + "\n")
+
+    def tearDown(self):
+        self.p.cleanup()
+        shutil.rmtree(os.path.dirname(self.t), ignore_errors=True)
+
+    def say(self, text):
+        with open(self.t, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"type": "user", "origin": {"kind": "human"},
+                                "message": {"content": [{"type": "text", "text": text}]}}) + "\n")
+
+    def check(self, quote, role=None, cmd=None):
+        return self.p.hook("pre-tool", {**as_agent(role, "Bash", command=cmd or f'python "{TOOL}" change from-transcript '
+                                                                               f'"{quote}"'),
+                                        "transcript_path": self.t})
+
+    def test_the_users_own_sentences_are_recorded(self):
+        for quote in ("Make the header blue.", "also, build the price page last", "Add club crests",
+                      "Make the header blue. Also, build the price page last!"):
+            self.assertIsNone(decision(self.check(quote)), quote)
+        queued(self.t, "Rename the tab to Fixtures.")  # sent while the session was busy
+        self.assertIsNone(decision(self.check("Rename the tab to Fixtures")))
+        r = self.p.cli("change", "from-transcript", "Make the header blue.")
+        self.assertIn("recorded change 1", r.stdout)
+        items = jload(os.path.join(self.p.root, ".regista", "changes.json"))
+        self.assertEqual(items[0]["text"], "Make the header blue.")
+        self.assertIn("transcript", items[0]["by"])
+
+    def test_anything_else_is_refused(self):
+        for quote in ("add a dark mode", "Make the header", "add a login page", "add a search box", "add a footer",
+                      "add a news feed", "build the price page"):
+            out = self.check(quote)
+            self.assertEqual(decision(out), "deny", quote)
+        self.assertIn("isn't something the user typed", self.check("add a dark mode")["hookSpecificOutput"]
+                      ["permissionDecisionReason"])
+        self.assertEqual(decision(self.check("Make the header blue.", role="builder")), "deny")
+        self.assertEqual(decision(self.check("", cmd=f'python "{TOOL}" change from-transcript --by me "Make the header '
+                                                     'blue."')), "deny")
+        out = self.p.hook("pre-tool", {**as_agent(None, "Bash", command=f'python "{TOOL}" change from-transcript '
+                                                                         '"Make the header blue."')})
+        self.assertEqual(decision(out), "deny")  # no transcript, no proof
+
+    def test_codex_reads_the_users_messages(self):
+        t = os.path.join(os.path.dirname(self.t), "rollout.jsonl")
+        with open(t, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"type": "event_msg", "payload": {"type": "user_message",
+                                                                 "message": "Build the price page last."}}) + "\n")
+            f.write(json.dumps({"type": "response_item", "payload": {"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "Add a dark mode."}]}}) + "\n")
+        for quote, want in (("Build the price page last.", None), ("Add a dark mode.", "deny")):
+            out = self.p.hook("pre-tool", {**bash(f'python "{TOOL}" change from-transcript "{quote}"'),
+                                           "session_id": "c1", "transcript_path": t}, host="codex")
+            self.assertEqual(decision(out), want, quote)
+
+
 class RunOutcome(unittest.TestCase):
     def test_a_run_that_only_waits_on_the_user_says_so(self):
         p = Project(gates=[{"name": "tests", "run": "echo ok"}, E2E_GATE])
@@ -1410,8 +1980,49 @@ class Deploy(unittest.TestCase):
                          "deny")
         self.assertIsNone(decision(self.p.hook("pre-tool", as_agent(None, "Bash", command=f'python "{TOOL}" deploy'))))
 
+    def test_a_deploy_leaves_the_folder_clean(self):
+        r = self.p.cli("deploy")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(sh(self.p.root, "git", "status", "--porcelain").strip(), "")
+        self.assertIn("Record the deploy of", sh(self.p.root, "git", "log", "-1", "--format=%s"))
+        self.assertEqual(sh(self.p.root, "git", "show", "--name-only", "--format=", "HEAD").split(),
+                         [".regista/gates/deployed.json"])
+
     def test_plain_gate_runs_skip_live_checks(self):
         self.assertNotIn("live", self.p.cli("gate").stdout)
+
+
+class GateCommands(unittest.TestCase):
+    """Agents ran the end-to-end suite directly, outside the gate lock, and collided on one database (lesson 7)."""
+
+    def setUp(self):
+        self.p = Project(gates=[{"name": "tests", "run": "cd web && PGHOST=/tmp npm test --silent"},
+                                {"name": "e2e", "run": "npm run e2e --silent", "evidence": "e2e", "tests": ["e2e/**"]}])
+
+    def tearDown(self):
+        self.p.cleanup()
+
+    def check(self, cmd, host=None):
+        out = self.p.hook("pre-tool", as_agent("builder", "Bash", command=cmd), host=host)
+        return decision(out), (out or {}).get("hookSpecificOutput", {}).get("permissionDecisionReason", "")
+
+    def test_running_a_gate_command_is_sent_through_the_harness(self):
+        for cmd in ("npm run e2e", "npm run e2e --silent > /tmp/e2e.log 2>&1 &", "cd sub && npm run e2e -- --grep x",
+                    "PGHOST=/tmp timeout 900 npm run e2e", 'bash -c "npm run e2e"', "npm test", "npm run test",
+                    "npm t -- web/a.test.js"):
+            with self.subTest(cmd=cmd):
+                verdict, reason = self.check(cmd)
+                self.assertEqual(verdict, "deny")
+                self.assertIn("gate " + ("e2e" if "e2e" in cmd else "tests"), reason)
+                self.assertIn("lock", reason)
+        self.assertEqual(self.check("npm run e2e", host="codex")[0], "deny")
+
+    def test_mentions_and_other_commands_are_fine(self):
+        for cmd in ('echo "npm run e2e"', 'grep -n "npm run e2e --silent" README.md', "npm run e2e:debug",
+                    "npm run build", "node --test e2e/one.test.js", "cd web", f'python "{TOOL}" gate e2e',
+                    "npm install"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(self.check(cmd)[0])
 
 
 LAUNCHER = os.path.join(os.path.dirname(TOOL), "regista")
@@ -1572,7 +2183,11 @@ class Fleet(unittest.TestCase):
     def test_spawn_refusals(self):
         self.assertIn("isn't ready", self.spawn("M4").stdout)
         self.assertIn("all its steps are ticked", self.spawn("M1").stdout)
-        self.assertEqual(self.spawn("M2").returncode, 0)
+        self.p.write(".regista/plan.md", FLEET_PLAN + "\n## M5 — Extra\n- [ ] more\n")  # the plan, not yet committed
+        r = self.spawn("M2")
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn("First committed the plan and the harness's records that had changed (.regista/plan.md)", r.stdout)
+        self.assertIn("M5 — Extra", sh(self.wt(), "git", "show", "HEAD:.regista/plan.md"))  # the worker sees it
         self.assertIn("already has a worker", self.spawn("M2", "--name", "again").stdout)
         self.p.write("src/a.py", "x = 1\n")
         sh(self.p.root, "git", "add", "-A")
@@ -1627,8 +2242,8 @@ class Fleet(unittest.TestCase):
         self.assertNotIn("SendMessage", (out or {}).get("reason", ""))  # asked once; the run carries on
         stop = self.hook("stop", {})
         self.assertEqual(stop["decision"], "block")
-        self.assertIn("committed 1 (feat: the pages)", stop["reason"])
-        self.assertIn("The pages are built.", stop["reason"])
+        self.assertIn("1 commit(s) (feat: the pages)", stop["reason"])  # progress is folded (lesson 11), commits named
+        self.assertIn("Told the overseer.", stop["reason"])
 
     def test_checks_and_changes_typed_in_a_worker_reach_the_overseer(self):
         self.p.commit(".regista/specs/m2.json", json.dumps({"milestone": "M2", "requirements": [
@@ -1696,7 +2311,7 @@ class Fleet(unittest.TestCase):
         sessions[0]["status"] = "busy"
         jsave(os.path.join(self.fake, "sessions.json"), sessions)
         self.worker_commit("src/pages.py", "pages = 1\n")
-        self.assertIn("m2 is busy", self.fleet("merge", "m2").stdout)
+        self.assertIn("m2 is busy", self.fleet("merge", "m2", "--when-idle", "0").stdout)
         sessions[0]["status"] = "idle"
         jsave(os.path.join(self.fake, "sessions.json"), sessions)
         self.worker_commit("broken.txt", "")
@@ -1712,7 +2327,7 @@ class Fleet(unittest.TestCase):
         r = self.fleet("merge", "m2")
         self.assertEqual(r.returncode, 1)
         self.assertIn("README.md", r.stdout)
-        self.assertIn("git merge main", r.stdout)
+        self.assertIn("fleet sync", r.stdout)  # how the worker brings the project's work into its branch
         self.assertEqual(sh(self.p.root, "git", "status", "--porcelain", "--untracked-files=no").strip(), "")
 
     def test_harness_records_merge_by_content(self):
@@ -1799,6 +2414,332 @@ class Fleet(unittest.TestCase):
         self.assertNotIn("fail", [r["status"] for r in res], res)
         with open(out, encoding="utf-8") as f:
             self.assertEqual(f.read(), "W=m2 S=1 OW=m2 OS=1")
+
+    # --- lesson 1: the overseer runs in the project -------------------------------------------
+
+    def set_sessions(self, update):
+        """Change the fake session list the way Claude Code would, in one step (the fake reads it meanwhile)."""
+        path = os.path.join(self.fake, "sessions.json")
+        sessions = jload(path) if os.path.exists(path) else []
+        update(sessions)
+        jsave(path + ".tmp", sessions)
+        os.replace(path + ".tmp", path)
+
+    def overseer_in(self, folder):
+        self.set_sessions(lambda s: s.append({"name": "overseer", "sessionId": "overseer-1", "status": "busy",
+                                              "cwd": folder, "kind": "interactive"}))
+
+    def test_fleet_commands_refuse_a_session_started_outside_the_project(self):
+        # The FPL overseer ran in ~/personal-assistants and drove the project with `cd ~/fpl && regista.py fleet …`
+        # (26 to 28 October 2026): its hooks never ran, so it heard nothing from its workers for 23 hours.
+        elsewhere = tempfile.mkdtemp(prefix="regista-elsewhere-")
+        self.addCleanup(shutil.rmtree, elsewhere, True)
+        self.overseer_in(elsewhere)
+        r = self.spawn()
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn(f"started in {elsewhere}, not in the project", r.stdout)
+        self.assertIn(f"`cd {self.p.root} && claude`", r.stdout)
+        self.assertIn("/regista:oversee", r.stdout)
+        self.assertFalse(os.path.exists(self.wt()))
+        self.assertIn("not in the project", self.fleet("merge", "m2").stdout)
+        self.assertEqual(self.fleet().returncode, 0)  # looking is fine
+        # a plain terminal in the project (no session) runs it as before
+        env = {k: v for k, v in os.environ.items() if k not in ("CLAUDE_PROJECT_DIR", "CLAUDE_CODE_SESSION_ID")}
+        env.update({k: v for k, v in self.env.items() if k != "CLAUDE_CODE_SESSION_ID"})
+        r = subprocess.run([PY, TOOL, "fleet", "spawn", "M3"], cwd=self.p.root, capture_output=True, text=True,
+                           encoding="utf-8", env=env)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        # a session started in the project, or in a folder inside it, may
+        self.set_sessions(lambda s: [x.update(cwd=os.path.join(self.p.root, ".regista")) for x in s
+                                     if x["sessionId"] == "overseer-1"])
+        r = self.spawn()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    # --- lesson 2: merges don't fail over small things -----------------------------------------
+
+    def test_merge_waits_for_a_worker_finishing_its_turn(self):
+        # A worker reported "ready" and the merge said "busy" while its turn was ending (4 times, 26 to 27 October).
+        import threading
+        self.spawn()
+        self.worker_commit("src/pages.py", "pages = 1\n")
+        self.set_sessions(lambda s: s[0].update(status="busy"))
+        later = threading.Timer(2.0, lambda: self.set_sessions(lambda s: s[0].update(status="idle")))
+        later.start()
+        self.addCleanup(later.cancel)
+        r = self.fleet("merge", "m2")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("Merged m2", r.stdout)
+        # a worker that stays busy is still refused, after the wait
+        self.worker_commit("src/more.py", "more = 1\n")
+        self.set_sessions(lambda s: s[0].update(status="busy"))
+        t0 = time.time()
+        r = self.fleet("merge", "m2", "--when-idle", "1")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("m2 is busy, still after waiting 1 second for its turn to end", r.stdout)
+        self.assertGreaterEqual(time.time() - t0, 1)
+        self.assertIn("--force", r.stdout)
+
+    def test_merge_commits_the_harness_records_and_sets_aside_one_in_the_way(self):
+        # FPL: a results file a gate run left changed or untracked stopped merges; the overseer committed by hand
+        # 6 times, and once Ciprian moved the file himself after 41 minutes.
+        self.spawn()
+        self.worker_commit("src/pages.py", "pages = 1\n")
+        self.worker_commit(".regista/gates/requirements.json", json.dumps({"UI-1": {"passes": True, "at": "2"}}))
+        self.p.write(".regista/status.md", "# Status\nM2 is being built.\n")
+        self.p.write(".regista/gates/requirements.json", json.dumps({"UI-1": {"passes": False, "at": "1"}}))
+        self.p.write("src/draft.py", "draft = 1\n")  # untracked work isn't in the way
+        with open(os.path.join(self.wt(), ".regista", "TODO.md"), "a", encoding="utf-8") as f:
+            f.write("- [ ] the worker's own note\n")  # the worker's uncommitted records aren't merged, so they don't stop it
+        r = self.fleet("merge", "m2")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("First committed the harness's records that had changed here (.regista/status.md)", r.stdout)
+        self.assertIn(".regista/gates/requirements.json was in the way", r.stdout)
+        self.assertIn("requirements.json.before-merge", r.stdout)
+        log = sh(self.p.root, "git", "log", "--first-parent", "--format=%s", "-2").splitlines()
+        self.assertEqual(log[1], "Save the harness's records before merging m2")
+        self.assertEqual(sh(self.p.root, "git", "show", "HEAD:.regista/status.md"), "# Status\nM2 is being built.\n")
+        self.assertTrue(jload(os.path.join(self.p.root, ".regista", "gates", "requirements.json"))["UI-1"]["passes"])
+        aside = jload(os.path.join(self.p.root, ".regista", "gates", "requirements.json.before-merge"))
+        self.assertFalse(aside["UI-1"]["passes"])  # the overseer's copy is kept, under another name
+        # work that isn't a record still stops the merge
+        self.worker_commit("src/more.py", "more = 1\n")
+        self.p.commit("src/a.py", "a = 1\n", "a")
+        self.p.write("src/a.py", "a = 2\n")
+        r = self.fleet("merge", "m2")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("uncommitted changes (src/a.py)", r.stdout)
+
+    def test_a_failed_merge_puts_the_record_it_set_aside_back(self):
+        self.spawn()
+        self.worker_commit(".regista/gates/requirements.json", json.dumps({"UI-1": {"passes": True, "at": "2"}}))
+        self.worker_commit("broken.txt", "")
+        self.p.write(".regista/gates/requirements.json", '{"mine": 1}')
+        r = self.fleet("merge", "m2")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("fails a gate", r.stdout)
+        self.assertEqual(jload(os.path.join(self.p.root, ".regista", "gates", "requirements.json")), {"mine": 1})
+        self.assertFalse(os.path.exists(os.path.join(self.p.root, ".regista", "gates", "requirements.json.before-merge")))
+
+    def test_plan_tick_boxes_merge_from_both_sides(self):
+        # FPL: two branches ticked steps in plan.md and the merge stopped on the conflict for about 30 minutes.
+        plan = FLEET_PLAN.replace("- [ ] the pages\n", "- [ ] the pages\n- [ ] the menu\n- [ ] the footer\n")
+        self.p.commit(".regista/plan.md", plan, "plan")
+        self.spawn()
+        self.worker_commit(".regista/plan.md", plan.replace("- [ ] the pages", "- [x] the pages"), "tick")
+        self.worker_commit("src/pages.py", "pages = 1\n")
+        ours = plan.replace("- [ ] the menu", "- [x] the menu").replace("- [ ] the footer", "- [ ] the footer, in blue")
+        self.p.commit(".regista/plan.md", ours, "the overseer's plan")
+        r = self.fleet("merge", "m2")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        merged = sh(self.p.root, "git", "show", "HEAD:.regista/plan.md")
+        self.assertEqual(merged, ours.replace("- [ ] the pages", "- [x] the pages"))
+        # anything else than tick boxes still stops it
+        self.worker_commit(".regista/plan.md", merged.replace("- [ ] the charts", "- [ ] the bar charts"), "reword")
+        self.p.commit(".regista/plan.md", merged.replace("- [ ] the charts", "- [x] the charts"), "tick")
+        r = self.fleet("merge", "m2")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn(".regista/plan.md (in the plan, more than tick boxes)", r.stdout)
+        self.assertEqual(sh(self.p.root, "git", "status", "--porcelain", "--untracked-files=no").strip(), "")
+
+    def test_merge_plan_ticks(self):
+        base = "## M1\n- [ ] a\n- [ ] b\n"
+        self.assertEqual(regista.merge_plan_ticks("## M1\n- [x] a\n- [ ] b\n", base, "## M1\n- [ ] a\n- [X] b\n"),
+                         "## M1\n- [x] a\n- [x] b\n")
+        self.assertEqual(regista.merge_plan_ticks("## M1\n- [ ] a\n- [ ] b\n- [ ] c\n", base, "## M1\n- [x] a\n- [x] b\n"),
+                         "## M1\n- [x] a\n- [x] b\n- [ ] c\n")  # the main side's new step, the other side's ticks
+        self.assertIsNone(regista.merge_plan_ticks("## M1\n- [x] a\n- [ ] b\n", base, "## M1\n- [ ] a\n- [ ] b2\n"))
+
+    def test_merge_installs_changed_dependencies_before_the_gates(self):
+        # FPL: a worker added a solver package; the main folder didn't have it, the gates hung, the merge took 37 minutes.
+        log = os.path.join(self.fake, "setup.log")
+        cfg_path = os.path.join(self.p.root, ".regista", "config.json")
+        c = jload(cfg_path)
+        c["fleet"] = {"setup": f'pwd >> "{log}"'}
+        c["gates"] = [{"name": "tests", "run": f'test -f "{log}"', "when": ["commit"]}]
+        jsave(cfg_path, c)
+        sh(self.p.root, "git", "commit", "-qam", "setup")
+        self.spawn()
+        os.remove(log)  # the worktree's own setup ran; now only the merge's counts
+        self.worker_commit("package-lock.json", '{"lockfileVersion": 3}')
+        r = self.fleet("merge", "m2")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("The merge changed package-lock.json, so the dependencies were installed first", r.stdout)
+        with open(log, encoding="utf-8") as f:
+            self.assertEqual(os.path.realpath(f.read().strip()), os.path.realpath(self.p.root))
+        self.worker_commit("src/pages.py", "pages = 1\n")  # no dependency change: no install
+        os.remove(log)
+        r = self.fleet("merge", "m2")
+        self.assertEqual(r.returncode, 1)  # the gate needs the log, so it shows no install ran
+        self.assertNotIn("installed first", r.stdout)
+
+    def test_a_merge_reuses_the_workers_passing_run(self):
+        # FPL: 6 of 7 merges re-ran the full gates on code the worker had just passed, about 62 minutes in all.
+        runs = os.path.join(self.fake, "runs.log")
+        cfg_path = os.path.join(self.p.root, ".regista", "config.json")
+        c = jload(cfg_path)
+        c["gates"] = [{"name": "tests", "run": f'echo run >> "{runs}"; test ! -f broken.txt', "when": ["commit"]}]
+        jsave(cfg_path, c)
+        sh(self.p.root, "git", "commit", "-qam", "counting gate")
+        self.spawn()
+        self.worker_commit("src/pages.py", "pages = 1\n")
+        r = subprocess.run([PY, TOOL, "gate"], cwd=self.wt(), capture_output=True, text=True, encoding="utf-8",
+                           env={k: v for k, v in os.environ.items() if k != "CLAUDE_PROJECT_DIR"})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue(os.path.isfile(os.path.join(self.p.root, ".git", "regista-passed.json")))
+        r = self.fleet("merge", "m2")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("reused", r.stdout)
+        with open(runs, encoding="utf-8") as f:
+            self.assertEqual(len(f.read().splitlines()), 1)
+        # once the project has moved on, the merged code is new: the gates run
+        self.worker_commit("src/more.py", "more = 1\n")
+        subprocess.run([PY, TOOL, "gate"], cwd=self.wt(), capture_output=True, env={k: v for k, v in os.environ.items()
+                                                                                   if k != "CLAUDE_PROJECT_DIR"})
+        self.p.commit("other.txt", "the overseer's own commit\n", "other")
+        r = self.fleet("merge", "m2")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("reused", r.stdout)
+        with open(runs, encoding="utf-8") as f:
+            self.assertEqual(len(f.read().splitlines()), 3)
+
+    def test_the_fingerprint_is_the_content_and_nothing_else(self):
+        root, cfg = self.p.root, regista.load_config(self.p.root)
+        fp = regista.state_fingerprint(root, cfg)
+        self.p.write("src/a.py", "a = 1\n")
+        dirty = regista.state_fingerprint(root, cfg)
+        self.assertNotEqual(dirty, fp)  # an untracked file counts
+        sh(root, "git", "add", "-A")
+        sh(root, "git", "commit", "-q", "-m", "a")
+        self.assertEqual(regista.state_fingerprint(root, cfg), dirty)  # committed or not, the same content
+        self.p.write(".regista/status.md", "# Status\nbusy\n")
+        self.assertEqual(regista.state_fingerprint(root, cfg), dirty)  # the harness's records don't count
+        self.p.write("src/a.py", "a = 2\n")
+        self.assertNotEqual(regista.state_fingerprint(root, cfg), dirty)
+        self.p.write("src/a.py", "a = 1\n")
+        self.assertEqual(regista.state_fingerprint(root, cfg), dirty)
+        if os.name != "nt":
+            os.chmod(os.path.join(root, "src", "a.py"), 0o755)
+            self.assertNotEqual(regista.state_fingerprint(root, cfg), dirty)  # an executable bit changes what runs
+            os.chmod(os.path.join(root, "src", "a.py"), 0o644)
+        os.rename(os.path.join(root, "src", "a.py"), os.path.join(root, "src", "b.py"))
+        sh(root, "git", "add", "-A")
+        self.assertNotEqual(regista.state_fingerprint(root, cfg), dirty)  # a rename moves the content
+
+    def test_a_worker_brings_in_the_projects_work(self):
+        # Regista's own build: a worker couldn't merge the main branch into its own, because the results file
+        # conflicted and the hook refused both ways of resolving it (27 October).
+        self.spawn()
+        self.worker_commit(".regista/gates/requirements.json", json.dumps({"A-1": {"passes": True, "at": "2"}}))
+        self.worker_commit("src/pages.py", "pages = 1\n")
+        self.p.commit(".regista/gates/requirements.json", json.dumps({"B-1": {"passes": True, "at": "1"}}), "results")
+        self.p.commit("src/other.py", "other = 1\n", "other")
+        self.p.commit(".regista/status.md", "# Status\nthe overseer's\n", "status")
+        self.worker_commit(".regista/status.md", "# Status\nthe worker's copy\n", "status")
+        # the worker's session may run it; its agents may not; hand edits of the results stay refused
+        self.assertIsNone(decision(self.hook("pre-tool", bash(f'python3 "{TOOL}" fleet sync'), cwd=self.wt())))
+        out = self.hook("pre-tool", {**bash(f'python3 "{TOOL}" fleet sync'), "agent_id": "a1",
+                                     "agent_type": "regista:builder"}, cwd=self.wt())
+        self.assertEqual(decision(out), "deny")
+        out = self.hook("pre-tool", bash("git checkout --theirs .regista/gates/requirements.json"), cwd=self.wt())
+        self.assertEqual(decision(out), "deny")
+        r = self.fleet("sync", cwd=self.wt())
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("Brought main's work into your branch", r.stdout)
+        self.assertEqual(sh(self.wt(), "git", "show", "HEAD:src/other.py"), "other = 1\n")
+        results = json.loads(sh(self.wt(), "git", "show", "HEAD:.regista/gates/requirements.json"))
+        self.assertEqual(set(results), {"A-1", "B-1"})
+        self.assertEqual(sh(self.wt(), "git", "show", "HEAD:.regista/status.md"), "# Status\nthe overseer's\n")
+        self.assertEqual(sh(self.wt(), "git", "status", "--porcelain", "--untracked-files=no").strip(), "")
+        self.assertIn("Nothing to bring in", self.fleet("sync", cwd=self.wt()).stdout)
+        # a real code conflict: the records are resolved, the code is left to the worker, who commits through the hook
+        self.worker_commit("README.md", "the worker's readme\n")
+        self.worker_commit(".regista/gates/requirements.json", json.dumps({"A-1": {"passes": False, "at": "3"}}))
+        self.p.commit("README.md", "the overseer's readme\n", "readme")
+        self.p.commit(".regista/gates/requirements.json", json.dumps({"B-1": {"passes": False, "at": "4"}}), "results")
+        r = self.fleet("sync", cwd=self.wt())
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("changed the same lines in README.md.", r.stdout)
+        self.assertIn("`git commit --no-edit`: the commit hook runs the gates and the review", r.stdout)
+        self.assertIn("git merge --abort", r.stdout)
+        self.assertEqual(sh(self.wt(), "git", "diff", "--name-only", "--diff-filter=U").split(), ["README.md"])
+        with open(os.path.join(self.wt(), "README.md"), "w", encoding="utf-8") as f:
+            f.write("both readmes\n")
+        sh(self.wt(), "git", "add", "README.md")
+        sh(self.wt(), "git", "commit", "-q", "--no-edit")
+        self.assertEqual(len(sh(self.wt(), "git", "show", "-s", "--format=%P", "HEAD").split()), 2)
+        results = json.loads(sh(self.wt(), "git", "show", "HEAD:.regista/gates/requirements.json"))
+        self.assertEqual((results["A-1"]["at"], results["B-1"]["at"]), ("3", "4"))
+        # a merge the worker started by hand: sync resolves its records
+        self.worker_commit(".regista/gates/requirements.json", json.dumps({"A-1": {"passes": True, "at": "5"}}))
+        self.p.commit(".regista/gates/requirements.json", json.dumps({"B-1": {"passes": True, "at": "6"}}), "results")
+        subprocess.run(["git", "merge", "main"], cwd=self.wt(), capture_output=True)
+        r = self.fleet("sync", cwd=self.wt())
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("records in the merge under way are resolved", r.stdout)
+        sh(self.wt(), "git", "commit", "-q", "--no-edit")
+        results = json.loads(sh(self.wt(), "git", "show", "HEAD:.regista/gates/requirements.json"))
+        self.assertTrue(results["A-1"]["passes"] and results["B-1"]["passes"])
+        # and the overseer's merge of the result goes through
+        self.assertEqual(self.fleet("merge", "m2").returncode, 0)
+        self.assertEqual(sh(self.p.root, "git", "show", "HEAD:README.md"), "both readmes\n")
+        self.assertIn("is for a worker", self.fleet("sync").stdout)
+
+    def test_spawn_warns_when_milestones_share_files(self):
+        plan = FLEET_PLAN.replace("## M2 — Pages\n", "## M2 — Pages\nFiles: src/pages/**, tests/test_app.py\n") \
+            .replace("## M3 — Charts\n", "## M3 — Charts\nFiles: src/charts/**, `tests/test_app.py`\n")
+        plan += "\n## M5 — Feeds\nFiles: src/feeds/**\n- [ ] feeds\n\n## M6 — Help\n- [ ] help\n"
+        self.p.commit(".regista/plan.md", plan, "plan with files")
+        self.assertNotIn("Warning", self.spawn("M2").stdout)
+        r = self.spawn("M3")
+        self.assertEqual(r.returncode, 0, r.stdout)  # a warning, not a refusal
+        self.assertIn("Warning: M3 and the running worker m2 (M2) change the same files: tests/test_app.py.", r.stdout)
+        self.assertIn("`regista.py fleet stop m3`", r.stdout)
+        self.assertNotIn("Warning", self.spawn("M5").stdout)
+        self.fleet("stop", "m3")
+        self.fleet("stop", "m5")
+        self.assertIn("M6 names no files", self.spawn("M6").stdout)
+
+    def test_a_worker_doesnt_edit_the_plan_and_its_commits_tick_it(self):
+        self.p.commit(".regista/specs/pages.json", json.dumps({"milestone": "M2", "step": "pages", "plan_step": "the pages",
+                                                               "requirements": []}), "spec")
+        self.spawn()
+        w = self.wt()
+        plan = os.path.join(w, ".regista", "plan.md")
+        for payload in ({"tool_name": "Edit", "tool_input": {"file_path": plan}},
+                        bash("sed -i 's/\\[ \\] the pages/[x] the pages/' .regista/plan.md"),
+                        bash(f'python3 "{TOOL}" plan tick M2 1')):
+            out = self.hook("pre-tool", payload, cwd=w)
+            self.assertEqual(decision(out), "deny", payload)
+            self.assertIn("overseer", out["hookSpecificOutput"]["permissionDecisionReason"])
+        out = self.hook("pre-tool", bash("git checkout -- ."), cwd=w) or {}  # a command on the whole folder
+        self.assertNotIn("edit the plan", out.get("hookSpecificOutput", {}).get("permissionDecisionReason", ""))
+        r = subprocess.run([PY, TOOL, "plan", "tick", "M2", "1"], cwd=w, capture_output=True, text=True, encoding="utf-8")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("overseer", r.stdout + r.stderr)
+        self.assertIsNone(decision(self.hook("pre-tool", {"tool_name": "Edit", "tool_input": {
+            "file_path": os.path.join(self.p.root, ".regista", "plan.md")}})))  # the overseer's own plan
+        # the worker commits the step: the hook ticks it on the worker's branch
+        with open(os.path.join(w, ".regista", "specs", "pages.json"), "w", encoding="utf-8") as f:
+            json.dump({"milestone": "M2", "step": "pages", "plan_step": "the pages", "title": "Pages",
+                       "requirements": []}, f)
+        os.makedirs(os.path.join(w, "src"), exist_ok=True)
+        with open(os.path.join(w, "src", "pages.py"), "w", encoding="utf-8") as f:
+            f.write("pages = 1\n")
+        out = self.hook("pre-tool", bash('git add -A && git commit -m "feat: the pages"'), cwd=w)
+        self.assertIsNone(decision(out), out)
+        sh(w, "git", "add", "-A")
+        sh(w, "git", "commit", "-q", "-m", "feat: the pages")
+        self.assertIn("- [x] the pages", sh(w, "git", "show", "HEAD:.regista/plan.md"))
+        self.assertIn("- [ ] the pages", sh(self.p.root, "git", "show", "HEAD:.regista/plan.md"))
+
+    def test_a_worker_waiting_on_its_agents_isnt_sent_to_report(self):
+        self.spawn()
+        self.worker_commit("src/pages.py", "pages = 1\n")
+        self.hook("subagent-start", {"session_id": "w1", "agent_id": "b7", "agent_type": "regista:builder"}, cwd=self.wt())
+        self.assertIsNone(self.hook("stop", {"session_id": "w1"}, cwd=self.wt()))
+        self.hook("subagent-stop", {"session_id": "w1", "agent_id": "b7", "agent_type": "regista:builder"}, cwd=self.wt())
+        out = self.hook("stop", {"session_id": "w1"}, cwd=self.wt())
+        self.assertEqual(out["decision"], "block")  # its agents are done: the run's nudge (and report) are back
 
 
 class Launcher(unittest.TestCase):
@@ -1899,6 +2840,22 @@ class Detect(unittest.TestCase):
         self.assertEqual(d["gates"], [])
         self.assertTrue(any("no code yet" in n for n in d["notes"]))
         self.assertIn(".env", d["protected"])
+
+    def test_a_database_per_worker_is_proposed(self):
+        # The FPL workers shared one test database and reset it under each other (lesson 7).
+        self.write("package.json", json.dumps({"scripts": {"test": "node --test", "e2e": "node --test tests/e2e/"},
+                                               "dependencies": {"pg": "8", "express": "4"}}))
+        self.write("tests/e2e/pages.test.js", "")
+        d = regista.detect(self.root)
+        e2e = next(g for g in d["gates"] if g["name"] == "e2e")
+        self.assertEqual((e2e["run"], e2e["evidence"], e2e["tests"]), ("npm run e2e", "e2e", ["tests/e2e/**"]))
+        note = next(n for n in d["notes"] if "REGISTA_SLOT" in n)
+        self.assertIn("PostgreSQL", note)
+        self.assertIn("_test_${REGISTA_SLOT:-0}", note)
+        self.assertIn("isolated_gates", note)
+        self.write("package.json", json.dumps({"scripts": {"test": "node --test", "e2e": "node --test tests/e2e/"},
+                                               "dependencies": {"better-sqlite3": "9"}}))
+        self.assertFalse(any("REGISTA_SLOT" in n for n in regista.detect(self.root)["notes"]))  # a file per worktree
 
     def test_node_web_app(self):
         self.write("package.json", json.dumps({"scripts": {"test": "vitest run", "lint": "eslint ."},
