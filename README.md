@@ -1,6 +1,24 @@
 # Regista: a build harness for Claude Code and Codex
 
+**Coding agents are good at writing code and bad at keeping their own rules over a long project.** They
+forget where they were after a reset, skip the tests when they're in a hurry, and approve their own work.
+Regista makes the rules hold: every step gets its tests written first, an independent review of exactly
+that change, and gates that block the commit until both pass. The work survives every reset, and you see
+it in plain language.
+
+Regista is built with Regista: every change since version 0.10 was specified, tested first, reviewed and
+gated before it could be committed.
+
+```bash
+claude plugin marketplace add ciprianrosca/regista
+claude plugin install regista@regista
+```
+
+Then, in your project: `/regista:init` to set it up, and `/regista:build all` to build the plan.
+
 Regista was called Daedalus until version 0.8.
+
+## What it enforces
 
 Regista turns Claude Code, or OpenAI's Codex CLI, into a disciplined builder for long-running
 projects. The rules that matter are **enforced by hooks**, not left to the model's memory:
