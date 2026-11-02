@@ -16,8 +16,6 @@ claude plugin install regista@regista
 
 Then, in your project: `/regista:init` to set it up, and `/regista:build all` to build the plan.
 
-Regista was called Daedalus until version 0.8.
-
 ## What it enforces
 
 Regista turns Claude Code, or OpenAI's Codex CLI, into a disciplined builder for long-running
@@ -128,23 +126,6 @@ python "<regista>/scripts/regista.py" open ~/fpl fpl-build
 It starts Claude Code in that folder inside tmux, with Remote Control under that name (so it shows up in
 the Claude app), and answers the "do you trust this folder" question for you. `--mode auto` sets its
 permission mode. Only you run it: agents are refused, as they are for starting any session.
-
-## Moving a project from Daedalus
-
-Projects set up with Daedalus keep working through the 0.9 series: Regista reads their `.daedalus/`
-folder as before, and says once per session that the project can move to the new name. `/regista:start`
-offers the move and makes it only after you say yes. The move renames the folder to `.regista/` and
-updates the paths that point into it. You can also run `regista.py migrate` yourself from the project's
-root folder: the first command below shows what would change and changes nothing, the second makes the
-move in one commit.
-
-```bash
-python "<regista>/scripts/regista.py" migrate --check
-python "<regista>/scripts/regista.py" migrate
-```
-
-When the old plugin is still enabled, `migrate` ends with the exact commands that swap it for Regista,
-in Claude Code and in Codex, to run in a terminal before you start a new session.
 
 ## What a project gets
 
