@@ -18,7 +18,8 @@
   ],
   "protected": [],
   "no_gates_for": [
-    "docs/**"
+    "docs/**",
+    ".regista/**"
   ],
   "push": "ask",
   "stop": "block",

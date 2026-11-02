@@ -99,6 +99,22 @@ def clean_environ(**extra):
     return mock.patch.dict(os.environ, clean_env(**extra), clear=True)
 
 
+def person_env(**extra):
+    """A person's own shell, as clean_env, and also without the variables an agent's shell has (Claude Code's
+    project variables and CLAUDECODE, Codex's CODEX_* other than CODEX_HOME): the gates themselves run with
+    CLAUDECODE=1, and the harness treats a command run from an agent's shell differently."""
+    env = {k: v for k, v in clean_env().items()
+           if k not in regista.HOST_PROJECT_VARS and k != "CLAUDECODE"
+           and not (k.startswith("CODEX_") and k != "CODEX_HOME")}
+    env.update(extra)
+    return env
+
+
+def person_environ(**extra):
+    """This process's environment made a person's shell the same way, for code run in-process."""
+    return mock.patch.dict(os.environ, person_env(**extra), clear=True)
+
+
 def env_gate(out):
     """A gate that writes the worker and slot it sees, under the new and the old names, to the file out."""
     return {"name": "env", "run": 'printf "W=%s S=%s OW=%s OS=%s" "${REGISTA_WORKER-unset}" "${REGISTA_SLOT-unset}" '
@@ -1585,8 +1601,9 @@ class TryItYourself(unittest.TestCase):
         self.assertIsNone(self.typed("UI-1 ok", agent_id="a1", agent_type="regista:builder"))
 
     def test_terminal_walkthrough_needs_a_person(self):
+        # a person's shell (no CLAUDE_PROJECT_DIR, no agent's variables) whose input isn't a terminal
         r = subprocess.run([PY, TOOL, "try", "--ask"], cwd=self.p.root, input="y\n\n", capture_output=True, text=True,
-                           env={k: v for k, v in os.environ.items() if k != "CLAUDE_PROJECT_DIR"})
+                           env=person_env())
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("run it yourself in a terminal", r.stderr)
         self.assertEqual(self.state(), {})

@@ -23,7 +23,8 @@ you can, choose the defaults, and ask only what only they know. Plain words thro
    folders and protected secret files (`.env`, keys), and sets up the agent hosts: Claude Code's
    compaction (`.claude/settings.json`) and, if Codex is installed, `.codex/` (compaction, the four
    Regista agents, git access from Codex's Windows sandbox) plus a short note in `AGENTS.md`. Read its
-   JSON output: `detected.notes` says what's missing, `hosts` what was set up.
+   JSON output: `detected.notes` says what's missing, `hosts` what was set up, and `ruff` (when
+   present) that ruff's settings now skip `.regista/` and `.claude/worktrees/`.
 4. **A spec file given?** (`/regista:init docs/spec.md`, or a path the user names.) Read it whole. Take
    the three answers below from it: what is built and for whom (its opening), how to check it works
    (its acceptance or testing section, or the behaviour it describes), and what must never change (its

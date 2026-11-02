@@ -65,7 +65,9 @@ installing: `claude --plugin-dir <path to the clone>`. Codex copies the plugin i
 Both need Python 3.10+ and Git (Git Bash runs the gate commands on Windows). In Claude Code the hooks
 start through `scripts/regista`, a small launcher that finds Python as `python3`, `python` or `py -3`.
 Codex starts them with `python`, so there the command must exist (`sudo apt install python-is-python3`
-on Debian and Ubuntu); `regista.py doctor` checks it.
+on Debian and Ubuntu); `regista.py doctor` checks it. Everything runs on Python 3.10 except one step:
+editing ruff's settings (below) needs Python 3.11 or newer, because reading TOML came with 3.11. On 3.10,
+`init` and `migrate` leave ruff's settings as they are and print the line to add by hand.
 
 ## Use
 
@@ -96,7 +98,8 @@ everything below).
 
 `python <regista>/scripts/regista.py doctor` checks that everything works in a project, in plain
 language, with the fix for each problem. It also checks that git knows who commits, and proposes a
-`deploy` section when the project has live checks but no deploy.
+`deploy` section when the project has live checks but no deploy, and names the gates whose linter would
+also check the code in `.regista/` and in agents' worktrees (see "What a project gets").
 
 To open a new session in a project from a terminal, in one line:
 
@@ -156,6 +159,14 @@ or an end-to-end check starts with a milestone that adds them. When the end-to-e
 server (PostgreSQL, MySQL, MongoDB, Redis, or an ORM over one), the proposal adds a database per worker:
 the tests' setup names it after `REGISTA_SLOT` (for example `shop_test_${REGISTA_SLOT:-0}`), so workers
 don't reset each other's data and their gate runs needn't take turns (see "Tests that share a database").
+
+Linters should leave `.regista/` and `.claude/worktrees/` alone: the first can hold research scripts, the
+second holds agents' copies of the project. When the project has ruff settings (`[tool.ruff]` in
+pyproject.toml, or ruff.toml or .ruff.toml), `init` and `migrate` add both folders to ruff's
+`extend-exclude` and say so; the rest of the file stays as it was, and a second run changes nothing.
+Regista doesn't edit other linters' settings: `regista.py doctor` names each gate that runs eslint,
+flake8, pylint, biome, `prettier --check`, or a ruff that doesn't exclude both folders, while `.regista/`
+holds code files, so you can add the excludes yourself.
 
 ### Roles
 
@@ -304,6 +315,14 @@ the project they work as usual.)
   `regista.py fleet allow <name>`, which lets the worker do exactly that once. The hook lets the overseer
   run it only right after you typed yes in its chat, to a question that named that worker, so no agent can
   approve for you. You can also say yes in the worker itself.
+- **A worker's own records are kept**: removing a worker deletes its worktree, and with it the records git
+  doesn't hold: its hooks log (what its hooks refused), its gate history, its compactions, and any review it
+  wrote but never committed. So `fleet remove` first copies them into the project, at
+  `.regista/fleet/logs/<milestone>/<worker>/` (same file names, plus an `index.json` with the worker's name,
+  milestone, branch, Claude Code session id, worktree and the time of the copy), whether the worker was merged
+  or not and with or without `--force`. Reviews the project already has aren't copied again. If the copy
+  fails, the worktree stays and the command says why. These records alone don't stop a plain `fleet remove`;
+  other uncommitted changes still do. Like the hooks log and gate history, the folder stays out of git.
 - **News, kept short**: the news drops workers that have been removed, and folds a worker's progress-only
   updates into one line. What's ready, blocked, waiting for you, or asking something comes in full.
 - **Limits**: only the overseer starts, merges, stops and removes workers, passes on your OK, deploys, and
@@ -357,8 +376,37 @@ Set `window` (tokens), or the env var `REGISTA_CONTEXT_WINDOW`, to override it.
   is allowed (`.regista/`, the status file, the board, git, the Regista CLI), then `/clear` and
   `/regista:start continue`. `"on_limit": "pause"` makes that the rule at `limit_pct` itself.
 
-Refusals are logged to `.regista/hooks.log`. `python scripts/regista.py context <transcript.jsonl>`
-shows a Claude Code session's current use.
+`python scripts/regista.py context <transcript.jsonl>` shows a Claude Code session's current use.
+
+### Refusals, and whether they were right
+
+Every time a hook refuses a tool call, or asks you before letting it through, Regista adds one line to
+`.regista/hooks.log`. The line says whether it was a refusal or a question, which rule fired, whose call it
+was (the main session, which agent, or which worker), the session, and a first label. Rules that are never
+wrong when they fire, such as a failed gate, a commit with `--no-verify`, a write to a protected path or a
+push that needs your go-ahead, are labelled `real`. The others, mostly the rules about what each agent may
+touch, are labelled `unsure`, because some of them are false alarms (a reviewer's read-only command judged
+to change a file, for example). A rule about paths counts as `real` only when the refused path matched
+exactly: when the match came from a folder that holds it (`git checkout -- .`), a variable Regista couldn't
+follow, or a path inside inline code, the refusal is `unsure`. So is a pause at the context limit, which
+rests on an estimate of the tokens used.
+
+```bash
+python scripts/regista.py refusals                 # every refusal, newest first, with its number
+python scripts/regista.py refusals --unlabelled    # only the unsure ones, waiting for your label
+python scripts/regista.py refusals label 12 false_alarm --why "sed -n only reads the file"
+python scripts/regista.py refusals --json          # the same list for other tools, labels included
+```
+
+The label can be `real` (the refusal was right) or `false_alarm` (it shouldn't have fired). Your labels are
+added to the end of the log, so nothing already in it is ever rewritten, and older lines without a rule or
+a label still list. Labelling is your call: the hooks refuse every session that tries to run `refusals label`,
+the main orchestrator session included, so you label from your own terminal, and they refuse every write to
+the log they can recognise. As a second defence, `refusals label` itself won't run inside a Claude Code or
+Codex tool shell (it sees their environment variables, such as `CLAUDECODE`). Neither defence is complete:
+a command the hooks can't parse (inline Python, a renamed copy of `regista.py`, a variable cleared first)
+could still add a label or write to the log. The board tracks that gap; closing it needs a guard at the
+operating-system level, such as a separate user or a read-only mount.
 
 ### Try it yourself
 
@@ -390,12 +438,47 @@ follow:
   question, and "doc ok" the only check it named. Only a reply you typed counts, and only when the
   session's last message held those lines; "not ok" or "mostly ok" records nothing.
 
+Each manual record also says how it was passed, in its `how` field, without changing whether it passes:
+
+- `looked`: you passed that one check by name (`/regista:verify UI-3 ok`, an "ok" to a question naming only
+  that check, `try --ask`, or `regista.py verify-manual` run yourself at a real terminal).
+- `bulk`: passed together with others, by `all ok`, `M3 ok` or a plain "ok" to a question naming several
+  checks. A check you had already passed by name keeps `looked`.
+- `forced`: `verify-manual ID --note "…" --forced`, or a note that says it was forced, not confirmed
+  individually or not checked one by one.
+- `relayed`: `verify-manual` run without a terminal, or in a shell that carries an agent's environment
+  variables (`CLAUDECODE` or Codex's, the same check `refusals label` makes), even inside a pseudo-terminal.
+  That covers an agent in another project's session, where this project's hooks can't refuse it. `by` still
+  says `user`.
+
+`try --ask` won't run at all in a shell that carries an agent's variables, even inside a pseudo-terminal: it
+records nothing and tells the agent to ask you to run it in your own terminal.
+
+This is not a guarantee that an agent can never get `looked`. Both commands recognise an agent's shell only by
+its environment variables, so a command that clears them and runs `verify-manual` or `try --ask` inside a fake
+terminal could still pass as `looked`. It is the same gap as the one `refusals label` has, described above, and
+closing it needs the same guard at the operating-system level.
+
+`regista.py requirements` shows the how next to each manual pass (`unknown` for records written before the
+field existed), and `regista.py milestone M2` says how many of the milestone's passed manual checks you
+didn't look at one by one.
+
 
 Agents are refused `verify-manual`, `try --ask`, `regista.py open` and starting Claude Code or Codex sessions from the
 shell (a nested session could type the command for them). `claude plugin`, `claude mcp`, `claude agents`,
 `claude doctor` and `claude --version` start no session and are fine, and so is the harness run on a
 scratch project of its own. A failed check goes on the board and back
 through the build loop.
+
+The hooks are never run by hand. Only Claude Code and Codex call them, with what you actually typed; fed a
+made-up `/regista:verify UI-3 ok`, the user-prompt hooks would record a check you never looked at. So the
+pre-tool hook refuses every agent's shell command that runs `regista.py hook …` or the `regista` wrapper's
+`hook …`, however it is spelled (`python` or `python3`, `sh` with the wrapper, a quoted path, after `cd` or
+`env`, with input piped in), in every role and in Codex too. A subcommand it can't read, such as `$(…)` or a
+variable, counts as `hook`. The harness's hooks run on a scratch project of its own (another folder, with
+`CLAUDE_PROJECT_DIR` cleared) are fine. That leaves gaps, as with the guard on `refusals label`: it can't see a
+renamed copy of `regista.py`, inline code that imports it, or a run from another folder whose input names this
+project as its `cwd` (a hook takes its project from its input).
 
 ### Codex
 
@@ -475,7 +558,12 @@ The same `regista.py` runs Codex's hooks with `--host codex` (`hooks/codex-hooks
   commit of records only skips the gates and the review. With other uncommitted work the record is left
   alone and the output says so: the commit hook records it with the commit.
 - **Commits with nothing to check skip the gates**: the setup commit, and commits of only the harness's
-  records (status, board, specs, reviews) or of `no_gates_for` paths (`["docs/**"]` in new projects).
+  records (status, board, specs, reviews) or of `no_gates_for` paths (`["docs/**", ".regista/**"]` in new
+  projects; a change to an already committed `.regista/config.json` still runs them). An untracked folder
+  that is a git repository or worktree of its own, such as `.claude/worktrees/<name>/`, isn't part of a commit
+  that names its files. A commit that would stage it (`git add -A`, `git add .`, or `git add` of a folder above
+  it) is refused, because git would record it as a link to another repository instead of files: add the folder
+  to `.gitignore` or stage your files by name. `regista.py init` adds `.claude/worktrees/` to `.gitignore`.
 - **Loosening needs you.** A commit whose config removes or changes a gate, unprotects a path, or turns a
   check off asks for your OK, however the file was changed. Adding checks doesn't. An edit to the config
   is judged the same way as it's made: adding a gate or a protected path goes through, a change that

@@ -8,7 +8,7 @@
     {
       "name": "regista",
       "source": "./",
-      "version": "0.10.0",
+      "version": "0.11.0",
       "description": "Build harness: saved state, gates, roles in separate contexts, self-compaction, try-it-yourself checks.",
       "homepage": "https://github.com/ciprianrosca/regista",
       "repository": "https://github.com/ciprianrosca/regista"

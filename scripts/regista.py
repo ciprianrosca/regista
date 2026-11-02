@@ -32,7 +32,8 @@ CLI (run from anywhere inside the project):
   python regista.py change from-transcript "Q" (the orchestrator) record a change the user typed in this session
   python regista.py plan add-milestone "TITLE" [--after M3] [--files GLOBS] [--gate T] [--step T]
   python regista.py plan tick M3 STEP          tick a step (its number or its text); not in a worker
-  python regista.py verify-manual ID --note T  (the user only) record a manual check
+  python regista.py verify-manual ID --note T [--forced]  (the user only) record a manual check; --forced
+                                             says it wasn't checked one by one
   python regista.py try [M1|ID] [--ask]        what to try yourself; --ask (the user, in a terminal) records it
   python regista.py tests cleanup [--prove P | --apply P [c1 …]]  (the user only) overlapping tests: list them,
                                           prove each adds nothing, remove the proven ones with your OK
@@ -47,6 +48,7 @@ Hooks (stdin = the host's hook JSON; --host codex for Codex, default claude):
 """
 import argparse
 import datetime as dt
+import filecmp
 import glob
 import json
 import os
@@ -227,19 +229,42 @@ def git(root, *args, strip=True):
     return (r.stdout.strip() if strip else r.stdout) if r.returncode == 0 else ""
 
 
-def changed_files(root):
-    """Staged, unstaged and untracked paths: a superset of what a commit could include, because a
-    hook sees `git add -A && git commit` before the add has run."""
+def status_entries(root):
+    """(code, path) for each entry of `git status --porcelain --untracked-files=all`: staged, unstaged and
+    untracked paths, a renamed file under its new name."""
     out = git(root, "status", "--porcelain", "--untracked-files=all", strip=False)  # " M x": the space matters
-    files = []
+    entries = []
     for line in out.splitlines():
         if len(line) < 4:
             continue
         path = line[3:]
         if " -> " in path:
             path = path.split(" -> ", 1)[1]
-        files.append(path.strip('"').replace("\\", "/"))
-    return files
+        entries.append((line[:2], path.strip('"').replace("\\", "/")))
+    return entries
+
+
+def nested_repo(root, code, path):
+    """Whether a status entry is an untracked git repository or worktree of its own (.claude/worktrees/<name>/):
+    git lists it as one untracked entry ending in "/", it's a real folder (not a symlink) and it holds a .git
+    file or folder. A symlink, or an entry git lists as a plain file, is never one."""
+    if code != "??" or not path.endswith("/"):
+        return False
+    folder = os.path.join(root, path.rstrip("/"))
+    return os.path.isdir(folder) and not os.path.islink(folder) and os.path.lexists(os.path.join(folder, ".git"))
+
+
+def nested_repos(root):
+    """The untracked nested repositories and worktrees in the working tree, as folder paths without the "/"."""
+    return [path.rstrip("/") for code, path in status_entries(root) if nested_repo(root, code, path)]
+
+
+def changed_files(root, nested=False):
+    """Staged, unstaged and untracked paths: a superset of what a commit could include, because a
+    hook sees `git add -A && git commit` before the add has run. An untracked nested repository or worktree
+    (nested_repo) isn't this project's change, so it's left out unless `nested` asks for it; a commit that would
+    stage it is refused (stage_all_refusal)."""
+    return [path for code, path in status_entries(root) if nested or not nested_repo(root, code, path)]
 
 
 def ahead_count(root):
@@ -1016,8 +1041,9 @@ def committed_old_config(root):
 
 def harness_only(root, cfg, files):
     """Does this change touch only the harness's own records (status, board, specs, reviews, the setup
-    files `regista.py init` writes) or `no_gates_for` paths? Then there's no code for the gates to check. The
-    config counts only while it's new: once committed, a config change runs the gates like code. A move of
+    files `regista.py init` writes, the project's .gitignore among them) or `no_gates_for` paths? Then there's no
+    code for the gates to check. The config counts only while it's new: once committed, a config change runs the
+    gates like code, and so does a .gitignore change after the setup commit. A move of
     an old project's folder (`regista.py migrate`) counts too, with the host files it rewrites; its config is
     compared with the old one by config_loosened."""
     if not files:
@@ -1033,7 +1059,7 @@ def harness_only(root, cfg, files):
             if not config_new:
                 return False
         elif not (bookkeeping(root, cfg, f, folders) or f in HOST_FILES or f.startswith(".codex/")
-                  or (move and MOVE_HOST_FILES.fullmatch(f))
+                  or (move and MOVE_HOST_FILES.fullmatch(f)) or (config_new and f == ".gitignore")
                   or matches(f, cfg.get("no_gates_for") or [])):
             return False
     return True
@@ -1586,12 +1612,16 @@ def work_changes(root, cfg):
 
 
 def milestone_status(root, cfg, milestone):
-    """(done, reasons): done only when every requirement of the milestone passes (by the gates)
-    and, if configured, at least one is proven end to end."""
+    """(done, reasons): done only when the plan has no unticked step for the milestone, every requirement
+    of the milestone passes (by the gates) and, if configured, at least one is proven end to end. The specs
+    written so far don't cover the steps still to come, so their requirements alone can't close it."""
     specs, problems = load_specs(root)
     state = load_json(requirements_path(root), {})
     reqs = [(s, r) for s in specs if s.get("milestone") == milestone for r in s.get("requirements") or []]
     reasons = list(problems)
+    unticked = sum(m["open_steps"] for m in plan_milestones(root, cfg) if m["id"].lower() == str(milestone).lower())
+    if unticked:
+        reasons.append(unticked_reason(root, unticked, milestone))
     if not reqs:
         reasons.append(f"no requirements are specified for {milestone} in {harness_rel('specs', root=root)}/")
     for s, r in reqs:
@@ -1603,6 +1633,15 @@ def milestone_status(root, cfg, milestone):
                        "not only unit tests")
     reasons += long_check_reasons(root, cfg, "milestone")
     return not reasons, reasons
+
+
+def unticked_reason(root, n, milestone):
+    """The reason a milestone's unticked plan steps keep it open, and how to close them. A worker may not
+    change the plan, so there the overseer ticks the steps when it merges the worker."""
+    if worker_info(root):
+        return f"{n} step(s) unticked in the plan: the overseer ticks a built step when it merges this worker"
+    return (f"{n} step(s) unticked in the plan: tick a built step with `regista.py plan tick {milestone} <number>`, "
+            "or remove a dropped step from the plan")
 
 
 def long_check_reasons(root, cfg, event):
@@ -1719,6 +1758,9 @@ def runs_deploy_command(cfg, eff):
 SETUP_CMDS = {"cd", "pushd", "popd", "export", "set", "unset", "source", ".", "true", "false", ":", "echo", "printf",
               "test", "[", "exit", "wait", "sleep", "trap", "local", "return", "shift"}
 PACKAGE_MANAGERS = {"npm", "pnpm", "yarn", "bun"}
+# Arguments that only ask pytest what it is or what it would collect (`pytest --version`): no tests run. Only
+# pytest's: other tools read them otherwise (`npm test -V` still runs the tests, `ctest -V` is verbose).
+PYTEST_INFO_FLAGS = {"--version", "-V", "--help", "-h", "--collect-only", "--co"}
 
 
 def command_words(words):
@@ -1736,11 +1778,58 @@ def command_words(words):
     return [name] + rest
 
 
+# Runners that run a command in the project's environment: `uv run --frozen pytest -q` runs `pytest -q`. Per
+# runner, its options that take a value as the next word (`uv run --with pytest-xdist pytest`), before or after
+# `run`; `--opt=value` and short options with the value attached are one word anyway.
+RUNNER_VALUE_OPTIONS = {
+    "uv": {"--with", "-w", "--with-editable", "--with-requirements", "--extra", "--no-extra", "--group", "--no-group",
+           "--only-group", "--env-file", "--package", "--python", "-p", "--index", "--default-index", "--index-url",
+           "-i", "--extra-index-url", "--find-links", "-f", "--upgrade-package", "-P", "--reinstall-package",
+           "--no-build-package", "--no-binary-package", "--refresh-package", "--no-build-isolation-package",
+           "--index-strategy", "--keyring-provider", "--resolution", "--prerelease", "--fork-strategy",
+           "--exclude-newer", "--exclude-newer-package", "--link-mode", "--config-setting", "-C",
+           "--config-settings-package", "--python-platform", "--python-preference", "--cache-dir", "--directory",
+           "--project", "--config-file", "--color", "--allow-insecure-host", "--trusted-host"},
+    "poetry": {"--directory", "-C", "--project", "-P"},
+}
+PYTHON_NAME = re.compile(r"^(python(3(\.\d+)?)?|py)$")
+
+
+def without_runner(words):
+    """The command `uv run` or `poetry run` runs (with the runner's own options, before or after `run`), or the
+    words as they are when they don't start with a runner. `uv run -m pytest` runs `python -m pytest`."""
+    takes = RUNNER_VALUE_OPTIONS.get(words[0]) if words else None
+    if takes is None:
+        return words
+    i = 1
+    while i < len(words) and words[i].startswith("-") and words[i] != "--":
+        i += 2 if words[i] in takes else 1  # the runner's options before `run` (`poetry -C app run`)
+    if words[i:i + 1] != ["run"]:
+        return words
+    i, module = i + 1, False
+    while i < len(words) and words[i].startswith("-") and len(words[i]) > 1:
+        if words[i] == "--":
+            i += 1
+            break
+        module = module or (words[0] == "uv" and words[i] in ("-m", "--module"))
+        i += 2 if words[i] in takes else 1
+    return (["python", "-m"] if module else []) + words[i:]
+
+
+def gate_words(words):
+    """A command's words as the gate lock compares them: command_words, without a `uv run` or `poetry run`
+    around the command, and every way of starting pytest (`pytest`, `python3 -m pytest`) as `pytest`."""
+    words = command_words(without_runner(command_words(words)))
+    n = pytest_words(words)
+    return ["pytest"] + words[n:] if n else words
+
+
 def runs_like(words, want):
     """Do the words run the command `want`: the same program and arguments in that order, with more
     arguments allowed after them or as options in between, and `want`'s own options optional (`npm run e2e`
-    runs the gate `npm run e2e --silent`)."""
-    words, want = command_words(words), command_words(want)
+    runs the gate `npm run e2e --silent`). Both are compared as gate_words: `uv run python3 -m pytest -q` runs
+    the gate `pytest -q`."""
+    words, want = gate_words(words), gate_words(want)
     if not words or not want or words[0] != want[0]:
         return False
     i = 1
@@ -1754,6 +1843,37 @@ def runs_like(words, want):
     return True
 
 
+def pytest_words(words):
+    """How many of the words start pytest (`pytest`, `python3 -m pytest`, `python -m pytest`), or 0 when they
+    don't run pytest. A runner around them (`uv run`) is taken off first, by gate_words."""
+    if words[:1] == ["pytest"]:
+        return 1
+    if words[:1] and PYTHON_NAME.match(words[0]) and words[1:3] == ["-m", "pytest"]:
+        return 3
+    return 0
+
+
+def only_asks_info(words, want):
+    """Does the command only ask the gate's pytest for its version, help or what it would collect
+    (`python3 -m pytest --version` for the gate `python3 -m pytest -q`)? It starts pytest (in any spelling, with or
+    without a runner around it: gate_words),
+    then has the gate's own arguments in their order, some left out, with only such flags added: nothing else,
+    no path or test selection. Any other tool (npm, ctest, mvn) is never only asking."""
+    words, want = gate_words(words), gate_words(want)
+    if want[:1] != ["pytest"] or words[:1] != ["pytest"]:
+        return False
+    own, j, asks = want[1:], 0, False
+    for w in words[1:]:
+        k = own.index(w, j) if w in own[j:] else -1
+        if k >= 0:
+            j = k + 1  # the gate's next own argument, by position
+        elif w in PYTEST_INFO_FLAGS:
+            asks = True
+        else:
+            return False
+    return asks
+
+
 def runs_gate_command(root, cfg, eff):
     """The gate whose command the shell command runs itself, outside `regista.py gate` and so outside the gate
     lock, or None. A gate's command is the last one its `run` starts that isn't setup (`cd`, `export`):
@@ -1764,7 +1884,7 @@ def runs_gate_command(root, cfg, eff):
     for g in cfg["gates"]:
         for cmd in (g.get("run") or "", fill(g.get("run_some") or "", files="")):  # its whole run or a part of it
             runs = [w for w in shell_effects(cmd, root)["runs"] if command_words(w)[0] not in SETUP_CMDS]
-            if runs and any(runs_like(words, runs[-1]) for words in eff["runs"]):
+            if runs and any(runs_like(words, runs[-1]) and not only_asks_info(words, runs[-1]) for words in eff["runs"]):
                 return g
     return None
 
@@ -2101,7 +2221,8 @@ def release_guard(root, cfg, data):
         what.append(f"it pushes the tag {plan['tag']}" + (" and publishes its GitHub release page" if rs["github_release"]
                                                           else ""))
     if what:
-        ask(f"{DISPLAY_NAME}: releasing {plan['new']} needs the user's go-ahead: " + "; ".join(what) + ".")
+        ask(f"{DISPLAY_NAME}: releasing {plan['new']} needs the user's go-ahead: " + "; ".join(what) + ".",
+            "release_policy")
 
 
 # --- build all: one run through every milestone ---------------------------------------------
@@ -2122,7 +2243,8 @@ FILES = re.compile(r"^\s*(?:[-*]\s*)?\**Files\**\s*:\**\s*(.+?)\s*$", re.M | re.
 
 def plan_milestones(root, cfg):
     """The plan's milestones in plan order ('## M1 — name' headings), with their unticked steps and
-    their ordering rule: an `After: M8` line (or `After: all` for the last ones)."""
+    their ordering rule: an `After: M8` line (or `After: all` for the last ones). The template's
+    placeholder step (exactly `- [ ] <step>`) isn't a step; any other text, even all in angle brackets, is."""
     md = read(p(root, cfg["plan"] or harness_rel("plan.md", root=root)))
     heads = list(re.finditer(r"^##\s+(M\d+[a-z]?)\b[\s—–:.-]*(.*)$", md, re.M))
     out = []
@@ -2133,7 +2255,7 @@ def plan_milestones(root, cfg):
         after = rule.group(1).strip().rstrip(".") if rule else ""
         files = FILES.search(body)
         out.append({"id": m.group(1), "title": m.group(2).strip(),
-                    "open_steps": len(re.findall(r"^\s*[-*]\s*\[ \]", body, re.M)),
+                    "open_steps": len(re.findall(r"^\s*[-*]\s*\[ \](?!\s*<step>\s*$)", body, re.M)),
                     "after": "all" if re.match(r"(all|everything|the rest|last)\b", after, re.I) else
                     re.findall(r"\bM\d+[a-z]?\b", after),
                     "files": split_globs(files.group(1)) if files else []})
@@ -2361,8 +2483,11 @@ def run_report(root, cfg, details=None):
             if details is not None:
                 details.setdefault("waiting", []).append(m["id"])
         else:
-            steps = f"{m['open_steps']} step(s) unticked in the plan, " if m["open_steps"] else ""
-            lines.append(f"- {name}{rule}: gate open ({steps}{len(why)} reason(s); `regista.py milestone {m['id']}`)")
+            rest = len(why) - (1 if m["open_steps"] else 0)  # milestone_status counts the unticked steps as a reason
+            parts = ([unticked_reason(root, m["open_steps"], m["id"])] if m["open_steps"] else []) + (
+                [f"{'plus ' if m['open_steps'] else ''}{rest} {'other ' if m['open_steps'] else ''}reason(s)"]
+                if rest or not m["open_steps"] else [])
+            lines.append(f"- {name}{rule}: gate open ({'; '.join(parts)}; `regista.py milestone {m['id']}`)")
             if details is not None:
                 details.setdefault("open", []).append(m["id"])
     if not ms:
@@ -2759,9 +2884,78 @@ def open_session(folder, name, mode=""):
     return True, lines + problems
 
 
-def remove_worktree(root, wt, branch):
+WORKER_RECORDS = ("hooks.log", "gates/history.jsonl", "compactions.jsonl")  # a worker's untracked records
+
+
+def worker_records(root, wt):
+    """A worker's own records in its worktree `wt` that removing the worktree would lose, as paths inside its
+    harness folder: WORKER_RECORDS, and the reviews the project's reviews/ doesn't hold byte for byte (one written
+    after the worker's last commit, or one on a branch that is never merged). Returns (to copy, reviews the
+    project holds already). Symlinks are left out: they aren't records the harness wrote."""
+    def real(path):
+        return os.path.isfile(path) and not os.path.islink(path)
+    copy = [r for r in WORKER_RECORDS if real(harness_path(wt, *r.split("/")))]
+    same, folder = [], harness_path(wt, "reviews")
+    for fn in sorted(os.listdir(folder)) if os.path.isdir(folder) and not os.path.islink(folder) else []:
+        src, mine = os.path.join(folder, fn), harness_path(root, "reviews", fn)
+        if not fn.endswith(".json") or not real(src):
+            continue
+        if real(mine) and filecmp.cmp(src, mine, shallow=False):
+            same.append(f"reviews/{fn}")
+        else:
+            copy.append(f"reviews/{fn}")
+    return copy, same
+
+
+def keep_worker_records(root, name, w, wt):
+    """Copy a worker's untracked records (worker_records) into the project at
+    fleet/logs/<milestone>/<name>/, keeping their paths, with an index.json saying whose they are. A later worker
+    of the same name and milestone gets <name>-2/, and so on. Returns (where they went, relative to the project,
+    or "" when there was nothing to keep; why the copy failed, or "")."""
+    copy, _ = worker_records(root, wt)
+    if not copy:
+        return "", ""
+    milestone = w.get("milestone") or "tasks"
+    n, dest = 1, harness_path(root, "fleet", "logs", milestone, name)
+    while (os.path.isfile(os.path.join(dest, "index.json"))
+           and load_json(os.path.join(dest, "index.json"), {}).get("started") != w.get("started")):
+        n += 1
+        dest = harness_path(root, "fleet", "logs", milestone, f"{name}-{n}")
+    rel = os.path.relpath(dest, root).replace("\\", "/") + "/"
+    try:
+        for r in copy:
+            to = os.path.join(dest, *r.split("/"))
+            os.makedirs(os.path.dirname(to), exist_ok=True)
+            shutil.copyfile(harness_path(wt, *r.split("/")), to)
+        index = {"worker": name, "milestone": w.get("milestone") or "", "task": w.get("task") or "",
+                 "branch": w.get("branch") or "", "session_id": w.get("session_id") or "",
+                 "session_name": w.get("session_name") or "", "worktree": wt, "started": w.get("started") or "",
+                 "merged_at": w.get("merged_at") or "", "copied_at": now_iso(), "files": copy}
+        with open(os.path.join(dest, "index.json"), "w", encoding="utf-8") as f:
+            json.dump(index, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+    except OSError as e:
+        return rel, f"{e.strerror or e}" + (f" ({os.path.relpath(e.filename, root)})" if e.filename else "")
+    return rel, ""
+
+
+def records_kept_elsewhere(root, wt, files):
+    """The changed files in a worktree that are the worker's records, which keep_worker_records copies (or the
+    project holds already), so they don't make a plain `fleet remove` refuse."""
+    copy, same = worker_records(root, wt)
+    prefix = harness_rel(root=wt) + "/"
+    return {f for f in files if f.startswith(prefix) and f[len(prefix):] in set(copy + same)}
+
+
+def remove_worktree(root, wt, branch, name="", w=None):
+    """Remove a worktree that a start left behind, keeping the worker's records first. Returns lines to add to
+    the message (the worktree stays when its records couldn't be copied)."""
+    where, problem = keep_worker_records(root, name or os.path.basename(wt), {**(w or {}), "branch": branch}, wt)
+    if problem:
+        return [f"The worktree {os.path.relpath(wt, root)} stays: its records couldn't be copied to {where}: {problem}."]
     call(["git", "-C", root, "worktree", "remove", "--force", wt])
     call(["git", "-C", root, "branch", "-D", branch])
+    return [f"Its records are kept in {where}."] if where else []
 
 
 def fleet_spawn(root, cfg, milestone="", name="", task="", force=False):
@@ -2832,9 +3026,9 @@ def fleet_spawn(root, cfg, milestone="", name="", task="", force=False):
     if setup:
         code, out = run_shell(setup, wt, 1800)
         if code:
-            remove_worktree(root, wt, branch)
+            kept = remove_worktree(root, wt, branch, name, info)
             return False, [f"The setup command (`{setup}`) failed in the new worktree, so no worker started:",
-                           out.strip()[-800:]]
+                           out.strip()[-800:]] + kept
     # A new session never takes an earlier worker's name: Remote Control keeps old sessions listed under
     # theirs, and a message addressed to a shared name doesn't arrive.
     generation = workers.get(name, {}).get("generation", 0) + 1
@@ -2844,8 +3038,7 @@ def fleet_spawn(root, cfg, milestone="", name="", task="", force=False):
     save_json(worker_file(wt), {**info, "prompts": [prompt.strip()]})
     how, ref, url, problems = launch_worker(cfg, wt, sname, mode, prompt)
     if not how:
-        remove_worktree(root, wt, branch)
-        return False, problems
+        return False, problems + remove_worktree(root, wt, branch, name, info)
     workers[name] = {"milestone": milestone, "title": title, "task": task, "branch": branch, "worktree": rel,
                      "slot": slot, "base": info["base"], "started": info["started"], "state": "running", "how": how,
                      "ref": ref, "url": url, "session_name": sname, "mode": mode, "generation": generation,
@@ -3426,7 +3619,8 @@ def fleet_remove(root, cfg, name, force=False):
     if ahead not in ("", "0") and not force:
         return False, [f"{name} has {ahead} commit(s) that aren't merged. Merge them, or --force to throw them away."]
     wt = p(root, w["worktree"])
-    left = [f for f in changed_files(wt) if not matches(f, cfg["review"]["ignore"])] if os.path.isdir(wt) else []
+    left = [f for f in changed_files(wt, nested=True) if not matches(f, cfg["review"]["ignore"])] if os.path.isdir(wt) else []
+    left = [f for f in left if f not in records_kept_elsewhere(root, wt, left)]  # copied before the removal
     if left and not force:
         return False, [f"{name}'s worktree has changes no commit holds: {', '.join(left[:6])}. Ask the worker to "
                        "commit what matters, or --force to delete them."]
@@ -3434,14 +3628,27 @@ def fleet_remove(root, cfg, name, force=False):
         fleet_stop(root, cfg, name)
         workers = load_workers(root)
         w = workers[name]
+    where = ""
+    if os.path.isdir(wt):  # the worker's own records go with the worktree unless they're copied first
+        where, problem = keep_worker_records(root, name, w, wt)
+        if problem:
+            return False, [f"Not removed: {name}'s records (hooks log, gate history, compactions, uncommitted reviews) "
+                           f"couldn't be copied to {where}: {problem}. Its worktree and branch are still there"
+                           + (" (the worker is stopped)" if w.get("state") == "stopped" else "")
+                           + "; fix that and run the same command again."]
     code, out = call(["git", "-C", root, "worktree", "remove", "--force", wt])
     if code and os.path.exists(p(root, w["worktree"])):
-        return False, [f"git kept the worktree: {out.strip()[-300:]} (--force removes it anyway)."]
+        return False, [f"git kept the worktree: {out.strip()[-300:]} (--force removes it anyway)."] + \
+            ([f"{name}'s records are copied to {where} already."] if where else [])
     call(["git", "-C", root, "branch", "-D" if force else "-d", w["branch"]])
     w["state"] = "removed"
+    if where:
+        w["logs"] = where
     save_workers(root, workers)
-    fleet_event(root, name, "removed", "")
-    return True, [f"{name} removed: its session, worktree and branch are gone."]
+    fleet_event(root, name, "removed", f"records kept in {where}" if where else "")
+    return True, [f"{name} removed: its session, worktree and branch are gone."] + \
+        ([f"Its own records (hooks log, gate history, compactions, uncommitted reviews) are kept in {where}."]
+         if where else [])
 
 
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b[78=>]")
@@ -3647,11 +3854,66 @@ OK_WORDS = ("ok", "pass", "passed", "yes", "y", "works", "worked", "good", "veri
 FAIL_WORDS = ("fail", "failed", "no", "n", "broken", "bug", "wrong", "doesn't", "doesnt", "✗", "❌")
 
 
-def record_manual(root, rid, ok, note, by):
+# How a manual check was passed, on every record (`how`): "looked" (the user passed this one check by name, in
+# the session or with verify-manual at a real terminal), "bulk" (passed together with others: `all ok`, `M3 ok`,
+# a plain ok to a question naming several checks), "forced" (verify-manual --forced, or evidence saying it was
+# forced, not confirmed individually or not checked one by one) or "relayed" (verify-manual without a terminal or in an agent's shell: an
+# agent, perhaps from another project's session, where this project's hooks can't refuse it). Older records have
+# none, and neither does one written without an explicit how: "unknown". A check already passed as looked stays
+# looked when a later bulk ok covers it. `by` keeps saying who; `how` only records and reports, it doesn't change
+# which requirements pass.
+MANUAL_HOWS = ("looked", "bulk", "forced", "relayed")
+FORCED_NOTE = re.compile(r"\bforc(?:e|ed|ing)\b|\bnot\s+(?:individually\s+confirmed|confirmed\s+individually"
+                         r"|checked\s+one\s+by\s+one)\b", re.IGNORECASE)
+
+
+def record_manual(root, rid, ok, note, by, how="unknown"):
     state = load_json(requirements_path(root), {})
-    state[rid] = {**state.get(rid, {}), "verify": "manual", "passes": ok, "evidence": [note] if note else [],
-                  "at": dt.datetime.now().isoformat(timespec="seconds"), "by": by}
+    prior = state.get(rid, {})
+    if ok and how == "bulk" and prior.get("passes") and prior.get("how") == "looked":
+        how = "looked"  # the user already looked at this one by name; a later bulk ok doesn't relabel it
+    state[rid] = {**prior, "verify": "manual", "passes": ok, "evidence": [note] if note else [],
+                  "at": dt.datetime.now().isoformat(timespec="seconds"), "by": by, "how": how}
     save_json(requirements_path(root), state)
+
+
+def manual_how(st):
+    """How a manual record was passed, "unknown" for records written before `how` existed."""
+    return st.get("how") if st.get("how") in MANUAL_HOWS else "unknown"
+
+
+def cli_manual_how(note, forced):
+    """`how` for `regista.py verify-manual`: forced when asked or when the note says so; relayed in an agent's shell
+    (its variables, the check `refusals label` uses, even inside a pseudo-terminal) or without a terminal; looked
+    only when stdin and stdout are terminals and no agent's variables are set. A route that clears those variables
+    and fakes a terminal could still get looked: only an operating-system guard would close that."""
+    if forced or FORCED_NOTE.search(note or ""):
+        return "forced"
+    if agent_shell():
+        return "relayed"
+    try:
+        tty = sys.stdin.isatty() and sys.stdout.isatty()
+    except (AttributeError, ValueError):
+        tty = False
+    return "looked" if tty else "relayed"
+
+
+def manual_how_summary(root, milestone):
+    """One line on how the milestone's passed manual checks were passed, counting those nobody looked at one by
+    one (bulk, forced, relayed or unknown), or "" when none has passed."""
+    specs, _ = load_specs(root)
+    state = load_json(requirements_path(root), {})
+    hows = [manual_how(state.get(r.get("id", ""), {})) for s in specs if s.get("milestone") == milestone
+            for r in s.get("requirements") or [] if r.get("verify") == "manual"
+            and state.get(r.get("id", ""), {}).get("passes")]
+    if not hows:
+        return ""
+    other = [h for h in hows if h != "looked"]
+    if not other:
+        return f"Manual checks: the user looked at each of the {len(hows)} that passed, one by one."
+    kinds = ", ".join(f"{h} {other.count(h)}" for h in ("bulk", "forced", "relayed", "unknown") if h in other)
+    return (f"Manual checks: {len(other)} of the {len(hows)} that passed weren't looked at one by one by the user "
+            f"({kinds}).")
 
 
 def find_requirement(root, rid):
@@ -3737,8 +3999,9 @@ def verify_lines(ids):
                f"In a terminal: {PY} \"{DD}\" try --ask walks you through each check."])
 
 
-def verify_from_user(root, cfg, args, by):
-    """Record a check the user typed (`/<SLUG>:verify UI-3 ok …`). Returns the note for the agent."""
+def verify_from_user(root, cfg, args, by, how):
+    """Record a check the user typed (`/<SLUG>:verify UI-3 ok …`). Returns the note for the agent. `how` is the
+    record's how for a check named on its own; `all ok` and `M3 ok` are always "bulk"."""
     rid, ok, note = parse_verdict(args)
     usage = f"`{cmd_name('verify')} <ID> ok` or `{cmd_name('verify')} <ID> fail <what happened>`"
     if not rid:
@@ -3754,14 +4017,14 @@ def verify_from_user(root, cfg, args, by):
         if not waiting:
             return f"{DISPLAY_NAME}: no checks are waiting for the user{'' if rid.lower() == 'all' else ' in ' + rid}."
         for x in waiting:
-            record_manual(root, x, True, note or f"verified with `{rid} ok`", by)
+            record_manual(root, x, True, note or f"verified with `{rid} ok`", by, "bulk")
         return (f"{DISPLAY_NAME} recorded {', '.join(waiting)} as verified by the user (they typed `{rid} ok`). Tell them, "
                 "in one line, exactly which checks that covered, and carry on.")
     if not r and not overseer_root(root):
         for name, w in load_workers(root).items():  # a spec still on a running worker's branch
             wt = p(root, w.get("worktree", ""))
             if w.get("state") == "running" and os.path.isdir(wt) and find_requirement(wt, rid)[1]:
-                return verify_from_user(wt, load_config(wt), args, by).replace(
+                return verify_from_user(wt, load_config(wt), args, by, how).replace(
                     f"{DISPLAY_NAME} recorded", f"{DISPLAY_NAME} recorded (in the worker {name}, whose branch has that check)", 1)
     if not r:
         ids = [x[1]["id"] for x in try_items(root, cfg) if x[1].get("verify") == "manual"]
@@ -3774,7 +4037,7 @@ def verify_from_user(root, cfg, args, by):
     if ok is None:
         return (f"{DISPLAY_NAME}: nothing recorded for {r['id']}: the command needs ok or fail. Ask the user to retype: "
                 f"{usage}.")
-    record_manual(root, r["id"], ok, note or ("worked as described" if ok else ""), by)
+    record_manual(root, r["id"], ok, note or ("worked as described" if ok else ""), by, how)
     if ok:
         return (f"{DISPLAY_NAME} recorded {r['id']} as verified by the user"
                 + (f" ({note})" if note else "") + ". Acknowledge it in one line and carry on.")
@@ -3784,7 +4047,12 @@ def verify_from_user(root, cfg, args, by):
 
 
 def try_ask(root, cfg, which=None):
-    """Interactive walkthrough in the user's own terminal."""
+    """Interactive walkthrough in the user's own terminal. Refused in an agent's tool shell (its variables, the check
+    `refusals label` uses), even at a pseudo-terminal: only the user's answers may be recorded as looked."""
+    host = agent_shell()
+    if host:
+        sys.exit(f"`try --ask` records your own answers, so it doesn't run inside a {host} session and nothing was "
+                 "recorded. Ask the user to run it in their own terminal: regista.py try --ask")
     if not sys.stdin.isatty():
         sys.exit("`try --ask` asks you about each check, so run it yourself in a terminal (not through an agent).")
     items = [x for x in try_items(root, cfg, which) if x[1].get("verify") == "manual"]
@@ -3804,13 +4072,13 @@ def try_ask(root, cfg, which=None):
         ans = input("  Did it work? [y]es / [n]o / Enter to skip: ").strip().lower()
         if ans in ("y", "yes"):
             note = input("  Anything to note? (Enter for none): ").strip()
-            record_manual(root, r["id"], True, note or "worked as described", "user (terminal)")
+            record_manual(root, r["id"], True, note or "worked as described", "user (terminal)", "looked")
             print("  Recorded: verified.")
         elif ans in ("n", "no"):
             note = ""
             while not note:
                 note = input("  What happened instead? ").strip()
-            record_manual(root, r["id"], False, note, "user (terminal)")
+            record_manual(root, r["id"], False, note, "user (terminal)", "looked")
             print("  Recorded: not working. The agent will see it at the next start.")
         elif not st.get("passes"):
             skipped.append(r["id"])
@@ -4425,7 +4693,7 @@ def typed_items(text):
     return out
 
 
-def record_typed(root, cfg, text, by):
+def record_typed(root, cfg, text, by, how):
     """Record every verify and change in a message the user typed. Returns the notes for the agent.
     In a worker, a check is recorded on both sides (the overseer's project is the record; the worker
     needs it for its gate) and a change goes to the overseer, which plans."""
@@ -4434,9 +4702,9 @@ def record_typed(root, cfg, text, by):
     name = worker_info(root).get("name", "")
     for command, args in typed_items(text):
         if command == "verify":
-            notes.append(verify_from_user(root, cfg, args, by))
+            notes.append(verify_from_user(root, cfg, args, by, how))
             if home:
-                verify_from_user(home, load_config(home), args, f"{by}, in the worker {name}")
+                verify_from_user(home, load_config(home), args, f"{by}, in the worker {name}", how)
                 fleet_event(home, name, "verify", args)
         elif home:
             change_from_user(home, args, f"{by}, in the worker {name}")
@@ -4487,7 +4755,8 @@ def queued_typed(root, cfg, data):
                                     by="user (replied while the session was busy)")
             continue
         notes += [n.replace(f"{DISPLAY_NAME} recorded", f"{DISPLAY_NAME} recorded (sent while you were working)", 1)
-                  for n in record_typed(root, cfg, att.get("prompt") or "", "user (sent while the session was busy)")]
+                  for n in record_typed(root, cfg, att.get("prompt") or "", "user (sent while the session was busy)",
+                                       "looked")]
     if new:
         save_json(typed_path(root), {"seen": (seen_state.get("seen") or [])[-400:] + new})
     return notes
@@ -4581,7 +4850,8 @@ def ok_reply_typed(root, cfg, data, prompt, upto=None, by="user (replied ok to t
     said = prompt.strip().replace("\n", " ")[:60]
     return [n.replace(f"{DISPLAY_NAME} recorded", f"{DISPLAY_NAME} recorded (the user replied \"{said}\" to your "
                                                   "question that named these checks)", 1)
-            for n in record_typed(root, cfg, "\n".join(f"/{SLUG}:verify {x} ok" for x in ids), by)]
+            for n in record_typed(root, cfg, "\n".join(f"/{SLUG}:verify {x} ok" for x in ids), by,
+                                  "bulk" if len(ids) > 1 else "looked")]
 
 
 def typed_prompts(data):
@@ -5007,54 +5277,92 @@ def is_transcript(tdir, path):
 
 def integrity_check(root, cfg, data):
     """Rules for everyone, the orchestrator included: the gates and their results are the harness's.
-    Returns ("deny" | "ask", reason) or (None, None)."""
+    Returns ("deny" | "ask", reason, rule, sure) or (None, None, None, None); the rule names the guard in the
+    refusal log. For a rule about paths, sure says whether a refused path matched exactly (False: the refusal is
+    logged as unsure); for the others it's None."""
     role = role_of(data, root)
     tool = data.get("tool_name", "")
     ti = data.get("tool_input") or {}
     rel = tool_path(root, ti) if tool in EDIT_TOOLS else None
     eff = effects_of(root, data)
     writes = eff["writes"] if eff else []
+    exact = exact_writes(eff) if eff else []
+
+    def hit(edited, globs):
+        """None when nothing guarded is written; True when a refused path matched exactly (the file an edit tool
+        names, or a path the command names itself); False when only a folder holding one, a path with an unknown
+        variable or path text in inline code matched."""
+        if edited:
+            return True
+        return bool(named(root, exact, globs)) if under(root, writes, globs) else None
+    # The hooks are Claude Code's and Codex's to call, never an agent's: fed made-up input, the user-prompt hooks
+    # would record a manual check as one the user typed.
+    if eff and runs_hook(eff, root=root):
+        return "deny", (f"{DISPLAY_NAME}: the hooks are run only by Claude Code and Codex, never by hand: a hook fed "
+                        "made-up input could record a manual check as if the user had typed it (a subcommand that can't be read, "
+                        "such as `$(…)` or a variable, counts as one). To see what is "
+                        "waiting, run `regista.py status` or `regista.py requirements`; to change how a hook "
+                        "behaves, edit its code and test it."), "hook_by_hand", None
     if (eff and (runs_cli(eff, "verify-manual", root=root) or runs_cli(eff, "try", "--ask", root=root))) or (
             tool == "Skill" and re.search(r"(^|:)verify$", str(ti.get("skill") or ti.get("name") or ""))):
         return "deny", (f"{DISPLAY_NAME}: manual checks are the user's call. Show them the steps "
                         f"(`regista.py try`) and ask them to record what they saw: `{cmd_name('verify')} <ID> ok` "
-                        "or `fail <what happened>`, or `regista.py try --ask` in their own terminal.")
+                        "or `fail <what happened>`, or `regista.py try --ask` in their own terminal."), "manual_check_by_agent", None
+    # Whether a refusal was a false alarm is the user's call too, for every session under the hooks, the main one
+    # included; any project's, so a worker can't label the overseer's.
+    if eff and runs_cli(eff, "refusals", "label"):
+        return "deny", (f"{DISPLAY_NAME}: labelling refusals is the user's call. If you think a refusal was a false "
+                        "alarm, tell the user, with the refusal's number from `regista.py refusals`, and ask them to "
+                        "label it from their own terminal: `regista.py refusals label <n> real|false_alarm --why \"...\"`."), \
+            "label_by_agent", None
     if eff and runs_cli(eff, "tests", "cleanup", root=root):
         return "deny", (f"{DISPLAY_NAME}: which tests may go is the user's call, never an agent's. If the gates take too "
                         "long, tell the user they can run `regista.py tests cleanup` in their own terminal: it lists "
-                        "overlapping tests, proves each adds nothing, and removes them only with their OK.")
+                        "overlapping tests, proves each adds nothing, and removes them only with their OK."), \
+            "tests_cleanup_by_agent", None
     if (eff and runs_cli(eff, "change", "add", root=root)) or (
             tool == "Skill" and re.search(r"(^|:)change$", str(ti.get("skill") or ti.get("name") or ""))):
         return "deny", (f"{DISPLAY_NAME}: what gets built is the user's call. If you think the plan needs a change, ask them; "
-                        f"they record it with `{cmd_name('change')} <what they want>`.")
+                        f"they record it with `{cmd_name('change')} <what they want>`."), "change_by_agent", None
     if eff and nested_agent(eff):
         return "deny", (f"{DISPLAY_NAME}: agents don't start Claude Code or Codex sessions from the shell: a nested session "
                         "would run outside its role. The orchestrator starts agents "
                         + ("with the Agent tool." if HOST["name"] == "claude"
-                           else f"with spawn_agent ({codex_agent_prefix(root)}<role>)."))
+                           else f"with spawn_agent ({codex_agent_prefix(root)}<role>).")), "nested_session", None
     tdir = transcripts_dir(data)
     if tdir:
         target = ti.get("file_path") or ti.get("notebook_path") or ""
-        if any(is_transcript(tdir, x) for x in ([target] if tool in EDIT_TOOLS and target else []) + writes):
+        edited = bool(tool in EDIT_TOOLS and target and is_transcript(tdir, target))
+        if edited or any(is_transcript(tdir, x) for x in writes):
             return "deny", (f"{DISPLAY_NAME}: the session transcripts are the host's record of what the user typed; "
-                            "nobody writes them.")
+                            "nobody writes them."), "transcript_write", edited or any(is_transcript(tdir, x) for x in exact)
     fleet_files = [harness_rel("fleet", "**", root=root), harness_rel("worker.json", root=root)]
-    if (rel and matches(rel, fleet_files)) or under(root, writes, fleet_files):
-        return "deny", f"{DISPLAY_NAME}: the overseer's and workers' records are written only by the harness."
-    approvals = [harness_rel("approvals.json", root=root)]
-    if (rel and matches(rel, [harness_rel("cleanup", "**", root=root)])) or under(root, writes, [harness_rel("cleanup", "**", root=root)]):
+    sure = hit(rel and matches(rel, fleet_files), fleet_files)
+    if sure is not None:
+        return "deny", f"{DISPLAY_NAME}: the overseer's and workers' records are written only by the harness.", \
+            "harness_records", sure
+    cleanup = [harness_rel("cleanup", "**", root=root)]
+    sure = hit(rel and matches(rel, cleanup), cleanup)
+    if sure is not None:
         return "deny", (f"{DISPLAY_NAME}: the test cleanup proposals and their proofs are written only by "
-                        "`regista.py tests cleanup`, which the user runs.")
-    if (rel and matches(rel, approvals)) or under(root, writes, approvals):
+                        "`regista.py tests cleanup`, which the user runs."), "harness_records", sure
+    approvals = [harness_rel("approvals.json", root=root)]
+    sure = hit(rel and matches(rel, approvals), approvals)
+    if sure is not None:
         return "deny", (f"{DISPLAY_NAME}: the user's approvals are recorded only by the harness, from what the user "
-                        "typed. Ask the user instead.")
+                        "typed. Ask the user instead."), "harness_records", sure
+    refusal_log = [harness_rel("hooks.log", root=root)]  # the refusals, and the user's labels appended to it
+    sure = hit(rel and matches(rel, refusal_log), refusal_log)
+    if sure is not None:
+        return "deny", (f"{DISPLAY_NAME}: the refusal log, and the user's labels in it, are written only by the "
+                        "harness."), "harness_records", sure
     if eff and opens_session(eff):
         return "deny", (f"{DISPLAY_NAME}: opening a new session is the user's call. Give them the command to run in "
-                        f"their own terminal: `{PY} \"{DD}\" open <folder> <name>`.")
+                        f"their own terminal: `{PY} \"{DD}\" open <folder> <name>`."), "open_session_by_agent", None
     worktrees = harness_rel("worktrees", root=root)
     if (rel and rel.startswith(worktrees + "/")) or under(root, writes, [worktrees + "/**"]):
         return "deny", (f"{DISPLAY_NAME}: that's a worker's worktree. Send the worker what to change (SendMessage), or take "
-                        "it over: `regista.py fleet stop <name>`.")
+                        "it over: `regista.py fleet stop <name>`."), "worker_worktree", None
     home = overseer_root(root)
     if home:  # a worker writes in its own worktree, not in the overseer's project folder
         target = ti.get("file_path") or ti.get("notebook_path") or ""
@@ -5062,33 +5370,52 @@ def integrity_check(root, cfg, data):
                    if rel_to_root(root, x) is None and rel_to_root(home, x) is not None]
         if outside:
             return "deny", (f"{DISPLAY_NAME}: {outside[0]} is in the overseer's project folder. You work in your own "
-                            "worktree; send the overseer what it should change there.")
+                            "worktree; send the overseer what it should change there."), "overseer_folder", None
     gates, config = harness_rel("gates", root=root), harness_rel("config.json", root=root)
-    if (rel and rel.startswith(gates + "/")) or under(root, writes, [gates + "/**"]):
+    sure = hit(rel and rel.startswith(gates + "/"), [gates + "/**"])
+    if sure is not None:
         return "deny", (f"{DISPLAY_NAME}: {gates}/ (baseline, requirement results, run logs) is written only by "
-                        "the gates. Run `regista.py gate` instead.")
-    if (rel == config) or under(root, writes, [config]):
+                        "the gates. Run `regista.py gate` instead."), "gates_folder", sure
+    sure = hit(rel == config, [config])
+    if sure is not None:
         if role == "main":
             # Adding a gate or a protected path loosens nothing: only a change that loosens a check needs the user.
             loose = config_write_loosens(root, tool, ti) if rel == config and not writes else None
             if loose == []:
-                return None, None
+                return None, None, None, None
             return "ask", (f"{DISPLAY_NAME}: this change to the harness config loosens its checks ({'; '.join(loose)}), "
                            "which needs the user's OK." if loose else
-                           f"{DISPLAY_NAME}: changing the harness config (gates, thresholds, roles) needs the user's OK.")
-        return "deny", f"{DISPLAY_NAME}: agents don't change the harness config. Report what you'd change and why."
+                           f"{DISPLAY_NAME}: changing the harness config (gates, thresholds, roles) needs the user's OK."), \
+                "harness_config", sure
+        return "deny", f"{DISPLAY_NAME}: agents don't change the harness config. Report what you'd change and why.", \
+            "harness_config", sure
     # The hosts' own settings decide whether the hooks, the agents and compaction run at all.
     host_files = [".codex/**", ".claude/settings.json", ".claude/settings.local.json"]
-    if (rel and matches(rel, host_files)) or under(root, writes, host_files):
+    sure = hit(rel and matches(rel, host_files), host_files)
+    if sure is not None:
         if role == "main":
             return "ask", (f"{DISPLAY_NAME}: this changes the agent host's settings (hooks, agents, compaction), which needs "
-                           f"the user's OK. `regista.py setup` writes the ones {DISPLAY_NAME} needs.")
-        return "deny", f"{DISPLAY_NAME}: agents don't change the agent host's settings. Report what you'd change and why."
-    return None, None
+                           f"the user's OK. `regista.py setup` writes the ones {DISPLAY_NAME} needs."), "host_settings", sure
+        return "deny", f"{DISPLAY_NAME}: agents don't change the agent host's settings. Report what you'd change and why.", \
+            "host_settings", sure
+    return None, None, None, None
 
 
 def role_check(root, cfg, data):
-    """Per-role permissions. Returns a refusal reason or None."""
+    """Per-role permissions. Returns (rule, reason) for a refusal, the rule naming the guard in the refusal log,
+    or (None, None)."""
+    why = plan_guard(root, cfg, data)
+    if why:
+        return "plan_owner", why
+    why = typed_change_check(root, data)
+    if why:
+        return "typed_change", why
+    why = role_rules(root, cfg, data)
+    return ("role_guard", why) if why else (None, None)
+
+
+def role_rules(root, cfg, data):
+    """What each role may touch. Returns a refusal reason or None."""
     role = role_of(data, root)
     tool = data.get("tool_name", "")
     ti = data.get("tool_input") or {}
@@ -5099,9 +5426,6 @@ def role_check(root, cfg, data):
     is_test = bool(rel and matches(rel, tests))
     eff = effects_of(root, data)
     writes = eff["writes"] if eff else []
-    why = plan_guard(root, cfg, data) or typed_change_check(root, data)
-    if why:
-        return why
 
     # The verdict file and its recorder belong to the reviewer alone.
     if role != "reviewer":
@@ -5231,22 +5555,45 @@ def emit_context(event, text):
 
 HOOK_CTX = {}  # root + hook input of the running hook, for the refusal log
 
+# Rules whose firing is never a mistake: their refusals are logged as real. The others (the role guards, the
+# guards that judge a shell command or a quote, and the context limit, which rests on a token estimate) are logged
+# as unsure, for the user to label with `regista.py refusals`. A rule about paths is real only when a refused path
+# matched exactly: a match through a folder holding it, an unknown variable or inline code is logged as unsure.
+CERTAIN_RULES = {"gate_failed", "protected_path", "no_verify", "push_policy", "manual_check_by_agent", "label_by_agent",
+                 "tests_cleanup_by_agent", "change_by_agent", "open_session_by_agent", "transcript_write",
+                 "harness_records", "gates_folder", "gate_baseline", "harness_config", "host_settings", "plan_owner",
+                 "fleet_owner", "worker_push", "release_policy", "coverage", "review_missing", "loosened_checks",
+                 "nested_repo_stage"}
 
-def log_refusal(reason):
+
+def log_refusal(reason, rule, kind="deny", sure=None):
+    """One line in hooks.log per refusal or question: what was refused, which guard (rule), whose call it was
+    (role, session, worker), and a first label from the rule (real or unsure; sure=False, a path rule's inexact
+    match, makes it unsure). The log is only ever appended to: the user's own labels are appended as label lines
+    (`regista.py refusals label`). Nothing that goes wrong here stops the refusal itself."""
     root, data = HOOK_CTX.get("root"), HOOK_CTX.get("data") or {}
     if not root:
         return
     try:
+        role, worker = role_of(data, root), worker_info(root).get("name") or None
         with open(harness_path(root, "hooks.log"), "a", encoding="utf-8") as f:
-            f.write(json.dumps({"at": dt.datetime.now().isoformat(timespec="seconds"), "tool": data.get("tool_name"),
+            f.write(json.dumps({"at": dt.datetime.now().isoformat(timespec="seconds"), "kind": kind, "rule": rule,
+                                "role": "worker" if role == "main" and worker else role,
+                                "session": data.get("session_id") or None, "worker": worker,
+                                "label": "real" if rule in CERTAIN_RULES and sure is not False else "unsure",
+                                "label_by": "rule",
+                                "tool": data.get("tool_name"),
                                 "input": {k: str(v)[:2000] for k, v in (data.get("tool_input") or {}).items()},
                                 "reason": reason[:300]}, ensure_ascii=False) + "\n")
-    except OSError:
+    except Exception:  # noqa: BLE001 (a malformed record or an unwritable log must never let the action through)
         pass
 
 
-def deny(reason):
-    log_refusal(reason)
+def deny(reason, rule, kind="deny", log=True, sure=None):
+    """Refuse the tool call. `rule` names the guard in the refusal log, `sure` whether a path rule matched exactly
+    (log_refusal); ask() logs its own question first."""
+    if log:
+        log_refusal(reason, rule, kind, sure)
     if HOOK_CTX.get("notes"):  # what the user sent meanwhile still reaches the session
         reason += "\n\n" + "\n".join(HOOK_CTX["notes"])
     emit({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
@@ -5257,7 +5604,7 @@ def approvals_path(root):
     return harness_path(root, "approvals.json")
 
 
-def ask(reason, item=None):
+def ask(reason, rule, item=None, sure=None):
     """Claude Code asks the user itself. Codex has no 'ask' answer for hooks (it would count as a failed
     hook and let the action through), so the action is refused, the agent asks in the chat, and the
     user's own reply, seen by the UserPromptSubmit hook that only a person's input fires, allows that
@@ -5267,6 +5614,7 @@ def ask(reason, item=None):
     root, data = HOOK_CTX.get("root"), item or HOOK_CTX.get("data") or {}
     home = overseer_root(root)
     if HOST["name"] == "claude" and not home:
+        log_refusal(reason, rule, "ask", sure)
         emit({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "ask",
                                      "permissionDecisionReason": reason}})
     ti = data.get("tool_input") or {}
@@ -5281,9 +5629,10 @@ def ask(reason, item=None):
     asked_before = (st.get("pending") or {}).get("key") == key
     st["pending"] = {"key": key, "reason": reason, "session": session, "at": time.time()}
     save_json(approvals_path(root), st)
+    log_refusal(reason, rule, "ask", sure)
     if not home:
         deny(reason + " Ask the user now, in one short question, and end your turn. If they reply yes, run "
-                      "exactly the same action again: their reply allows it once.")
+                      "exactly the same action again: their reply allows it once.", rule, log=False)
     name = worker_info(root).get("name", "")
     if not asked_before:
         what = reason[len(DISPLAY_NAME) + 2:] if reason.startswith(DISPLAY_NAME + ": ") else reason
@@ -5291,7 +5640,8 @@ def ask(reason, item=None):
     deny(reason + " You're a worker, and the user may not be watching you, so the overseer has been told you're "
                   "waiting for their OK. Tell it too, with SendMessage: one plain line on what you want to do and why. "
                   "Meanwhile carry on with work that doesn't need it, or end your turn. When the overseer says the user "
-                  "approved (or the user says yes here), run exactly the same action again: it's allowed once.")
+                  "approved (or the user says yes here), run exactly the same action again: it's allowed once.",
+         rule, log=False)
 
 
 YES = re.compile(r"^\s*(yes|y|yep|ok|okay|sure|approve[d]?|go ahead|do it|da)\b", re.I)
@@ -5612,9 +5962,10 @@ def shell_effects(cmd, cwd, powershell=False):
     followed), "runs" (each command's words), "where" (for each run, the project folder it works on
     when the command chose one: CLAUDE_PROJECT_DIR set or unset, else None for the session's own),
     "code" (inline source it runs), "opaque" (inline code whose processes couldn't be read), "git"
-    (git subcommands with their repo and arguments)."""
+    (git subcommands with their repo and arguments), "inferred" (the indexes of the writes inferred from inline
+    code rather than named by the command)."""
     eff = {"writes": [], "reads": [], "runs": [], "where": [], "code": [], "opaque": [], "git": [],
-           "home": find_root(cwd)}
+           "inferred": set(), "home": find_root(cwd)}
     if powershell:
         cmd = cmd.replace("\\", "/").replace("`", "'")  # PowerShell paths and its escape character
     _effects(cmd, cwd.replace("\\", "/"), {}, eff, {}, 0)
@@ -5627,6 +5978,21 @@ PROJECT_VAR = "CLAUDE_PROJECT_DIR"
 
 
 def _code_effects(code, cwd, eff, lang=None, env=None, scripts=None, depth=0):
+    """Inline code's effects (_inline_effects); every write it adds is marked as inferred."""
+    first = len(eff["writes"])
+    unsure = _inline_effects(code, cwd, eff, lang, env, scripts, depth)
+    eff.setdefault("inferred", set()).update(range(first, len(eff["writes"])))
+    return unsure
+
+
+def add_inferred(eff, paths):
+    """Writes the parser infers (the arguments of code whose writes it couldn't follow), not ones a command names."""
+    first = len(eff["writes"])
+    eff["writes"] += paths
+    eff.setdefault("inferred", set()).update(range(first, len(eff["writes"])))
+
+
+def _inline_effects(code, cwd, eff, lang=None, env=None, scripts=None, depth=0):
     """Inline code's effects. Python is read from its syntax tree and JavaScript from its file calls: only
     the paths passed to calls that write count as writes. Where a call's path can't be followed, or for
     other languages, every path-like string counts, as before, except the text in triple quotes (data).
@@ -6153,8 +6519,10 @@ def _effects(cmd, cwd, env, eff, scripts, depth):
             run = dict(env, **local)
             if code is not None:
                 unsure = _code_effects(code, cwd, eff, lang, run, scripts, depth)
-                if unsure or (name == "perl" and any(re.match(r"^-\w*i", a) for a in args)):
-                    eff["writes"] += [resolve(f, cwd) for f in files]  # perl -pi -e … files; open(sys.argv[1], "w")
+                if unsure:
+                    add_inferred(eff, [resolve(f, cwd) for f in files])  # open(sys.argv[1], "w")
+                elif name == "perl" and any(re.match(r"^-\w*i", a) for a in args):
+                    eff["writes"] += [resolve(f, cwd) for f in files]  # perl -pi -e … files
             script = next((a for a in positionals(args, ("-m", "-W", "-X", "--input-type", "-r", "--require",
                                                           "--import", "--loader"))
                            if a != "-"), None) if code is None else None
@@ -6168,7 +6536,7 @@ def _effects(cmd, cwd, env, eff, scripts, depth):
                     body = read(sp)
                 if body and _code_effects(body, cwd, eff, lang, run, scripts, depth):
                     rest = args[args.index(script) + 1:] if script in args else []
-                    eff["writes"] += [resolve(f, cwd) for f in positionals(rest)]  # it may write its arguments
+                    add_inferred(eff, [resolve(f, cwd) for f in positionals(rest)])  # it may write its arguments
             continue
         if SHELL_CMD.match(name):
             script = None
@@ -6300,6 +6668,25 @@ def under(root, paths, globs):
     return sorted(set(hits))
 
 
+def exact_writes(eff):
+    """The written paths a command names itself (absolute): not inferred from inline code, and with no unknown
+    variable or wildcard in them. A path rule's refusal is certain only when one of these matched."""
+    inferred = eff.get("inferred") or ()
+    return [x for k, x in enumerate(eff["writes"]) if k not in inferred and not re.search(r"[$*?\[]", x)]
+
+
+def named(root, paths, globs):
+    """The paths (absolute) that match the globs themselves, or are the very folder a glob covers (`rm -r
+    .regista/fleet` for .regista/fleet/**), as project-relative paths. Unlike under(), a folder that only holds a
+    match (".", .regista/) doesn't count."""
+    out = []
+    for ap in paths:
+        rel = rel_to_root(root, ap)
+        if rel not in (None, ".") and (matches(rel, globs) or matches(rel.rstrip("/") + "/x", globs)):
+            out.append(rel)
+    return sorted(set(out))
+
+
 def in_project(root, paths, allowed=()):
     """Paths inside the project, except the allowed globs (scratch files outside it are fine)."""
     out = []
@@ -6331,6 +6718,35 @@ def runs_cli(eff, *subcommand, root=None):
     return any(SPAWN_API.search(c) and "regista.py" in c and all(
         re.search(r"(?<=['\"\s,\[])" + re.escape(s) + r"(?=['\"\s,\]])", c) for s in subcommand)
         for c in eff.get("opaque", eff["code"]))
+
+
+HOOK_SCRIPTS = (f"{SLUG}.py", "dd.py")  # the CLI, and the old name's (dd.py)
+WRAPPER_SHELLS = re.compile(r"^(?:sh|bash|dash|zsh|ksh|ash|busybox)(?:\.exe)?$", re.IGNORECASE)
+HOOK_IN_CODE = re.compile(r"""(?:\b(?:regista|dd)\.py|/regista)['"]?(?:\s*,\s*|\s+)['"]?hook(?![\w-])""")
+
+
+def runs_hook(eff, root=None):
+    """Does the command run the harness's hooks by hand: `regista.py hook …` (any interpreter, any path) or the
+    `regista` wrapper's `hook …`, from the shell or from inline code? Only Claude Code and Codex call the hooks;
+    one fed made-up input could record a manual check as typed by the user. The bare word `regista` counts as the
+    wrapper only when it is a path, the program itself or a shell's script, so `grep regista hook` doesn't. A
+    subcommand the parser can't read (`$(echo hook)`, an unknown variable, `"$@"`) counts too, and `--` is skipped.
+    With root, only runs that work on that project count, as in runs_cli: the harness run on a scratch project of
+    its own (a temporary folder, another repository) is fine."""
+    where = eff.get("where") or []
+    for i, words in enumerate(eff["runs"]):
+        if root and i < len(where) and not works_here(root, where[i]):
+            continue
+        for k, w in enumerate(words[:-1]):
+            rest = [x for x in words[k + 1:] if x != "--"]
+            if not rest or not (rest[0] == "hook" or re.search(r"[$`]", rest[0])):
+                continue
+            path = w.replace("\\", "/")
+            base = path.rsplit("/", 1)[-1].lower()
+            if base in HOOK_SCRIPTS or (base == SLUG and (
+                    "/" in path or k == 0 or WRAPPER_SHELLS.match(os.path.basename(words[0].replace("\\", "/"))))):
+                return True
+    return any(SPAWN_API.search(c) and HOOK_IN_CODE.search(c) for c in eff.get("opaque", eff["code"]))
 
 
 CLAUDE_TOOLS = ("plugin", "plugins", "mcp", "agents", "doctor")  # `claude <these>` manage the install, no session
@@ -6427,8 +6843,9 @@ def gate_files(root, cfg):
     return sorted(out)
 
 
-def protected_hits(root, cfg, paths):
-    """Which written paths are protected: project globs, or absolute paths outside the project."""
+def protected_hits(root, cfg, paths, exact=False):
+    """Which written paths are protected: project globs, or absolute paths outside the project. With exact, only
+    paths that match a protected glob themselves (named()), not folders holding one."""
     rel_globs, hits = [], []
     for pt in cfg["protected"]:
         ap = os.path.expanduser(pt)
@@ -6437,7 +6854,7 @@ def protected_hits(root, cfg, paths):
             hits += [x for x in paths if x == ap or x.startswith(ap + "/") or glob_re(ap).match(x.lstrip("/"))]
         else:
             rel_globs.append(pt)
-    return sorted(set(hits + under(root, paths, rel_globs)))
+    return sorted(set(hits + (named if exact else under)(root, paths, rel_globs)))
 
 
 APPROVE = re.compile(r"^\s*(yes|y|yep|ok|okay|sure|allow|let (it|them)|approve[ds]?|go ahead|do it|da)\b", re.I)
@@ -6485,10 +6902,11 @@ def fleet_guard(root, cfg, data):
     if runs_cli(eff, "fleet"):
         if (w or role != "main") and any(runs_cli(eff, "fleet", x) for x in FLEET_WRITES):
             deny(f"{DISPLAY_NAME}: only the overseer starts, merges and stops workers." +
-                 (" Tell it what you need (SendMessage)." if w else " Report what you need to the orchestrator."))
+                 (" Tell it what you need (SendMessage)." if w else " Report what you need to the orchestrator."),
+                 "fleet_owner")
         if role != "main" and runs_cli(eff, "fleet", "sync"):
             deny(f"{DISPLAY_NAME}: the worker's own session brings the project's work into its branch (`regista.py fleet "
-                 "sync`), not its agents. Report what you need to the orchestrator.")
+                 "sync`), not its agents. Report what you need to the orchestrator.", "fleet_owner")
         if role == "main" and not w:
             os.makedirs(fleet_dir(root), exist_ok=True)
             save_json(os.path.join(fleet_dir(root), "overseer.json"),
@@ -6497,10 +6915,10 @@ def fleet_guard(root, cfg, data):
         if runs_cli(eff, "fleet", "allow"):
             why = allow_refusal(root, data, eff)
             if why:
-                deny(why)
+                deny(why, "fleet_allow")
     if w and (runs_cli(eff, "deploy") or runs_cli(eff, "release") or any(g["sub"] == "push" for g in eff["git"])):
         deny(f"{DISPLAY_NAME}: a worker doesn't push, deploy or release: the overseer does, after merging your branch. Tell it when "
-             "your work is ready.")
+             "your work is ready.", "worker_push")
 
 
 def plan_guard(root, cfg, data):
@@ -6533,36 +6951,96 @@ def hook_pre_bash(root, cfg, data):
         hits = protected_hits(root, cfg, eff["writes"])
         if hits:
             deny(f"{DISPLAY_NAME}: this command writes to a protected path ({', '.join(hits[:5])}). "
-                 "Protected paths are the user's deliverables: never write, move or delete them.")
+                 "Protected paths are the user's deliverables: never write, move or delete them.", "protected_path",
+                 sure=bool(protected_hits(root, cfg, exact_writes(eff), exact=True)))
     if runs_deploy_command(cfg, effects_of(root, data)):
         deny(f"{DISPLAY_NAME}: deploy with `{PY} \"{DD}\" deploy`: it ships the commit and then runs the live checks, "
-             "so a deploy that serves something else than the repository gets caught.")
+             "so a deploy that serves something else than the repository gets caught.", "deploy_command")
     gate = runs_gate_command(root, cfg, effects_of(root, data))
     if gate:
         deny(f"{DISPLAY_NAME}: this runs the '{gate['name']}' gate's command directly, outside the harness's gate lock, "
              "so it could run at the same time as another gate run and share its test database or ports. Run it "
              f"through the harness instead: `{PY} \"{DD}\" gate {gate['name']}`. It waits its turn, reuses a pass on "
-             "exactly these files (add --fresh to run it again anyway) and prints the last lines of a failure.")
+             "exactly these files (add --fresh to run it again anyway) and prints the last lines of a failure.",
+             "gate_lock")
     release_guard(root, cfg, data)
     for g in eff["git"]:
         if g["sub"] == "commit":
             if rel_to_root(root, g["cwd"]) is None or find_root(g["cwd"]) not in (None, root):
                 continue  # another repo's commit: its own config (if any) decides
             if commit_no_verify(g["args"]):
-                deny(f"{DISPLAY_NAME}: commits must run the gates; --no-verify / -n is not allowed.")
+                deny(f"{DISPLAY_NAME}: commits must run the gates; --no-verify / -n is not allowed.", "no_verify")
+            why = stage_all_refusal(root, eff)
+            if why:
+                deny(why, "nested_repo_stage")
             commit_check(root, cfg)
         elif g["sub"] == "push":
             if cfg["push"] == "block":
-                deny(f"{DISPLAY_NAME}: pushing is disabled for this project (config push=block). Ask the user to push.")
+                deny(f"{DISPLAY_NAME}: pushing is disabled for this project (config push=block). Ask the user to push.",
+                     "push_policy")
             if cfg["push"] == "ask":
-                ask(f"{DISPLAY_NAME}: pushes need the user's go-ahead.")
+                ask(f"{DISPLAY_NAME}: pushes need the user's go-ahead.", "push_policy")
     if gh_publishes(effects_of(root, data)):
         if cfg["push"] == "block":
             deny(f"{DISPLAY_NAME}: this publishes on GitHub, and pushing is disabled for this project (config push=block). "
-                 "Ask the user to do it.")
+                 "Ask the user to do it.", "push_policy")
         if cfg["push"] == "ask":
             ask(f"{DISPLAY_NAME}: merging a pull request or publishing a release on GitHub goes out like a push, so it "
-                "needs the user's go-ahead.")
+                "needs the user's go-ahead.", "push_policy")
+
+
+def add_reaches(root, g):
+    """The folders (relative to root, "." for all of it) whose untracked files a `git add` stages: every
+    pathspec, or the whole tree for -A/--all without one. -u/--update and a bare `git add` stage no new file.
+    A pathspec with a glob reaches everything under its literal start; other magic (`:(glob)x`) the whole tree."""
+    flags, specs, rest = [], [], False
+    for a in g["args"]:
+        if rest or not a.startswith("-") or a == "-":
+            specs.append(a)
+        elif a == "--":
+            rest = True
+        else:
+            flags.append(a)
+    short = "".join(a[1:] for a in flags if not a.startswith("--"))
+    if "--update" in flags or "u" in short:
+        return []
+    if not specs:
+        return ["."] if "--all" in flags or "A" in short else []
+    out = []
+    for spec in specs:
+        if spec.startswith(":/"):
+            base, spec = root, spec[2:]
+        elif spec.startswith(":"):
+            return ["."]
+        else:
+            base = g["cwd"]
+        literal = re.split(r"[*?\[]", spec, 1)[0]
+        rel = rel_to_root(root, os.path.join(base, literal) if literal else base)
+        if rel is None:
+            continue
+        if literal != spec:  # a glob: anything under its literal start, which may end mid-name
+            rel = rel if literal.endswith("/") or not literal else os.path.dirname(rel) or "."
+        out.append(rel)
+    return out
+
+
+def stage_all_refusal(root, eff):
+    """A commit command whose `git add` would stage an untracked nested repository or worktree (`git add -A`,
+    `git add .`, or a parent folder of it): git would record it as a link to another repository, not as files.
+    Returns the refusal, or None."""
+    reach = [x for g in eff["git"] if g["sub"] == "add" and rel_to_root(root, g["cwd"]) is not None
+             and find_root(g["cwd"]) in (None, root) for x in add_reaches(root, g)]
+    if not reach:
+        return None
+    hit = [n for n in nested_repos(root)
+           if any(r == "." or n == r or n.startswith(r + "/") or r.startswith(n + "/") for r in reach)]
+    if not hit:
+        return None
+    names = ", ".join(n + "/" for n in hit[:5])
+    return (f"{DISPLAY_NAME} blocked this commit: it would stage {names}, a git repository or worktree of its own "
+            "that git hasn't been told to ignore. Git would record it as a link to another repository, not as files. "
+            f"Add the folder to .gitignore (for worktrees, the line `{NESTED_WORKTREES}`), or stage the files you "
+            "mean by name: `git add <paths> && git commit`.")
 
 
 def commit_check(root, cfg):
@@ -6572,7 +7050,7 @@ def commit_check(root, cfg):
     if problems:
         deny(f"{DISPLAY_NAME} blocked this commit: requirements in {harness_rel('specs', root=root)}/ aren't covered or aren't valid.\n- "
              + "\n- ".join(problems[:15]) + "\nSend the missing tests to the test writer (it adds "
-             "`covers: <ID>`), or mark a spec not started yet as \"state\": \"planned\".")
+             "`covers: <ID>`), or mark a spec not started yet as \"state\": \"planned\".", "coverage")
     files = changed_files(root)
     gates = [] if harness_only(root, cfg, files) else select_gates(cfg, event="commit", files=files)
     results = []
@@ -6585,17 +7063,18 @@ def commit_check(root, cfg):
         if failed:
             tails = "\n\n".join(f"[{r['name']}]\n{r.get('tail', '')}" for r in failed)
             deny(f"{DISPLAY_NAME} blocked this commit: a gate failed.\n" + format_results(results) +
-                 "\n\nFix the cause (or revert the change) and commit again. Never weaken a gate to pass it.\n\n" + tails)
+                 "\n\nFix the cause (or revert the change) and commit again. Never weaken a gate to pass it.\n\n" + tails,
+                 "gate_failed")
     why = review_status(root, cfg)
     if why:
-        deny(why)
+        deny(why, "review_missing")
     if results:
         record_requirements(root, cfg, results)
     HOOK_CTX.setdefault("notes", []).extend(tick_committed_steps(root, cfg, files))
     loose = config_loosened(root, cfg) + tests_removed(root, cfg)
     if loose:
         ask(f"{DISPLAY_NAME}: this commit loosens the harness's checks compared with the last commit: " + "; ".join(loose)
-            + ". That needs the user's OK, whichever way the config was changed.")
+            + ". That needs the user's OK, whichever way the config was changed.", "loosened_checks")
 
 
 def hook_pre_edit(root, cfg, data):
@@ -6605,9 +7084,11 @@ def hook_pre_edit(root, cfg, data):
     hits = protected_hits(root, cfg, [os.path.abspath(path).replace("\\", "/")]) if path and cfg["protected"] else []
     if hits:
         deny(f"{DISPLAY_NAME}: {rel or path} is protected. "
-             "Protected paths are the user's deliverables: never write or edit them. Ask the user instead.")
+             "Protected paths are the user's deliverables: never write or edit them. Ask the user instead.",
+             "protected_path")
     if rel == harness_rel("gates", "baseline.json", root=root):
-        deny(f"{DISPLAY_NAME}: the gate baseline changes only through `regista.py gate --accept` after a passing run.")
+        deny(f"{DISPLAY_NAME}: the gate baseline changes only through `regista.py gate --accept` after a passing run.",
+             "gate_baseline")
 
 
 PATCH_FILE = re.compile(r"^\*\*\* (?:Add File|Update File|Delete File|Move to): *(.+?)\s*$", re.M)
@@ -6636,7 +7117,7 @@ def hook_pre_tool(root, cfg, data):
     items = tool_calls(data)
     if not items:
         deny(f"{DISPLAY_NAME}: couldn't tell which files this patch changes, so it's blocked. Use the standard "
-             "`*** Add File:` / `*** Update File:` / `*** Delete File:` headers.")
+             "`*** Add File:` / `*** Update File:` / `*** Delete File:` headers.", "patch_unreadable")
     typed = queued_typed(root, cfg, data)
     if role_of(data, root) == "main":
         news = fleet_news(root) if not worker_info(root) else ""
@@ -6644,16 +7125,16 @@ def hook_pre_tool(root, cfg, data):
         HOOK_CTX["notes"] = typed
     verdict, msg = context_check(root, cfg, data, items)
     if verdict == "deny":
-        deny(msg)
+        deny(msg, "context_limit")
     for d in items:
-        kind, why = integrity_check(root, cfg, d)
+        kind, why, rule, sure = integrity_check(root, cfg, d)
         if kind == "deny":
-            deny(why)
+            deny(why, rule, sure=sure)
         if kind == "ask":
-            ask(why, d)
-        why = role_check(root, cfg, d)
+            ask(why, rule, d, sure=sure)
+        rule, why = role_check(root, cfg, d)
         if why:
-            deny(why)
+            deny(why, rule)
         tool = d.get("tool_name", "")
         if tool in ("Bash", "PowerShell"):
             fleet_guard(root, cfg, d)
@@ -6693,7 +7174,7 @@ def hook_user_prompt(root, cfg, data):
         prompt = data.get("prompt") or ""
         if re.match(r"\s*[$/]?" + TYPED_SLUG + r":(verify|change)\b", prompt, re.I):
             notes += record_typed(root, cfg, re.sub(r"^\s*(" + TYPED_SLUG + ":)", r"$\1", prompt, flags=re.I),
-                                  "user (typed in Codex)")
+                                  "user (typed in Codex)", "looked")
     prompt = data.get("prompt") or ""
     reply = None
     if HOST["name"] == "codex" or (worker_info(root) and person_prompt(prompt)):
@@ -6730,7 +7211,7 @@ def hook_prompt_expansion(root, cfg, data):
     if not re.match(typed, prompt, re.I):
         args = data.get("command_args")
         prompt = f"/{name} {args if isinstance(args, str) else ''}"
-    notes = record_typed(root, cfg, prompt, "user (typed the command)")
+    notes = record_typed(root, cfg, prompt, "user (typed the command)", "looked")
     if notes:
         emit_context("UserPromptExpansion", "\n".join(notes))
 
@@ -6911,7 +7392,8 @@ def hook(event):
         msg = f"{DISPLAY_NAME} hook error in {event}: {type(e).__name__}: {e}"
         if event in ("pre-tool", "pre-bash", "pre-edit") and env_value("FAIL_OPEN") != "1":
             deny(msg + ". Failing closed: the action is blocked until the harness works again. Check "
-                 f"{harness_rel('config.json', root=root)}; set {ENV_PREFIX}FAIL_OPEN=1 to bypass while you fix it.")
+                 f"{harness_rel('config.json', root=root)}; set {ENV_PREFIX}FAIL_OPEN=1 to bypass while you fix it.",
+                 "hook_error")
         print(msg, file=sys.stderr)  # other events never trap the session
 
 
@@ -7024,18 +7506,54 @@ def detect(root):
         elif "[project.scripts]" in pyproject or "console_scripts" in alldeps:
             kind = "command-line tool" if kind == "unknown" else kind
         py_tests = [f for f in py_files if re.search(r"(^|/)(test_[^/]*|[^/]*_test)\.py$", f)]
-        if "pytest" in alldeps or py_tests or "conftest.py" in {f.split("/")[-1] for f in has}:
+        conftest = "conftest.py" in {f.split("/")[-1] for f in has}
+        # pytest's own settings: pytest.ini, or a pytest section in tox.ini, setup.cfg or pyproject.toml
+        pytest_cfg = "pytest.ini" in has or any(
+            name in has and re.search(r"^\s*\[" + section + r"\]", text(name), re.M)
+            for name, section in (("tox.ini", r"pytest"), ("setup.cfg", r"tool:pytest"),
+                                  ("pyproject.toml", r"tool\.pytest\.ini_options")))
+        # pytest counts as available only from the project's own files: never import or run it to find out
+        has_pytest = "pytest" in alldeps or conftest or pytest_cfg or runner != plain
+        run = None
+        if has_pytest and ("pytest" in alldeps or py_tests or conftest or pytest_cfg):
             run = runner + "pytest -q"
-            if not any(g["name"] == "tests" for g in gates):
-                gates.append({"name": "tests", "run": run, "when": ["commit"], "timeout": 900})
+        elif py_tests:  # plain unittest, from the folder that holds the tests
+            dirs = sorted({os.path.dirname(f) or "." for f in py_tests})
+            if all(d == "." or d.split("/")[0] in ("tests", "test") for d in dirs):
+                folder = next((d for d in ("tests", "test") if any(f.startswith(d + "/") for f in py_tests)), ".")
+                run = f"{plain}unittest discover -s {folder}"
+            else:  # discover doesn't descend into folders that aren't packages: run it on each folder of tests
+                import shlex
+
+                def packages(base, d):  # every folder below `base` down to `d` holds __init__.py
+                    parts = d.split("/")
+                    start = 0 if base == "." else len(base.split("/"))
+                    return all("/".join(parts[:i + 1] + ["__init__.py"]) in has for i in range(start, len(parts)))
+
+                listed = []
+                for d in dirs:  # sorted, so a parent folder comes before the folders inside it
+                    if not any(b != d and (b == "." or d.startswith(b + "/")) and packages(b, d) for b in listed):
+                        listed.append(d)  # discover on a listed folder already runs the packages inside it
+                run = " && ".join(
+                    f"{plain}unittest discover -s {shlex.quote('./' + d if d.startswith('-') else d)}"
+                    # a package importable from the root runs with the root as top level, so relative imports work
+                    + (" -t ." if d != "." and packages(".", d) else "") for d in listed)
+            if not any(re.search(r"(^|/)test[^/]*\.py$", f) for f in py_tests):
+                notes.append("The tests are named *_test.py, which `unittest discover` skips by default: rename "
+                             "them test_*.py, or add `-p \"*_test.py\"` to the tests gate.")
+        if run and not any(g["name"] == "tests" for g in gates):
+            gates.append({"name": "tests", "run": run, "when": ["commit"], "timeout": 900})
         if "ruff" in alldeps or "ruff.toml" in has or "[tool.ruff" in pyproject:
             gates.append({"name": "lint", "run": (runner if runner != plain else "") + "ruff check .",
                           "when": ["commit"], "timeout": 300})
         pkgs = sorted({f.split("/")[0] for f in py_files if f.count("/") == 1 and f.endswith("/__init__.py")}
                       - {"tests", "test"})
         src += ["src/**"] if "src" in top else [f"{d}/**" for d in pkgs]
-        if not src:
-            src += ["*.py"]
+        if not src:  # no package: the folders that hold code, and the root's own modules
+            code = [f for f in py_files if f not in py_tests and f.split("/")[-1] not in ("conftest.py", "setup.py")
+                    and f.split("/")[0] not in ("tests", "test")]
+            src += sorted({f"{f.split('/')[0]}/**" for f in code if "/" in f})
+            src += ["*.py"] if any("/" not in f for f in code) or not src else []
 
     if "go.mod" in has:
         stack.append("Go")
@@ -7079,7 +7597,15 @@ def detect(root):
             "review": {"required_for": sorted(set(src)) or ["src/**"]},
             "fleet": {"setup": worktree_setup(root)},
             "protected": SECRETS, "test_files": len(test_files), "notes": notes,
-            "git": os.path.isdir(os.path.join(root, ".git"))}
+            "git": in_git(root)}
+
+
+def in_git(root):
+    """Whether the folder is a git checkout: a .git folder, or a worktree's .git file pointing to its repository."""
+    dot = os.path.join(root, ".git")
+    if os.path.isdir(dot):
+        return True
+    return os.path.isfile(dot) and read(dot, 4096).lstrip().startswith("gitdir:")
 
 
 def worker_database_note(root, db):
@@ -7543,6 +8069,7 @@ def doctor(root, cfg):
                 bad.append(f"check '{g['name']}' runs `{word}`, which isn't installed or isn't on PATH")
                 continue
         good.append(f"check '{g['name']}': `{run}`")
+    info += lint_warnings(root, cfg)
     if (cfg.get("deploy") or {}).get("run") and not select_gates(cfg, event="deploy"):
         info.append("deploys run no live checks: add a gate with \"when\": [\"deploy\"] that looks at what's served")
     live = live_gates(cfg)
@@ -7607,16 +8134,263 @@ def ensure_gitignore(root):
 
 # --- init -----------------------------------------------------------------------------------
 
+NESTED_WORKTREES = ".claude/worktrees/"  # where Claude Code puts an agent's git worktree, inside the project
+
+
+def ensure_root_gitignore(root):
+    """The project's own .gitignore lists NESTED_WORKTREES, so `git add -A` never stages an agent's worktree. The
+    file is created if needed; its lines and line endings are kept, and an entry already there isn't repeated."""
+    path = os.path.join(root, ".gitignore")
+    text = read_exact(path) or ""
+    entry = NESTED_WORKTREES.rstrip("/")
+    if any(x.strip().strip("/") == entry for x in text.splitlines()):
+        return
+    nl = "\r\n" if "\r\n" in text else "\n"
+    write_exact(path, text + (nl if text and not text.endswith(("\n", "\r")) else "") + NESTED_WORKTREES + nl)
+
+
+# Linters and the harness folder. A gate that lints the whole project would also check the code in the harness
+# folder (research probes, tools) and in agents' worktrees. Ruff's settings are edited as text, since Python can
+# read TOML (tomllib, 3.11 and newer) but not write it: init and migrate add both folders to `extend-exclude`, and
+# keep every other line, comment and line ending. Other linters' settings aren't touched; doctor warns about them.
+
+LINT_SKIP = [PROJECT_DIR, NESTED_WORKTREES.rstrip("/")]  # the folders a project's linter should leave alone
+RUFF_FILES = (".ruff.toml", "ruff.toml", "pyproject.toml")  # in the order ruff prefers them
+TOML_HEADER = re.compile(r"""^[ \t]*\[\[?[ \t]*[A-Za-z0-9_\-."' \t]+\]\]?[ \t]*(#.*)?$""")
+RUFF_HEADER = re.compile(r"""^[ \t]*\[[ \t]*tool[ \t]*\.[ \t]*(ruff|"ruff"|'ruff')[ \t]*\][ \t]*(#.*)?$""")
+EXTEND_EXCLUDE = re.compile(r"""^[ \t]*(extend-exclude|"extend-exclude"|'extend-exclude')[ \t]*=[ \t]*""")
+LINTERS = [(name, re.compile(rx)) for name, rx in (
+    ("eslint", r"(?<![\w-])eslint(?![\w-])"), ("flake8", r"(?<![\w-])flake8(?![\w-])"),
+    ("pylint", r"(?<![\w-])pylint(?![\w-])"), ("biome", r"(?<![\w-])biome(?![\w-])"),
+    ("prettier --check", r"(?<![\w-])prettier(?![\w-])[^;&|\n]*\s(--check|-c)(?![\w-])"),
+    ("ruff", r"(?<![\w-])ruff(?![\w-])"))]
+CODE_SUFFIXES = (".py", ".js", ".mjs", ".ts")
+
+
+def have_tomllib():
+    """Can this Python read TOML? tomllib came with Python 3.11; without it ruff's settings aren't edited."""
+    try:
+        import tomllib  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def load_toml(text):
+    """The TOML `text` as a dict, or None when it isn't valid TOML or this Python has no tomllib (before 3.11)."""
+    try:
+        import tomllib
+        return tomllib.loads(text)
+    except (ImportError, ValueError):
+        return None
+
+
+def ruff_settings(root):
+    """(file, its text, its data, ruff's table in it) for the settings ruff reads at `root`: .ruff.toml, then
+    ruff.toml (ruff's keys at the top level), then pyproject.toml when it has a [tool.ruff] table. The data and
+    the table are None when the file can't be read as TOML. None when the project has no ruff settings."""
+    for rel in RUFF_FILES:
+        text = read_exact(os.path.join(root, rel))
+        if text is None:
+            continue
+        data = load_toml(text)
+        if rel != "pyproject.toml":
+            return rel, text, data, data
+        tool = (data or {}).get("tool")
+        table = tool.get("ruff") if isinstance(tool, dict) else None
+        if isinstance(table, dict):
+            return rel, text, data, table
+        if data is None and re.search(r"^[ \t]*\[[ \t]*tool[ \t]*\.[ \t]*[\"']?ruff\b", text, re.M):
+            return rel, text, None, None
+    return None
+
+
+def skip_key(entry):
+    """An exclude entry compared loosely: ".regista", "./.regista" and ".regista/" name the same folder."""
+    return entry.strip().removeprefix("./").rstrip("/") if isinstance(entry, str) else entry
+
+
+def ruff_missing(table, keys=("extend-exclude",)):
+    """The LINT_SKIP folders that ruff's `table` doesn't list under any of `keys`."""
+    listed = {skip_key(x) for k in keys for x in (table.get(k) if isinstance(table.get(k), list) else [])}
+    return [x for x in LINT_SKIP if x not in listed]
+
+
+def toml_array_end(text, start):
+    """For the TOML array opening at text[start] ("["): (the index just past its "]", the index just past its last
+    value or comma, whether that was a comma, whether it holds any value), or None if it doesn't close."""
+    depth, i, last, comma, values = 0, start, start + 1, False, False
+    while i < len(text):
+        c = text[i]
+        if c == "#":
+            end = text.find("\n", i)
+            i = len(text) if end < 0 else end
+            continue
+        if c in "\"'":
+            quote = c * 3 if text.startswith(c * 3, i) else c
+            j = i + len(quote)
+            while j < len(text) and not text.startswith(quote, j):
+                j += 2 if c == '"' and text[j] == "\\" else 1
+            if j >= len(text):
+                return None
+            i = j + len(quote)
+            last, comma, values = i, False, True
+            continue
+        if c == "]" and depth == 1:
+            return i + 1, last, comma, values
+        if c == "[" and depth == 0:
+            depth = 1
+        elif not c.isspace():
+            depth += (c == "[") - (c == "]")
+            last, comma, values = i + 1, c == "," and depth == 1, values or c != ","
+        i += 1
+    return None
+
+
+def ruff_excludes_added(text, rel):
+    """(ruff's settings `text`, from the file `rel`, with the LINT_SKIP folders it lacks added to `extend-exclude`
+    in ruff's table; the folders added). The key is created at the end of the table's keys (the top level of
+    ruff.toml, [tool.ruff] in pyproject.toml), or the existing list is extended, in its own layout. Every other
+    line and the line endings stay as they are. The text is None when it can't be edited safely (the result is
+    read back and must equal the old settings plus the new entries)."""
+    data = load_toml(text)
+    table = data if rel != "pyproject.toml" else ((data or {}).get("tool") or {}).get("ruff")
+    if not isinstance(table, dict) or not isinstance(table.get("extend-exclude", []), list):
+        return None, list(LINT_SKIP)
+    missing = ruff_missing(table)
+    if not missing:
+        return text, []
+    nl = "\r\n" if "\r\n" in text else "\n"
+    values = ", ".join(json.dumps(x) for x in missing)
+    lines = text.splitlines(keepends=True)
+    starts = [0]
+    for ln in lines:
+        starts.append(starts[-1] + len(ln))
+    head = None
+    if rel == "pyproject.toml":
+        head = next((i for i, ln in enumerate(lines) if RUFF_HEADER.match(ln.rstrip("\r\n"))), None)
+    first = 0 if rel != "pyproject.toml" else len(lines) if head is None else head + 1
+    end = next((i for i in range(first, len(lines)) if TOML_HEADER.match(lines[i].rstrip("\r\n"))), len(lines))
+    key = next((i for i in range(first, end) if EXTEND_EXCLUDE.match(lines[i])), None)
+    if key is not None:
+        at = starts[key] + EXTEND_EXCLUDE.match(lines[key]).end()
+        found = toml_array_end(text, at) if text[at:at + 1] == "[" else None
+        if not found:
+            return None, missing
+        close, last, comma, has = found
+        line_start = text.rfind("\n", 0, close - 1) + 1
+        if has and not text[line_start:close - 1].strip():  # "]" on a line of its own: one entry per line
+            after_open = text.find("\n", at) + 1
+            indent = re.match(r"[ \t]*", text[after_open:]).group(0) or "    "
+            new = (text[:last] + ("" if comma else ",") + text[last:line_start]
+                   + "".join(f"{indent}{json.dumps(x)},{nl}" for x in missing) + text[line_start:])
+        else:
+            new = text[:last] + ((" " if comma else ", ") if has else "") + values + text[last:]
+    else:
+        line = f"extend-exclude = [{values}]{nl}"
+        ends_open = bool(text) and not text.endswith("\n")
+        if rel == "pyproject.toml" and head is None:  # ruff's table exists only through [tool.ruff.*] tables
+            new = text + (nl if ends_open else "") + (nl if text.strip() else "") + "[tool.ruff]" + nl + line
+        else:
+            keyed = [i for i in range(first, end) if lines[i].strip() and not lines[i].lstrip().startswith("#")]
+            pos = starts[keyed[-1] + 1 if keyed else first]
+            new = text[:pos] + (nl if pos == len(text) and ends_open else "") + line + text[pos:]
+    import copy
+    want = copy.deepcopy(data)
+    target = want if rel != "pyproject.toml" else want["tool"]["ruff"]
+    target["extend-exclude"] = list(table.get("extend-exclude", [])) + missing
+    return (new if load_toml(new) == want else None), missing
+
+
+def ruff_exclude_plan(root):
+    """(file, its new text, the folders added) when ruff's settings at `root` lack LINT_SKIP's folders in
+    `extend-exclude`; the text is None when the file can't be edited safely. None when there's nothing to do."""
+    found = ruff_settings(root)
+    if not found:
+        return None
+    rel, text = found[:2]
+    if not have_tomllib():  # the file can't be read, so only a quick look: does it name both folders already?
+        named = all(re.search(r"""["'](\./)?""" + re.escape(x) + r"""/?["']""", text) for x in LINT_SKIP)
+        return None if named else (rel, None, list(LINT_SKIP))
+    new, missing = ruff_excludes_added(text, rel)
+    return (rel, new, missing) if missing else None
+
+
+def ruff_exclude_text(rel, new, missing, done=True):
+    """The plain line that says what the ruff edit did (`done`) or will do."""
+    names = " and ".join(missing)
+    skip = f"{PROJECT_DIR}/ and {NESTED_WORKTREES}"
+    if new is None and not have_tomllib():
+        where = "under [tool.ruff] in pyproject.toml" if rel == "pyproject.toml" else f"to {rel}"
+        line = "extend-exclude = [" + ", ".join(json.dumps(x) for x in LINT_SKIP) + "]"
+        return (f"Editing ruff's settings needs Python 3.11 or newer, so {rel} isn't changed and ruff still checks "
+                f"{skip}. To keep ruff out of them, add this line {where} by hand (if there's already an "
+                f"extend-exclude list, add the two folders to it instead):\n    {line}")
+    if new is None:
+        return (f"{rel}: ruff's settings there couldn't be edited safely, so add {names} to its extend-exclude by "
+                f"hand; until then ruff also checks {skip}.")
+    return (f"{rel}: added {names} to ruff's extend-exclude, so ruff skips {skip}." if done else
+            f"{rel}: add {names} to ruff's extend-exclude, so ruff skips {skip}.")
+
+
+def ensure_ruff_excludes(root):
+    """init: add LINT_SKIP's folders to ruff's `extend-exclude`, if the project has ruff settings. Returns the
+    line that says what was done, or "" when there was nothing to do."""
+    plan = ruff_exclude_plan(root)
+    if not plan:
+        return ""
+    if plan[1] is not None:
+        write_exact(os.path.join(root, plan[0]), plan[1])
+    return ruff_exclude_text(*plan)
+
+
+def harness_code(root):
+    """Does the harness folder hold code files (CODE_SUFFIXES) that a linter would check?"""
+    for _, dirs, files in os.walk(harness_path(root)):
+        dirs[:] = [d for d in dirs if d not in (".git", "node_modules")]
+        if any(f.endswith(CODE_SUFFIXES) for f in files):
+            return True
+    return False
+
+
+def lint_warnings(root, cfg):
+    """doctor: one line per gate whose linter would also check the code in the harness folder and in agents'
+    worktrees. Ruff counts only when its settings don't list both folders in `exclude` or `extend-exclude`."""
+    gates = [(g, [name for name, rx in LINTERS if rx.search(g.get("run") or "")]) for g in cfg["gates"]]
+    gates = [(g, names) for g, names in gates if names]
+    if not gates or not harness_code(root):
+        return []
+    ruff = ruff_settings(root)
+    ruff_ok = bool(ruff and ruff[3] is not None and not ruff_missing(ruff[3], ("exclude", "extend-exclude")))
+    folder = rel_to_root(root, harness_path(root)) or PROJECT_DIR
+    out = []
+    for g, names in gates:
+        names = [n for n in names if not (n == "ruff" and ruff_ok)]
+        if not names:
+            continue
+        where = ""
+        if "ruff" in names:
+            where = (f" (for ruff: extend-exclude in {ruff[0]})" if ruff else
+                     " (for ruff: extend-exclude under [tool.ruff] in pyproject.toml, or in ruff.toml)")
+        out.append(f"check '{g['name']}' runs {' and '.join(names)}, which also checks the code in {folder}/ and in "
+                   f"agents' worktrees → exclude `{folder}/` and `{NESTED_WORKTREES}` from it{where}")
+    return out
+
+
 def template_config(text):
     """The template config.json with its paths into the harness folder (the plan, status, board, state,
-    memory and knowledge files) set from harness_rel, so they follow PROJECT_DIR. Text that isn't valid
-    JSON (a project name with a quote in it) is left as it is."""
+    memory and knowledge files, and the folder's entry in no_gates_for) set from harness_rel, so they follow
+    PROJECT_DIR. Text that isn't valid JSON (a project name with a quote in it) is left as it is."""
     try:
         cfg = json.loads(text)
     except ValueError:
         return text
+    tpl_dir = str(cfg.get("plan") or "").split("/", 1)[0]  # the harness folder the template's paths name
     paths = {k: DEFAULTS[k] for k in ("status_file", "board_file", "state_dir", "memory_dir", "knowledge_file")}
     paths["plan"] = harness_rel("plan.md")
+    if tpl_dir and isinstance(cfg.get("no_gates_for"), list):
+        paths["no_gates_for"] = [harness_rel(x[len(tpl_dir) + 1:]) if isinstance(x, str) and x.startswith(tpl_dir + "/")
+                                 else x for x in cfg["no_gates_for"]]
     cfg.update({k: v for k, v in paths.items() if k in cfg})  # same keys, so the template's order stays
     return json.dumps(cfg, indent=2, ensure_ascii=False) + "\n"
 
@@ -7641,8 +8415,12 @@ def init(name, auto=False):
             with open(dst, "w", encoding="utf-8") as f:
                 f.write(text)
     ensure_gitignore(root)
+    ensure_root_gitignore(root)
+    ruff = ensure_ruff_excludes(root)
     if not auto:
         print(f"Created {target}. Next: fill config.json (gates, protected) and plan.md.")
+        if ruff:
+            print(ruff)
         return
     found = detect(root)
     path = os.path.join(target, "config.json")
@@ -7653,7 +8431,8 @@ def init(name, auto=False):
     cfg["fleet"] = {**cfg.get("fleet", {}), **found["fleet"]}
     save_json(path, cfg)
     lines = setup_hosts(root, load_config(root))
-    print(json.dumps({"created": target, "detected": found, "hosts": lines}, indent=2, ensure_ascii=False))
+    print(json.dumps({"created": target, "detected": found, "hosts": lines, **({"ruff": ruff} if ruff else {})},
+                     indent=2, ensure_ascii=False))
 
 
 # --- migrate: move a project set up under the old name to the new folder ---------------------
@@ -8035,6 +8814,11 @@ def migration_changes(root, touched=None):
         changes.append((".gitignore: change " + ", ".join(f"{a} to {b}" for a, b in entries[:5])
                         + (", …" if len(entries) > 5 else "") + ".",
                         lambda: write_exact(os.path.join(root, ".gitignore"), ignore_text) or [".gitignore"]))
+    plan = ruff_exclude_plan(root)
+    if plan and plan[1] is not None:
+        touched.append(p(root, plan[0]))
+        changes.append((ruff_exclude_text(*plan, done=False),
+                        lambda: write_exact(p(root, plan[0]), plan[1]) or [plan[0]]))
     changes.append((f"Commit all of it as one commit, \"{MOVE_MESSAGE}\".", lambda: []))
     return changes
 
@@ -8214,6 +8998,9 @@ def migrate(check=False):
                f"change them by hand afterwards:\n" + "\n".join(f"- {where}: {value}" for where, value in fixes))
     history = ("History keeps its old paths: handoffs, research notes, reviews, gate logs and specs aren't "
                "changed.")
+    ruff = ruff_exclude_plan(root)
+    if ruff and ruff[1] is None:  # ruff's settings can't be edited here: what to add by hand
+        by_hand += "\n\n" + ruff_exclude_text(*ruff)
     if check:
         print(f"Moving this project from {OLD_PROJECT_DIR}/ to {PROJECT_DIR}/ makes these changes:")
         print("\n".join("- " + line for line, _ in changes))
@@ -8264,6 +9051,118 @@ def migrate(check=False):
     if swap:
         print("\n" + swap)
     return 0
+
+
+# --- refusals: what the hooks refused, and the user's labels ---------------------------------
+#
+# hooks.log only grows. A refusal line carries the rule's first label (real or unsure); the user's label is a later
+# line {"label_of": <number>, "line": <hash of the refusal's line>, "label", "label_by": "user", "label_why"}, merged
+# when the log is read. Lines from before refusals had a kind, a rule and a label list with those fields empty.
+
+REFUSAL_LABELS = ("real", "false_alarm")
+REFUSAL_FIELDS = ("number", "at", "kind", "rule", "role", "session", "worker", "label", "label_by", "label_why",
+                  "tool", "input", "reason")
+
+
+def refusal_hash(line):
+    import hashlib
+    return hashlib.sha256(line.strip().encode("utf-8")).hexdigest()[:16]
+
+
+def load_refusals(root):
+    """Every refusal in the project's hooks.log, oldest first, numbered from 1, the user's labels merged in.
+    Returns (refusals, the hash of each one's line)."""
+    try:
+        with open(harness_path(root, "hooks.log"), encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return [], []
+    rows, hashes, labels = [], [], []
+    for line in lines:
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue  # older logs mix in plain text lines
+        if not isinstance(d, dict):
+            continue
+        if "label_of" in d:
+            labels.append(d)
+        elif "reason" in d:
+            label = d.get("label") if d.get("label") in REFUSAL_LABELS + ("unsure",) else "unsure"
+            rows.append({"number": len(rows) + 1, "at": d.get("at"), "kind": d.get("kind") or "deny",
+                         "rule": d.get("rule"), "role": d.get("role"), "session": d.get("session"),
+                         "worker": d.get("worker"), "label": label, "label_by": d.get("label_by"),
+                         "label_why": None, "tool": d.get("tool"), "input": d.get("input"), "reason": d.get("reason")})
+            hashes.append(refusal_hash(line))
+    for lab in labels:  # in the order the user gave them: the last label wins
+        n = lab.get("label_of")
+        i = (n - 1 if isinstance(n, int) and 0 < n <= len(rows) and hashes[n - 1] == lab.get("line") else
+             next((k for k, h in enumerate(hashes) if h == lab.get("line")), None))
+        if i is not None and lab.get("label") in REFUSAL_LABELS:
+            rows[i].update(label=lab["label"], label_by=lab.get("label_by") or "user", label_why=lab.get("label_why"))
+    return rows, hashes
+
+
+def refusal_line(r):
+    """One refusal on one line: its number, when, the rule, whose call, the label and the reason's first words."""
+    reason = re.sub(r"^[^:\n]{1,40}: ", "", (r.get("reason") or "").strip()).split("\n")[0]
+    reason = reason if len(reason) <= 110 else reason[:107].rstrip() + "..."
+    who = (r.get("role") or "?") + (f" ({r['worker']})" if r.get("worker") else "")
+    label = r["label"] + (f" ({r['label_by']}: {r['label_why']})" if r.get("label_by") == "user" and r.get("label_why")
+                          else "")
+    return (f"{r['number']:>4}  {(r.get('at') or '?').replace('T', ' ')[:16]}  {r['kind']:<4}  {r.get('rule') or '?':<22}  "
+            f"{who:<11}  {label:<11}  {reason}")
+
+
+def refusals_text(rows, unlabelled=False):
+    """The listing, newest first."""
+    if unlabelled:
+        rows = [r for r in rows if r["label"] == "unsure"]
+        if not rows:
+            return "No refusals waiting for a label."
+        head = f"{len(rows)} refusal(s) waiting for your label, newest first."
+    else:
+        if not rows:
+            return "No refusals logged."
+        waiting = sum(r["label"] == "unsure" for r in rows)
+        head = f"{len(rows)} refusal(s), newest first; {waiting} waiting for your label."
+    return "\n".join([head] + [refusal_line(r) for r in reversed(rows)] + [
+        "Label one: regista.py refusals label <number> real|false_alarm --why \"what you saw\""])
+
+
+# The variables an agent host sets in the shell its tools run in: Claude Code's, and Codex's sandbox and session ones.
+AGENT_SHELL_VARS = ("CLAUDECODE", "CODEX_SANDBOX", "CODEX_SANDBOX_NETWORK_DISABLED", "CODEX_THREAD_ID",
+                    "CODEX_SESSION_ID")
+
+
+def agent_shell():
+    """The agent host whose tool shell this process runs in (Claude Code or Codex), or None for a person's terminal."""
+    found = [k for k in AGENT_SHELL_VARS if os.environ.get(k)]
+    return None if not found else "Claude Code" if found[0] == "CLAUDECODE" else "Codex"
+
+
+def label_refusal(root, args, why):
+    """`refusals label <number> real|false_alarm --why "..."`: the user's label, appended to hooks.log. Refused in an
+    agent's tool shell, so a route around the hook's reading of the command still can't label."""
+    if len(args) != 3 or args[0] != "label":
+        sys.exit("Usage: regista.py refusals label <number> real|false_alarm --why \"what you saw\"")
+    host = agent_shell()
+    if host:
+        sys.exit(f"Labelling refusals is the user's call, so this command doesn't run inside a {host} session. "
+                 "Run it from your own terminal: regista.py refusals label <number> real|false_alarm --why \"...\"")
+    number, label = args[1], args[2]
+    if label not in REFUSAL_LABELS:
+        sys.exit(f"'{label}' isn't a label: use real (the refusal was right) or false_alarm (it shouldn't have fired).")
+    if not (why or "").strip():
+        sys.exit("Say why with --why \"...\": what the command did, and why the refusal was right or wrong.")
+    rows, hashes = load_refusals(root)
+    if not number.isdigit() or not 0 < int(number) <= len(rows):
+        sys.exit(f"There's no refusal number {number}: `regista.py refusals` lists them.")
+    n = int(number)
+    with open(harness_path(root, "hooks.log"), "a", encoding="utf-8") as f:
+        f.write(json.dumps({"at": now_iso(), "label_of": n, "line": hashes[n - 1], "label": label, "label_by": "user",
+                            "label_why": why.strip()}, ensure_ascii=False) + "\n")
+    return f"Refusal {n} ({rows[n - 1].get('rule') or 'no rule recorded'}) is now labelled {label}."
 
 
 # --- main -----------------------------------------------------------------------------------
@@ -8342,6 +9241,7 @@ def main():
     vm.add_argument("id")
     vm.add_argument("--note", required=True, help="what you checked, and how")
     vm.add_argument("--fail", action="store_true", help="record it as failing instead")
+    vm.add_argument("--forced", action="store_true", help="record that it was passed without being checked one by one")
     ts = sub.add_parser("tests", help="(the user only) `tests cleanup`: find overlapping tests, prove they add nothing, "
                                       "remove them with your OK")
     ts.add_argument("action", choices=["cleanup"])
@@ -8358,6 +9258,12 @@ def main():
     sub.add_parser("review-status", help="does the current change set need a review, and is there one?")
     cx = sub.add_parser("context")
     cx.add_argument("transcript")
+    rf = sub.add_parser("refusals", help="what the hooks refused, newest first; `refusals label <n> real|false_alarm "
+                                         "--why \"...\"` (the user only) says whether a refusal was right")
+    rf.add_argument("args", nargs="*", metavar="label N real|false_alarm")
+    rf.add_argument("--unlabelled", action="store_true", help="only the refusals waiting for your label")
+    rf.add_argument("--json", action="store_true", help="the refusals as a JSON list, newest first")
+    rf.add_argument("--why", help="(label) why the refusal was right or a false alarm")
     h = sub.add_parser("handoff-name")
     h.add_argument("slug")
     k = sub.add_parser("hook")
@@ -8453,7 +9359,7 @@ def main():
                 st = state.get(r["id"], {})
                 c = cov.get(r["id"], {})
                 if r.get("verify") == "manual":
-                    where = (f"checked by the user on {st.get('at', '')[:10]}" if st.get("passes") else
+                    where = (f"checked by the user on {st.get('at', '')[:10]} ({manual_how(st)})" if st.get("passes") else
                              f"the user reported a problem on {st.get('at', '')[:10]}" if st.get("by") else
                              "waits for the user (`regista.py try`)")
                 else:
@@ -8469,6 +9375,9 @@ def main():
     elif a.cmd == "milestone":
         done, why = milestone_status(root, cfg, a.name)
         print(f"{a.name}: DONE, gate met." if done else f"{a.name}: gate open.\n- " + "\n- ".join(why))
+        how_line = manual_how_summary(root, a.name)
+        if how_line:
+            print(how_line)
         sys.exit(0 if done else 1)
     elif a.cmd == "run":
         if a.action == "start":
@@ -8574,8 +9483,9 @@ def main():
         req = next((r for s in specs for r in s.get("requirements") or [] if r.get("id") == a.id), None)
         if not req or req.get("verify") != "manual":
             sys.exit(f"{a.id} isn't a manual requirement in {harness_rel('specs', root=root)}/.")
-        record_manual(root, a.id, not a.fail, a.note, "user")
-        print(f"{a.id}: recorded as {'failing' if a.fail else 'verified'}.")
+        how = cli_manual_how(a.note, a.forced)
+        record_manual(root, a.id, not a.fail, a.note, "user", how)
+        print(f"{a.id}: recorded as {'failing' if a.fail else 'verified'} ({how}).")
     elif a.cmd == "tests":
         if a.prove:
             path, prop = cleanup_load(root, a.prove)
@@ -8613,6 +9523,16 @@ def main():
         sys.exit(1 if why else 0)
     elif a.cmd == "snapshot":
         print(snapshot(root, cfg, a.reason))
+    elif a.cmd == "refusals":
+        if a.args:
+            print(label_refusal(root, a.args, a.why))
+            return
+        rows, _ = load_refusals(root)
+        if a.json:
+            pick = [r for r in rows if r["label"] == "unsure"] if a.unlabelled else rows
+            print(json.dumps([{k: r[k] for k in REFUSAL_FIELDS} for r in reversed(pick)], indent=1, ensure_ascii=False))
+        else:
+            print(refusals_text(rows, a.unlabelled))
     elif a.cmd == "handoff-name":
         slug = re.sub(r"[^a-z0-9]+", "-", a.slug.lower()).strip("-") or "session"
         print(os.path.join(p(root, cfg["state_dir"]), f"{dt.date.today():%Y-%m-%d}-{slug}.md"))

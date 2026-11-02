@@ -23,7 +23,7 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # test_regista points HOME and CODEX_HOME at a temporary folder when it is imported.
 from test_regista import (FAKE, FLEET_PLAN, PY, TOOL, TRY_SPEC, Project, as_agent, bash, clean_env,  # noqa: E402
-                          decision, jload, jsave, queued, regista, sh)
+                          decision, jload, jsave, person_environ, queued, regista, sh)
 from test_migration import OldProject, run_tool, save  # noqa: E402
 
 
@@ -346,7 +346,8 @@ class ReadyToSend(unittest.TestCase):
     def test_the_terminal_walkthrough_lists_what_was_skipped(self):
         cfg = regista.load_config(self.p.root)
         buf = io.StringIO()
-        with mock.patch.object(sys.stdin, "isatty", return_value=True), \
+        # run as in a person's own terminal: without CLAUDE_PROJECT_DIR or an agent's variables in os.environ
+        with person_environ(), mock.patch.object(sys.stdin, "isatty", return_value=True), \
                 mock.patch("builtins.input", side_effect=["y", "", ""]), redirect_stdout(buf):
             regista.try_ask(self.p.root, cfg)
         self.assertIn("/regista:verify UI-3 ok", buf.getvalue())
