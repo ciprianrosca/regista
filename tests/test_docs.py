@@ -335,28 +335,9 @@ class TemplateConfig(unittest.TestCase):
                                     "%s is %r, which does not start with .regista/" % (key, value))
 
 
-# --- DOC-4: the README uses the new name, with one line and one section about Daedalus ------------
+# --- DOC-4: the README uses the new name and says nothing about Daedalus or dd.py ----------------
 
 README = "README.md"
-MIGRATE_HEADING = "Moving a project from Daedalus"
-TOP_LINES = 15
-HEADING_RE = re.compile(r"^(#{1,6})\s+(.*?)\s*#*\s*$")
-FENCE_RE = re.compile(r"^\s*(```|~~~)")
-
-
-def headings(lines):
-    """(index, level, text) for every Markdown heading, skipping lines inside fenced code blocks."""
-    found, fenced = [], False
-    for i, line in enumerate(lines):
-        if FENCE_RE.match(line):
-            fenced = not fenced
-            continue
-        if fenced:
-            continue
-        m = HEADING_RE.match(line)
-        if m:
-            found.append((i, len(m.group(1)), m.group(2)))
-    return found
 
 
 class Readme(unittest.TestCase):
@@ -367,61 +348,12 @@ class Readme(unittest.TestCase):
         self.text = self.raw.decode("utf-8")
         self.lines = self.text.split("\n")
 
-    def migrate_section(self):
-        """The (start, end) line indexes of the migrate section, heading included, end exclusive; or None."""
-        heads = headings(self.lines)
-        for n, (i, level, text) in enumerate(heads):
-            if text.strip() == MIGRATE_HEADING:
-                end = len(self.lines)
-                for j, other_level, _ in heads[n + 1:]:
-                    if other_level <= level:
-                        end = j
-                        break
-                return i, end
-        return None
-
-    def section_text(self):
-        span = self.migrate_section()
-        self.assertIsNotNone(span, "README.md has no heading %r" % MIGRATE_HEADING)
-        return "\n".join(self.lines[span[0]:span[1]])
-
-    def top_daedalus_lines(self):
-        """Indexes of the lines among the first 15, outside the migrate section, that mention Daedalus."""
-        span = self.migrate_section() or (len(self.lines), len(self.lines))
-        return [i for i, line in enumerate(self.lines[:TOP_LINES])
-                if re.search("daedalus", line, re.IGNORECASE) and not span[0] <= i < span[1]]
-
     def test_title_names_regista(self):  # covers: DOC-4
         self.assertIn("Regista", self.lines[0], "the README's first line does not name Regista: %r" % self.lines[0])
 
-    def test_one_line_near_the_top_says_it_was_called_daedalus_until_0_8(self):  # covers: DOC-4
-        found = self.top_daedalus_lines()
-        self.assertEqual(len(found), 1, "the first %d lines of README.md should mention Daedalus exactly once, "
-                         "found %d: %s" % (TOP_LINES, len(found), ["%d: %s" % (i + 1, self.lines[i]) for i in found]))
-        line = self.lines[found[0]]
-        self.assertIn("Daedalus", line, "line %d does not name Daedalus: %r" % (found[0] + 1, line))
-        self.assertIn("0.8", line, "line %d does not say until version 0.8: %r" % (found[0] + 1, line))
-
-    def test_has_the_moving_from_daedalus_section(self):  # covers: DOC-4
-        self.assertIsNotNone(self.migrate_section(), "README.md has no heading %r" % MIGRATE_HEADING)
-
-    def test_section_shows_the_migrate_command_and_its_preview(self):  # covers: DOC-4
-        section = self.section_text()
-        self.assertIn("regista.py migrate", section, "the section does not show `regista.py migrate`")
-        self.assertIn("migrate --check", section, "the section does not show `migrate --check`")
-
-    def test_section_says_the_user_says_yes_through_start(self):  # covers: DOC-4
-        section = self.section_text()
-        self.assertIn("yes", section, "the section does not say the move needs the user's yes")
-        self.assertIn("/regista:start", section, "the section does not mention /regista:start")
-
-    def test_no_old_names_outside_the_note_and_the_section(self):  # covers: DOC-4
-        allowed = set(self.top_daedalus_lines()[:1])
-        span = self.migrate_section()
-        if span:
-            allowed.update(range(*span))
+    def test_no_old_names_anywhere(self):  # covers: DOC-4
         hits = ["%d: %s" % (i + 1, line.strip()[:120]) for i, line in enumerate(self.lines)
-                if i not in allowed and (re.search("daedalus", line, re.IGNORECASE) or "dd.py" in line)]
+                if re.search("daedalus", line, re.IGNORECASE) or "dd.py" in line]
         self.assertFalse(hits, "%d README lines still say daedalus or dd.py:\n%s" % (len(hits), "\n".join(hits[:40])))
 
     def test_mentions_the_new_names(self):  # covers: DOC-4
