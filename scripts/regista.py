@@ -5365,13 +5365,16 @@ def fetch_usage(token):
 
 
 def usage_settings(cfg):
-    return {**DEFAULTS["usage"], **((cfg or {}).get("usage") or {})}
+    u = (cfg or {}).get("usage") if isinstance(cfg, dict) else None
+    return {**DEFAULTS["usage"], **(u if isinstance(u, dict) else {})}
 
 
 def read_usage(cfg=None, fresh=False):
     """The plan's usage now: {state ok|unknown|not_plan, reason, source endpoint|cache|"", at, session, week}.
     Cached for REGISTA_USAGE_CACHE_SECONDS (60); fresh skips the cache. Never raises."""
     try:
+        if isinstance(cfg, dict) and cfg.get("usage") is not None and not isinstance(cfg["usage"], dict):
+            return usage_reading("unknown", "the usage section in config.json isn't an object")
         if usage_settings(cfg).get("enabled") is False:
             return usage_reading("unknown", "the usage meter is off (usage.enabled is false in config.json)")
         for var, what in (("CLAUDE_CODE_USE_BEDROCK", "Amazon Bedrock"), ("CLAUDE_CODE_USE_VERTEX", "Google Vertex")):
@@ -5412,6 +5415,221 @@ def format_usage(reading):
         resets = f", resets {local_time_text(part['resets_at'])}" if part.get("resets_at") else ""
         lines.append(f"  {label + ':':<14}{round(part['pct'], 1):g}% used{resets}")
     return "\n".join(lines)
+
+
+# --- usage records: what each agent and step cost, appended to usage.jsonl ------------------------
+# Only counts, percentages, times and the model name are written: never the token, never transcript text.
+
+TOKEN_FIELDS = (("input", "input_tokens"), ("output", "output_tokens"),
+                ("cache_write", "cache_creation_input_tokens"), ("cache_read", "cache_read_input_tokens"))
+OTHER_SESSION_SECONDS = 600  # a session transcript changed this recently counts as running
+EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"  # git's empty tree: the base before the first commit
+
+
+def quietly(fn, default, *args, **kw):
+    """fn(*args), or `default` on any error: recording usage never fails a hook."""
+    try:
+        return fn(*args, **kw)
+    except Exception:  # noqa: BLE001
+        return default
+
+
+def agent_tokens(transcript_path):
+    """(tokens, model) from a Claude Code transcript: the assistant entries' usage summed, each message.id once
+    (Claude Code repeats it on several lines), and the last assistant entry's model. (None, '') if unreadable."""
+    if not isinstance(transcript_path, str) or not os.path.isfile(transcript_path):
+        return None, ""
+    totals, seen, model = {k: 0 for k, _ in TOKEN_FIELDS}, set(), ""
+    try:
+        with open(transcript_path, "rb") as f:
+            for line in f:
+                if b'"assistant"' not in line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                msg = row.get("message") if isinstance(row, dict) and row.get("type") == "assistant" else None
+                if not isinstance(msg, dict):
+                    continue
+                if isinstance(msg.get("model"), str) and msg["model"]:
+                    model = msg["model"]
+                mid = msg.get("id")
+                if isinstance(mid, str) and mid:
+                    if mid in seen:
+                        continue
+                    seen.add(mid)
+                u = msg.get("usage") if isinstance(msg.get("usage"), dict) else {}
+                for key, src in TOKEN_FIELDS:
+                    v = u.get(src)
+                    if isinstance(v, int) and not isinstance(v, bool):
+                        totals[key] += v
+    except OSError:
+        return None, ""
+    return totals, model
+
+
+def spec_step(path):
+    """(milestone, step, spec) from a spec file that isn't planned, else None. The step defaults to the file name."""
+    s = load_json(path, None)
+    if not isinstance(s, dict) or s.get("state") == "planned":
+        return None
+    step = s.get("step")
+    step = str(step) if step not in (None, "") else os.path.splitext(os.path.basename(path))[0]
+    return str(s.get("milestone") or ""), step, s
+
+
+def current_spec(root):
+    """(milestone, step, spec) of the step being built: the one non-planned spec in the change set, else the most
+    recently modified non-planned spec, else ('', '', None)."""
+    specs = harness_rel("specs", root=root) + "/"
+    changed = [spec_step(p(root, f)) for f in changed_files(root)
+               if f.startswith(specs) and f.endswith(".json") and "/" not in f[len(specs):]]
+    changed = [x for x in changed if x]
+    if len(changed) == 1:
+        return changed[0]
+    newest = None
+    for f in glob.glob(harness_path(root, "specs", "*.json")):
+        t = quietly(os.path.getmtime, None, f)
+        x = spec_step(f) if t is not None else None
+        if x and (newest is None or t > newest[0]):
+            newest = (t, x)
+    return newest[1] if newest else ("", "", None)
+
+
+def current_step(root):
+    """(milestone, step) of the step being built, or ('', '') (see current_spec)."""
+    return current_spec(root)[:2]
+
+
+def other_sessions(session_id=""):
+    """Claude Code session transcripts (*.jsonl directly in a folder under ~/.claude/projects/) changed in the
+    last 10 minutes, other than this session's. Only names and modification times are read."""
+    base = os.path.join(os.path.expanduser("~"), ".claude", "projects")
+    own, cutoff, n = f"{session_id}.jsonl" if session_id else None, time.time() - OTHER_SESSION_SECONDS, 0
+    try:
+        folders = [d.path for d in os.scandir(base) if d.is_dir(follow_symlinks=False)]
+    except OSError:
+        return 0
+    for folder in folders:
+        try:
+            for e in os.scandir(folder):
+                if e.name.endswith(".jsonl") and e.name != own and e.is_file() and e.stat().st_mtime >= cutoff:
+                    n += 1
+        except OSError:
+            continue
+    return n
+
+
+def usage_projects_path():
+    base = os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state")
+    return os.path.join(base, SLUG, "usage-projects.json")
+
+
+def note_usage_project(root):
+    """Add the project's absolute root to the machine-wide list of projects with usage records, once."""
+    path, root = usage_projects_path(), os.path.abspath(root)
+    listed = load_json(path, [])
+    listed = [x for x in listed if isinstance(x, str)] if isinstance(listed, list) else []
+    if any(os.path.realpath(x) == os.path.realpath(root) for x in listed):
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(listed + [root], f, indent=2, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def append_usage_record(root, cfg, record):
+    """Append one record to usage.jsonl and list the project machine-wide. Never raises."""
+    try:
+        if not isinstance(record, dict) or usage_settings(cfg).get("enabled") is False:
+            return
+        with open(harness_path(root, "usage.jsonl"), "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        note_usage_project(root)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def usage_fields(reading):
+    """The record's usage part: state, percentages and reset times (null unless the reading is ok)."""
+    ok = reading.get("state") == "ok"
+    s, w = [(reading.get(k) or {}) if ok else {} for k in ("session", "week")]
+    return {"state": reading.get("state") or "unknown", "session_pct": s.get("pct"), "week_pct": w.get("pct"),
+            "session_resets_at": s.get("resets_at"), "week_resets_at": w.get("resets_at")}
+
+
+def record_usage(root, cfg, data, kind, fresh=False, spec=None, **extra):
+    """Build and append a usage record of `kind` with `extra` fields; with `spec` (a current_spec result) the step
+    named there. Nothing when the meter is off; never raises."""
+    try:
+        if usage_settings(cfg).get("enabled") is False:
+            return
+        ms, step, _ = spec or quietly(current_spec, ("", "", None), root)
+        session = str((data or {}).get("session_id") or "")
+        rec = {"kind": kind, "at": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+               "milestone": ms, "step": step, "session_id": session,
+               "usage": usage_fields(read_usage(cfg, fresh=fresh)),
+               "other_sessions": quietly(other_sessions, 0, session), **extra}
+        append_usage_record(root, cfg, rec)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def agent_fields(root, data):
+    return {"agent_id": str(data.get("agent_id") or ""), "role": quietly(role_of, "other", data, root),
+            "agent_type": str(data.get("agent_type") or "")}
+
+
+def record_agent_stop(root, cfg, data, started):
+    """The agent_stop record: seconds since the recorded start and the agent's own tokens from its transcript."""
+    if usage_settings(cfg).get("enabled") is False:
+        return
+    ok = isinstance(started, (int, float)) and not isinstance(started, bool) and started > 0
+    tokens, model = (None, "") if HOST["name"] == "codex" else \
+        quietly(lambda: agent_tokens(subagent_transcript(data)), (None, ""))  # a Codex rollout has another format
+    record_usage(root, cfg, data, "agent_stop", **agent_fields(root, data), tokens=tokens, model=model,
+                 seconds=round(time.time() - started, 1) if ok else None)
+
+
+def step_size(root, cfg):
+    """(files, lines changed) in the change set besides the harness's records: insertions plus deletions from
+    git against the last commit, and the lines of untracked files."""
+    plan = plan_rel(root, cfg)
+    entries = [(c, f) for c, f in status_entries(root)
+               if not nested_repo(root, c, f) and not bookkeeping(root, cfg, f) and f != plan]
+    work = {f for _, f in entries}
+    base = "HEAD" if git(root, "rev-parse", "--verify", "-q", "HEAD") else EMPTY_TREE
+    lines = 0
+    for row in git(root, "diff", "--numstat", "-z", "--no-renames", base, strip=False).split("\0"):
+        parts = row.split("\t", 2)
+        if len(parts) == 3 and parts[2] in work:
+            lines += sum(int(x) for x in parts[:2] if x.isdigit())
+    for code, f in entries:
+        if code == "??":
+            lines += quietly(text_lines, 0, p(root, f))
+    return len(work), lines
+
+
+def text_lines(path, limit=50_000_000):
+    """Lines in a text file (0 for a binary or very large one)."""
+    if os.path.getsize(path) > limit:
+        return 0
+    with open(path, "rb") as f:
+        b = f.read()
+    return 0 if b"\0" in b else b.count(b"\n") + (1 if b and not b.endswith(b"\n") else 0)
+
+
+def record_step(root, cfg, data):
+    """The step record, when a commit passes the commit hook's checks, with a fresh usage reading."""
+    if usage_settings(cfg).get("enabled") is False:
+        return
+    spec = quietly(current_spec, ("", "", None), root)
+    files, lines = quietly(step_size, (0, 0), root, cfg)
+    reqs = spec[2].get("requirements") if isinstance(spec[2], dict) else None
+    record_usage(root, cfg, data, "step", fresh=True, spec=spec, commit_files=files, lines_changed=lines,
+                 requirements=len(reqs) if isinstance(reqs, list) else 0)
 
 
 # --- roles ----------------------------------------------------------------------------------
@@ -7177,7 +7395,7 @@ def hook_pre_bash(root, cfg, data):
             why = stage_all_refusal(root, eff)
             if why:
                 deny(why, "nested_repo_stage")
-            commit_check(root, cfg)
+            commit_check(root, cfg, data)
         elif g["sub"] == "push":
             if cfg["push"] == "block":
                 deny(f"{DISPLAY_NAME}: pushing is disabled for this project (config push=block). Ask the user to push.",
@@ -7247,7 +7465,7 @@ def stage_all_refusal(root, eff):
             "mean by name: `git add <paths> && git commit`.")
 
 
-def commit_check(root, cfg):
+def commit_check(root, cfg, data=None):
     """The commit hook: coverage, gates (unless only the harness's own records change), the review,
     then the requirement results, which describe the commit. A loosened config needs the user."""
     problems = coverage_problems(root, cfg)
@@ -7275,6 +7493,7 @@ def commit_check(root, cfg):
     if results:
         record_requirements(root, cfg, results)
     HOOK_CTX.setdefault("notes", []).extend(tick_committed_steps(root, cfg, files))
+    quietly(record_step, None, root, cfg, data or HOOK_CTX.get("data") or {})
     loose = config_loosened(root, cfg) + tests_removed(root, cfg)
     if loose:
         ask(f"{DISPLAY_NAME}: this commit loosens the harness's checks compared with the last commit: " + "; ".join(loose)
@@ -7538,6 +7757,7 @@ def hook_subagent_start(root, cfg, data):
     save_json(os.path.join(agents_dir(root), f"{data.get('agent_id', 'unknown')}.json"),
               {"role": role, "type": data.get("agent_type") or "", "session": data.get("session_id") or "",
                "started": time.time()})
+    quietly(record_usage, None, root, cfg, data, "agent_start", **agent_fields(root, data))
     if role not in ROLES:
         return
     emit_context("SubagentStart", agent_note(root, cfg, role))
@@ -7555,6 +7775,7 @@ def hook_subagent_stop(root, cfg, data):
         if not recorded:
             emit({"decision": "block", "reason": f"{DISPLAY_NAME}: record your verdict before finishing: write {review_draft(root)} "
                                                   f"and run `{PY} \"{DD}\" review-record`."})
+    quietly(record_agent_stop, None, root, cfg, data, st.get("started") if isinstance(st, dict) else None)
     if data.get("agent_id"):
         save_json(path, {**st, "finished": time.time()})
 
@@ -9504,6 +9725,9 @@ def main():
             cfg = load_config(root) if root else {}
         except (OSError, ValueError):
             cfg = {}
+        except Exception:  # a section of the wrong type: read_usage judges the raw usage section
+            raw = load_json(harness_path(root, "config.json"), {})
+            cfg = raw if isinstance(raw, dict) else {}
         reading = read_usage(cfg, fresh=a.fresh)
         print(json.dumps(reading, ensure_ascii=False) if a.json else format_usage(reading))
         return
