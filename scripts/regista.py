@@ -6089,12 +6089,39 @@ def build_estimate(root, cfg, target):
 
 
 def range_text(low, high):
-    """'3 to 5', '0.06 to 0.12': as few decimals as make the two differ and keep a non-zero low above 0."""
+    """'3 to 5', '0.06 to 0.12', '0 to 0.5': as few decimals as make the two differ and keep a non-zero low
+    above 0; a low of zero prints as '0'."""
     for d in range(0, 4):
         a, b = round(low, d), round(high, d)
         if a != b and (a > 0 or low <= 0):
-            return f"{a:.{d}f} to {b:.{d}f}"
+            return f"{0 if low <= 0 else a:.{d if low > 0 else 0}f} to {b:.{d}f}"
     return f"{round(high, 3):g}"
+
+
+def week_cost_text(low, high):
+    """'about 3 to 6% of your week'; 'less than 0.001% of your week' when even the high end rounds to 0 at
+    three decimals; 'up to 0.5% of your week' when only the low end does."""
+    if round(high, 3) <= 0:
+        return "less than 0.001% of your week"
+    if low > 0 and round(low, 3) <= 0:
+        return f"up to {round(high, 3):g}% of your week"
+    return f"about {range_text(low, high)}% of your week"
+
+
+def millions_text(n):
+    """8,000,000 -> '8 million'; 2,460,000 -> '2.5 million'; under 50,000 the exact count."""
+    if n < 50_000:
+        return f"{n:,}"
+    m = round(n / 1e6, 1)
+    return f"{m:.0f} million" if m == int(m) else f"{m:.1f} million"
+
+
+def millions_range_text(low, high):
+    """'8 to 24 million tokens', '2.5 to 8 million tokens'."""
+    a, b = millions_text(low), millions_text(high)
+    if a.endswith(" million") and b.endswith(" million"):
+        a = a[:-len(" million")]
+    return f"{a} to {b} tokens"
 
 
 def minutes_text(low, high):
@@ -6117,60 +6144,101 @@ def format_estimate(est):
 
 
 def estimate_text(est):
-    n, target = est["steps_left"], est["target"]
-    what = "the whole plan" if target == "all" else target
+    """The estimate's sentences. Each part is written on its own: one that can't be written (an unreadable
+    reset time, a broken field) is left out and the rest still print."""
     out = []
+
+    def part(write):
+        try:
+            text = write()
+        except Exception:  # noqa: BLE001
+            return
+        if text:
+            out.append(text)
+
+    n = est.get("steps_left") or 0
+    part(lambda: cost_line(est, n))
+    part(lambda: week_lines(est, n))
+    if n:
+        part(lambda: f"It should take roughly {minutes_text(est['minutes_low'], est['minutes_high'])}.")
+        part(lambda: tokens_line(est))
+        part(lambda: based_on_line(est))
+    if not out:
+        raise ValueError("no part of the estimate could be written")
+    return "\n".join(out)
+
+
+def cost_line(est, n):
+    target = est["target"]
+    what = "the whole plan" if target == "all" else target
     if est.get("problem") and not n:
-        out.append(est["problem"])
-    elif not n:
-        out.append(f"{what[0].upper() + what[1:]} has no steps left to build.")
-    else:
-        cost = range_text(est["pct_low"], est["pct_high"]) + "%"
-        out.append(f"Building {what} ({n} step{'s' if n != 1 else ''} left) should take about {cost} of your week.")
-    week, stop = est["week"], est["stop_at"]
-    if week.get("pct") is not None:
-        used = week["pct"]
+        return est["problem"]
+    if not n:
+        return f"{what[0].upper() + what[1:]} has no steps left to build."
+    return (f"Building {what} ({n} step{'s' if n != 1 else ''} left) should take "
+            f"{week_cost_text(est['pct_low'], est['pct_high'])}.")
+
+
+def week_lines(est, n):
+    week = est["week"]
+    if week.get("pct") is None:
+        reason = str(week.get("reason") or "").strip().rstrip(".")
+        why = f" {reason[0].upper() + reason[1:]}." if reason else ""
+        return f"Your current weekly usage is unknown, so whether it fits is unknown too.{why}"
+    used, stop = week["pct"], est["stop_at"]
+    try:
         when = f" The week resets {local_time_text(week['resets_at'])}." if week.get("resets_at") else ""
-        left = max(0.0, stop - used)
-        out.append(f"You have used {pct_text(used)} of this week's limit. {DISPLAY_NAME} stops a build-all run at "
-                   f"{pct_text(stop)}, so {pct_text(left)} is left before it stops.{when}")
-        if n:
+    except Exception:  # noqa: BLE001
+        when = ""
+    left = max(0.0, stop - used)
+    lines = [f"You have used {pct_text(used)} of this week's limit. {DISPLAY_NAME} stops a build-all run at "
+             f"{pct_text(stop)}, so {pct_text(left)} is left before it stops.{when}"]
+    if n:
+        try:
             top, bottom = (pct_text(round(used + est[k], 1)) for k in ("pct_high", "pct_low"))
-            out.append({"yes": f"It fits: even at the high end you would be at about {top}.",
-                        "maybe": f"It may not fit: at the high end you would reach about {top}, past the "
-                                 f"stop at {pct_text(stop)}. If it gets there, {DISPLAY_NAME} finishes the step it's "
-                                 "on, saves and stops the run.",
-                        "no": f"It doesn't fit: even at the low end you would reach about {bottom}, past "
-                              f"the stop at {pct_text(stop)}. Build part of it now, or wait for the reset."
-                        }[est["fits"]])
+            lines.append({"yes": f"It fits: even at the high end you would be at about {top}.",
+                          "maybe": f"It may not fit: at the high end you would reach about {top}, past the "
+                                   f"stop at {pct_text(stop)}. If it gets there, {DISPLAY_NAME} finishes the step "
+                                   "it's on, saves and stops the run.",
+                          "no": f"It doesn't fit: even at the low end you would reach about {bottom}, past "
+                                f"the stop at {pct_text(stop)}. Build part of it now, or wait for the reset."
+                          }[est["fits"]])
+        except Exception:  # noqa: BLE001
+            pass
+    try:
         session = est.get("session") or {}
         if session.get("pct") is not None:
-            resets = f", resets {local_time_text(session['resets_at'])}" if session.get("resets_at") else ""
-            out.append(f"The current 5-hour session window is at {pct_text(session['pct'])}{resets}.")
-    else:
-        why = f" ({week['reason']})" if week.get("reason") else ""
-        out.append(f"Your current weekly usage is unknown{why}, so whether it fits is unknown too.")
-    if n:
-        out.append(f"It should take roughly {minutes_text(est['minutes_low'], est['minutes_high'])}.")
-        roles = [f"{role} {tokens_text(t, '')}" for role, t in
-                 sorted(est["tokens_by_role"].items(), key=lambda x: -x[1]) if t]
-        tok = (f"That is about {est['tokens_low'] / 1e6:.1f} to {est['tokens_high'] / 1e6:.1f} million tokens for "
-               f"the agents")
-        out.append(tok + ("; a typical step: " + ", ".join(roles) + "." if roles else "."))
-    mine, others = est["based_on"]["project"], est["based_on"]["other_projects"]
-    if not n:
+            try:
+                resets = f", resets {local_time_text(session['resets_at'])}" if session.get("resets_at") else ""
+            except Exception:  # noqa: BLE001
+                resets = ""
+            lines.append(f"The current 5-hour session window is at {pct_text(session['pct'])}{resets}.")
+    except Exception:  # noqa: BLE001
         pass
-    elif est["source"] == "default":
-        out.append("There are no usage records of past steps yet, so these figures are a rough default "
-                   f"({DEFAULT_STEP_TOKENS[0] / 1e6:g} to {DEFAULT_STEP_TOKENS[1] / 1e6:g} million tokens a step, "
-                   f"about {DEFAULT_TOKENS_PER_PCT / 1e6:g} million tokens per 1% of the week).")
-    else:
-        here = f"{mine} past step{'s' if mine != 1 else ''} in this project"
-        there = f"{others} past step{'s' if others != 1 else ''} in other projects on this machine"
-        rests = here + (f" and {there}" if others and mine else "") if mine else there
-        out.append(f"The estimate rests on {rests}." + (" With so few, it's rough."
-                                                         if mine + others < ESTIMATE_MIN_STEPS else ""))
-    return "\n".join(out)
+    return "\n".join(lines)
+
+
+def tokens_line(est):
+    tok = f"That is about {millions_range_text(est['tokens_low'], est['tokens_high'])} for the agents"
+    try:
+        roles = [f"{role} {millions_text(t)}" for role, t in
+                 sorted(est["tokens_by_role"].items(), key=lambda x: -x[1]) if t]
+    except Exception:  # noqa: BLE001
+        roles = []
+    return tok + ("; a typical step: " + ", ".join(roles) + "." if roles else ".")
+
+
+def based_on_line(est):
+    mine, others = est["based_on"]["project"], est["based_on"]["other_projects"]
+    if est["source"] == "default":
+        return ("There are no usage records of past steps yet, so these figures are a rough default "
+                f"({DEFAULT_STEP_TOKENS[0] / 1e6:g} to {DEFAULT_STEP_TOKENS[1] / 1e6:g} million tokens a step, "
+                f"about {DEFAULT_TOKENS_PER_PCT / 1e6:g} million tokens per 1% of the week).")
+    here = f"{mine} past step{'s' if mine != 1 else ''} in this project"
+    there = f"{others} past step{'s' if others != 1 else ''} in other projects on this machine"
+    rests = here + (f" and {there}" if others and mine else "") if mine else there
+    return f"The estimate rests on {rests}." + (" With so few, it's rough."
+                                                 if mine + others < ESTIMATE_MIN_STEPS else "")
 
 
 # --- roles ----------------------------------------------------------------------------------

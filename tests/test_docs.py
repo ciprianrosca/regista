@@ -2,7 +2,7 @@
 templates (DOC-3).
 
 .claude-plugin/plugin.json, .claude-plugin/marketplace.json and .codex-plugin/plugin.json must name the
-plugin "regista" at version "0.11.0" with the address https://github.com/ciprianrosca/regista, say nothing
+plugin "regista" at version "0.12.0" with the address https://github.com/ciprianrosca/regista, say nothing
 about "daedalus" in any case, and keep their CRLF line endings on every line, including the last.
 
 Everything under skills/, agents/ and templates/ uses the new names (Regista, /regista:<skill>,
@@ -23,7 +23,7 @@ CODEX_PLUGIN = os.path.join(REPO, ".codex-plugin", "plugin.json")
 MANIFESTS = [CLAUDE_PLUGIN, MARKETPLACE, CODEX_PLUGIN]
 
 NAME = "regista"
-VERSION = "0.11.0"
+VERSION = "0.12.0"
 URL = "https://github.com/ciprianrosca/regista"
 
 
@@ -43,7 +43,7 @@ class ClaudePluginManifest(unittest.TestCase):
     def test_name_is_regista(self):  # covers: DOC-1
         self.assertEqual(self.data.get("name"), NAME)
 
-    def test_version_is_0_9_0(self):  # covers: DOC-1
+    def test_version_is_0_9_0(self):  # covers: DOC-1, UDOC-2
         self.assertEqual(self.data.get("version"), VERSION)
 
     def test_homepage_and_repository(self):  # covers: DOC-1
@@ -58,7 +58,7 @@ class CodexPluginManifest(unittest.TestCase):
     def test_name_is_regista(self):  # covers: DOC-1
         self.assertEqual(self.data.get("name"), NAME)
 
-    def test_version_is_0_9_0(self):  # covers: DOC-1
+    def test_version_is_0_9_0(self):  # covers: DOC-1, UDOC-2
         self.assertEqual(self.data.get("version"), VERSION)
 
     def test_homepage_and_repository(self):  # covers: DOC-1
@@ -82,7 +82,7 @@ class MarketplaceManifest(unittest.TestCase):
         self.assertIsInstance(plugins, list)
         self.assertEqual(len(plugins), 1)
 
-    def test_plugin_entry_fields(self):  # covers: DOC-1
+    def test_plugin_entry_fields(self):  # covers: DOC-1, UDOC-2
         plugins = self.data.get("plugins") or [{}]
         entry = plugins[0]
         self.assertEqual(entry.get("name"), NAME)
@@ -366,6 +366,91 @@ class Readme(unittest.TestCase):
 
     def test_keeps_lf_endings(self):  # covers: DOC-4
         self.assertNotIn(b"\r", self.raw, "README.md contains carriage returns; it should use LF only")
+
+
+# --- UDOC-1: the README documents the usage meter ---------------------------------------------------
+# Loose on purpose: it looks for the commands, the config keys with their defaults and a few key words, not for
+# exact sentences, so rewording the README doesn't break it.
+
+def section(text, title_pattern):
+    """The section whose heading matches title_pattern (case-insensitive), with its subsections, or ""."""
+    lines = text.split("\n")
+    for i, line in enumerate(lines):
+        m = re.match(r"^(#+)\s+(.*)$", line)
+        if m and re.search(title_pattern, m.group(2), re.IGNORECASE):
+            level, body = len(m.group(1)), [line]
+            for nxt in lines[i + 1:]:
+                h = re.match(r"^(#+)\s", nxt)
+                if h and len(h.group(1)) <= level:
+                    break
+                body.append(nxt)
+            return "\n".join(body)
+    return ""
+
+
+class ReadmeUsage(unittest.TestCase):
+    def setUp(self):
+        self.text = read_bytes(os.path.join(REPO, README)).decode("utf-8")
+        self.usage = section(self.text, r"usage")
+        self.low = re.sub(r"\s+", " ", self.usage.lower())
+
+    def near(self, a, b, span=300):
+        """Whether patterns a and b both occur in the usage section within `span` characters of each other."""
+        sa = [m.start() for m in re.finditer(a, self.low)]
+        sb = [m.start() for m in re.finditer(b, self.low)]
+        return any(abs(x - y) <= span for x in sa for y in sb)
+
+    def test_use_section_lists_the_estimate_command(self):  # covers: UDOC-1
+        use = section(self.text, r"^use\b")
+        self.assertTrue(use, "README.md has no Use section")
+        self.assertTrue("/regista:estimate" in use, "the Use section's command list should include /regista:estimate")
+
+    def test_plan_usage_section(self):  # covers: UDOC-1
+        self.assertTrue(self.usage, "README.md needs a section on plan usage (a heading that says usage)")
+        low = self.low
+        checks = {
+            "the session and weekly percentages": r"session",
+            "the weekly percentage": r"week",
+            "percentages": r"%|percent",
+            "each agent's tokens": r"agent[^.]*token|token[^.]*agent",
+            "Claude Code's sign-in": r"sign[- ]?in|signed in|log[- ]?in",
+            "Anthropic's usage address": r"anthropic",
+            "read-only": r"read[- ]only",
+            "undocumented, may change": r"undocumented",
+            "the address may change": r"change",
+            "the token is never printed or stored": r"never[^.]*(print|show)[^.]*stor|never[^.]*stor[^.]*(print|show)",
+            "regista.py usage": r"regista\.py usage",
+            "usage report": r"usage report",
+            "estimate": r"regista\.py estimate|/regista:estimate",
+            "build all": r"build[- ]all|build all",
+            "no plan limits on an API key": r"api key",
+            "Bedrock": r"bedrock",
+            "Vertex": r"vertex",
+        }
+        for what, pattern in checks.items():
+            with self.subTest(what=what):
+                self.assertRegex(low, pattern, "the plan usage section should say %s" % what)
+
+    def test_config_keys_and_defaults(self):  # covers: UDOC-1
+        for key, default in (("enabled", r"true"), ("warn_at_weekly_pct", r"(?<![\d.])75(?![\d.])"),
+                             ("stop_at_weekly_pct", r"(?<![\d.])90(?![\d.])")):
+            with self.subTest(key=key):
+                self.assertTrue(key in self.low, "the plan usage section should name the config key %s" % key)
+                self.assertTrue(self.near(re.escape(key), default, 200),
+                                "the plan usage section should give %s's default next to it" % key)
+        self.assertRegex(self.low, r"[\"`]usage[\"`]|usage section|section usage|\busage\b[^.]*config",
+                         "the plan usage section should name the config section usage")
+
+    def test_what_build_all_does_at_the_levels(self):  # covers: UDOC-1
+        self.assertTrue(self.near(r"warn", r"warn_at_weekly_pct|(?<![\d.])75(?![\d.])", 400),
+                        "the README should say a build-all run warns at warn_at_weekly_pct")
+        self.assertTrue(self.near(r"save|end|stop", r"stop_at_weekly_pct|(?<![\d.])90(?![\d.])", 400),
+                        "the README should say a build-all run saves and ends at stop_at_weekly_pct")
+
+    def test_no_plan_limits_on_api_key_bedrock_vertex(self):  # covers: UDOC-1
+        self.assertTrue(self.near(r"bedrock|vertex|api key", r"no plan limit|not on a claude plan|no limit|"
+                                  r"plan limits? (do not|don't) apply|without plan limits", 300),
+                        "the README should say sessions on an API key, Bedrock or Vertex have no plan limits")
 
 
 if __name__ == "__main__":

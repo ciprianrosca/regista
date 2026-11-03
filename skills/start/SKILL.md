@@ -30,7 +30,9 @@ path (`python "${CLAUDE_PLUGIN_ROOT}/scripts/regista.py" …`). This skill check
 6. **`/regista:start continue`** (the resume prompt after a pause): don't wait. If the handoff
    has work "In flight", finish that first; otherwise carry on from the resume point with the build
    loop (`/regista:build`). Stop only if the next step is blocked. If a build-all run is active (the
-   state says so; `regista.py run` shows it), carry on with `/regista:build all`.
+   state says so; `regista.py run` shows it), carry on with `/regista:build all`. If the last run ended at
+   the weekly limit, run `regista.py usage` first: carry on only once the week is back below the stop
+   level, and otherwise say when it resets.
    Without `continue`, wait for the user's command.
 
 **A project on the old folder.** When the session-start context says the project still uses the old
@@ -41,8 +43,9 @@ After the summary, offer the move: show the user what
 
 ## `/regista:status`
 `python "${CLAUDE_PLUGIN_ROOT}/scripts/regista.py" status`, then a compact report: milestones (done / in progress / not started, with
-the current one's open steps), the last gate run, open decisions oldest first and who they wait on,
-and git (branch, uncommitted files, commits not pushed).
+the current one's open steps and its cost so far, when the status gives one), the last gate run, open
+decisions oldest first and who they wait on, and git (branch, uncommitted files, commits not pushed).
+For the plan's current usage, run `regista.py usage`; for what the next build should cost, `/regista:estimate`.
 
 ## `/regista:todo`
 Show the board's open items grouped by section. Don't edit it unless asked.

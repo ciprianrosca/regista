@@ -470,6 +470,109 @@ class Text(EstimateBase):
         self.assertIn(WEEK_RESETS_TEXT_BUCHAREST, out)
 
 
+# --- UDOC-3 to UDOC-6: fixes to the estimate's text
+
+def outside_brackets(text):
+    """The text with every bracketed part (round or square, nested or not) removed."""
+    out, depth = [], 0
+    for ch in text:
+        if ch in "([":
+            depth += 1
+        elif ch in ")]" and depth:
+            depth -= 1
+        elif not depth:
+            out.append(ch)
+    return "".join(out)
+
+
+def deepest_bracket(text):
+    depth = deepest = 0
+    for ch in text:
+        if ch in "([":
+            depth += 1
+            deepest = max(deepest, depth)
+        elif ch in ")]" and depth:
+            depth -= 1
+    return deepest
+
+
+class TextFixes(EstimateBase):
+    def est(self, target="M2", rows=None):
+        return self.estimate(target, rows=rows if rows is not None else history(SEVEN))
+
+    def text_of(self, est):
+        text = regista.format_estimate(est)
+        self.assertIsInstance(text, str)
+        return text
+
+    def test_unknown_usage_gives_the_reason_as_its_own_sentence(self):  # covers: UDOC-3
+        self.usage_unknown()
+        reason = (regista.read_usage(self.cfg, fresh=True).get("reason") or "").strip().rstrip(".")
+        self.assertTrue(reason, "setup: an unreachable usage address should give a reason")
+        text = self.text_of(self.est())
+        self.assertLessEqual(deepest_bracket(text), 1, f"brackets nested inside brackets:\n{text}")
+        flat = re.sub(r"\s+", " ", outside_brackets(text))
+        body = re.escape(reason[1:])
+        self.assertRegex(flat, r"(?:^|[.!?:] )" + "[" + re.escape(reason[0].upper() + reason[0].lower()) + "]" + body
+                         + r"[.!?]", f"the reason ({reason!r}) should be a sentence of its own, not in brackets:\n{text}")
+
+    def test_whole_millions_have_no_decimal(self):  # covers: UDOC-4
+        text = self.text_of(self.est())  # 6 to 12 million tokens for M2
+        self.assertRegex(text, r"(?<![\d.])6 to 12 million tokens", text)
+        self.assertNotRegex(text, r"(?<![\d.])\d+\.0 million", text)
+
+    def test_other_amounts_have_one_decimal(self):  # covers: UDOC-4
+        est = self.est()
+        est.update(tokens_low=2_500_000, tokens_high=8_000_000)
+        text = self.text_of(est)
+        self.assertRegex(text, r"(?<![\d.])2\.5( million)? to 8 million tokens", text)
+        self.assertNotRegex(text, r"(?<![\d.])\d+\.\d\d+ million", text)  # never two decimals
+        self.assertNotRegex(text, r"(?<![\d.])\d+\.0 million", text)
+
+    def test_a_cost_too_small_to_show_says_less_than(self):  # covers: UDOC-5
+        est = self.est()
+        est.update(pct_low=0.0001, pct_high=0.0004)
+        text = self.text_of(est)
+        self.assertIn("less than 0.001% of your week", text)
+        self.assertNotRegex(text.lower(), r"about 0(\.0+)?\s*%")
+        est.update(pct_low=0.0, pct_high=0.0)
+        text = self.text_of(est)
+        self.assertIn("less than 0.001% of your week", text)
+        self.assertNotRegex(text.lower(), r"about 0(\.0+)?\s*%")
+
+    def test_a_low_end_of_zero_is_not_0_0(self):  # covers: UDOC-5
+        est = self.est()
+        est.update(pct_low=0.0, pct_high=0.5)
+        head = first_line(self.text_of(est))
+        self.assertNotRegex(head, r"(?<![\d.])0\.0(?!\d)", head)
+        self.assertRegex(head, r"(?<![\d.])0\.5\s*%", head)
+
+    def test_an_unreadable_reset_time_leaves_out_only_that_part(self):  # covers: UDOC-6
+        self.week(80.0)
+        est = self.est()
+        est["week"] = {**est["week"], "resets_at": "sometime next week"}
+        text = self.text_of(est)
+        m = RANGE.search(first_line(text))
+        self.assertTrue(m, f"the cost line should still be printed:\n{text}")
+        self.assertEqual((float(m.group(1)), float(m.group(2))), (3.0, 6.0))
+        self.assertNotIn("sometime next week", text)
+        self.assertTrue(has_pct(text, 80), f"the week's use should still be there:\n{text}")
+        self.assertIn("fit", text.lower())
+        self.assertRegex(text, r"(?<![\d.])12 million", text)
+
+    def test_other_unreadable_parts_leave_the_cost_line(self):  # covers: UDOC-6
+        self.week(80.0)
+        for broken in ({"minutes_low": "soon", "minutes_high": None}, {"tokens_by_role": "lots"},
+                       {"based_on": None}, {"session": "x"}):
+            with self.subTest(broken=broken):
+                est = {**self.est(), **broken}
+                text = self.text_of(est)
+                m = RANGE.search(first_line(text))
+                self.assertTrue(m, f"the cost line should still be printed:\n{text}")
+                self.assertEqual((float(m.group(1)), float(m.group(2))), (3.0, 6.0))
+                self.assertIn(WEEK_RESETS_TEXT_BUCHAREST, text)
+
+
 # --- UEST-13: never raises
 
 class NeverRaises(EstimateBase):
@@ -652,6 +755,20 @@ class BuildAllWeek(UsageEnv):
         out = self.stop_hook()
         self.assertEqual(out.get("decision"), "block")
         self.assertIn("carry on", all_text(out).lower())
+
+    def test_a_second_stop_at_the_limit_ends_the_run_and_lets_the_session_stop(self):  # covers: UDOC-7
+        self.week(92.0)
+        self.p.hook("stop", {"session_id": "s1"})  # the first stop says to save and end the run
+        out = self.p.hook("stop", {"session_id": "s1", "stop_hook_active": True}) or {}  # no new commit since
+        self.assertNotEqual(out.get("decision"), "block", f"it should let the session stop:\n{out}")
+        state = regista.load_json(regista.run_path(self.p.root), {})
+        self.assertFalse(state.get("active"), f"the run should have ended:\n{state}")
+        reason = all_text(state)
+        self.assertRegex(reason.lower(), r"week", f"the run's reason should name the weekly limit:\n{state}")
+        self.assertIn("limit", reason.lower(), state)
+        self.assertIn(WEEK_RESETS_TEXT_BUCHAREST, reason, f"the run's reason should name the reset time:\n{state}")
+        again = self.p.hook("stop", {"session_id": "s1", "stop_hook_active": True}) or {}
+        self.assertNotEqual(again.get("decision"), "block", again)
 
 
 if __name__ == "__main__":

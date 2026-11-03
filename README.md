@@ -93,6 +93,7 @@ In a project's repo root (in Codex, `$regista:<name>` instead of `/regista:<name
 /regista:init          set up the project: detects the checks, asks three plain questions, writes a plan
 /regista:init docs/spec.md   the same, taking the answers from a spec
 /regista:start         where we are / next / blocked (runs automatically at session start)
+/regista:estimate M2   what building M2 (or all) should cost: share of your weekly limit, time, tokens
 /regista:build next    next step: brief → test writer → builder → reviewer → gates → commit
 /regista:build M2      keep going until milestone 2's gate passes or a step is blocked
 /regista:build all     build every milestone in the plan, one after another; stop only for what needs you
@@ -110,6 +111,8 @@ In a project's repo root (in Codex, `$regista:<name>` instead of `/regista:<name
 `regista.py deploy` deploys the last commit and runs the live checks (see Deploys below).
 `regista.py plan add-milestone "<title>"` and `regista.py plan tick M3 <step>` change the plan (see Build
 everything below).
+`regista.py usage` shows how much of your plan's session and weekly limits is used, and `regista.py usage
+report` what each step and milestone cost (see Plan usage below).
 `regista.py release` makes a release: version, changelog, gates, tag, release page, deploy (see Releases below).
 
 `python <regista>/scripts/regista.py doctor` checks that everything works in a project, in plain
@@ -376,6 +379,42 @@ Set `window` (tokens), or the env var `REGISTA_CONTEXT_WINDOW`, to override it.
   `/regista:start continue`. `"on_limit": "pause"` makes that the rule at `limit_pct` itself.
 
 `python scripts/regista.py context <transcript.jsonl>` shows a Claude Code session's current use.
+
+### Plan usage
+
+On a Claude plan, long builds use up the plan's weekly limit. Regista tells you what a build should
+cost before it starts, records what each step cost once it's done, and stops a `/regista:build all` run
+before the week runs out.
+
+- `/regista:estimate M2` (or `regista.py estimate [M<n> | all]`) says how much of your week a milestone
+  or the whole plan should take, how much is left before the stop, whether it fits, roughly how long it
+  takes and how many tokens the agents will use. It rests on the steps built before, in this project or
+  in others on the same machine; with none yet, it says its figures are a rough default.
+  `/regista:build` offers it before `build M<n>` and `build all` start.
+- `regista.py usage report [M<n>]` shows what each step and milestone cost: its share of the week and
+  each agent's tokens, by role. A single small step can show little or no change; the milestone's total
+  is more reliable. `regista.py status` adds the current milestone's cost so far.
+- `regista.py usage` shows the session (5-hour) and weekly percentages and when each resets.
+
+The percentages come from Anthropic's usage address, read with Claude Code's sign-in (its credentials
+file, or the macOS keychain). The access is read-only, and a reading is kept for a minute. The sign-in
+token is never printed or stored anywhere. The address is undocumented and may change; if it stops
+answering, the meter just says "usage unknown" and the rest of the harness works as before. Each agent's
+tokens come from its own transcript. The records go to `.regista/usage.jsonl`, which git ignores.
+
+Sessions on an API key, Bedrock or Vertex have no plan limits: the meter says "not on a Claude plan"
+and never stops a build.
+
+```json
+"usage": {"enabled": true, "warn_at_weekly_pct": 75, "stop_at_weekly_pct": 90}
+```
+
+- **`enabled`** (default true): false switches the meter off, with no readings, records, warnings or stops.
+- **At `warn_at_weekly_pct`** (default 75) a build-all run warns the session after each step's commit,
+  with the share of the week used and when it resets.
+- **At `stop_at_weekly_pct`** (default 90) a build-all run finishes no more steps: it saves, ends with a
+  reason naming the weekly limit and the reset time, and lets the session stop. Run `/regista:build all`
+  again after the reset.
 
 ### Refusals, and whether they were right
 
