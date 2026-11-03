@@ -19,6 +19,8 @@ CLI (run from anywhere inside the project):
   python regista.py snapshot [--reason TEXT]   write a mechanical handoff (git state, recent commits)
   python regista.py handoff-name SLUG          print the path for a new handoff file
   python regista.py context TRANSCRIPT         context use of a session transcript (tokens, window, %)
+  python regista.py usage [--json] [--fresh]   the Claude plan's session and weekly usage and reset times
+                                          (cached 60 seconds; --fresh asks again); always exits 0
   python regista.py review-status              does the current change set need a review, and is there one?
   python regista.py review-record              (reviewer agent only) record the review draft, reviews/draft.json
   python regista.py requirements               requirements, their coverage and pass/fail (set by the gates)
@@ -175,7 +177,10 @@ DEFAULTS["reuse_passing_runs"] = True
 # tests use <ENV_PREFIX>SLOT to pick their own.
 DEFAULTS["fleet"] = {"max_workers": 3, "launch": "auto", "setup": "", "copy": [".env", ".env.local", ".env.test"],
                      "isolated_gates": False, "claude_args": []}
-NESTED = ("context", "roles", "review", "requirements", "fleet")
+# The plan usage meter (`regista.py usage`): off with enabled false; build all warns and stops at these weekly
+# percentages.
+DEFAULTS["usage"] = {"enabled": True, "stop_at_weekly_pct": 90, "warn_at_weekly_pct": 75}
+NESTED = ("context", "roles", "review", "requirements", "fleet", "usage")
 HOOK_GATE_BUDGET = 3300  # seconds of gate runs per commit; the hook itself times out at 3600 and would fail open
 
 
@@ -5210,6 +5215,205 @@ def context_check(root, cfg, data, items=None):
     return None, None
 
 
+# --- plan usage: the account's session and weekly percentages ---------------------------------
+
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+USAGE_TIMEOUT = 5  # seconds; any slower answer means "usage unknown"
+KEYCHAIN_CMD = ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"]
+
+
+def usage_cache_path():
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
+    return os.path.join(base, SLUG, "usage.json")
+
+
+def usage_cache_seconds():
+    try:
+        return max(0.0, float(env_value("USAGE_CACHE_SECONDS", "60")))
+    except ValueError:
+        return 60.0
+
+
+def oauth_token(text):
+    """claudeAiOauth.accessToken from a credentials JSON text, or None."""
+    try:
+        tok = (json.loads(text).get("claudeAiOauth") or {}).get("accessToken")
+    except (ValueError, AttributeError):
+        return None
+    return tok if isinstance(tok, str) and tok.strip() else None
+
+
+def usage_token():
+    """Claude Code's OAuth access token, read just before the request and never kept: the credentials file,
+    else on macOS the Keychain. None when there is none."""
+    path = env_value("CREDENTIALS") or os.path.join(os.path.expanduser("~"), ".claude", ".credentials.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            tok = oauth_token(f.read())
+    except (OSError, UnicodeDecodeError):
+        tok = None
+    if tok or sys.platform != "darwin":
+        return tok
+    exe = shutil.which(KEYCHAIN_CMD[0])  # found through PATH; the system folders are added for what it runs
+    if not exe:
+        return None
+    env = {**os.environ, "PATH": os.pathsep.join(x for x in (os.environ.get("PATH"), os.defpath) if x)}
+    try:
+        r = subprocess.run([exe] + KEYCHAIN_CMD[1:], capture_output=True, text=True, timeout=USAGE_TIMEOUT, env=env)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return oauth_token(r.stdout) if r.returncode == 0 else None
+
+
+def usage_item(obj, key):
+    """{pct, resets_at} from one part of the reply (`key` names the percentage), or None if it doesn't fit."""
+    if not isinstance(obj, dict):
+        return None
+    pct, at = obj.get(key), obj.get("resets_at")
+    if isinstance(pct, bool) or not isinstance(pct, (int, float)):
+        return None
+    if at is not None:
+        if not isinstance(at, str):
+            return None
+        try:
+            when = dt.datetime.fromisoformat(at.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        at = (when if when.tzinfo else when.replace(tzinfo=dt.timezone.utc)).isoformat()
+    return {"pct": float(pct), "resets_at": at}
+
+
+def parse_usage(data):
+    """(session, week) from the endpoint's reply: five_hour and seven_day, else the `limits` list."""
+    if not isinstance(data, dict):
+        return None, None
+    limits = data.get("limits") if isinstance(data.get("limits"), list) else []
+    kinds = {x.get("kind"): x for x in limits if isinstance(x, dict)}
+    session = usage_item(data.get("five_hour"), "utilization") or usage_item(kinds.get("session"), "percent")
+    week = usage_item(data.get("seven_day"), "utilization") or usage_item(kinds.get("weekly_all"), "percent")
+    return session, week
+
+
+def usage_reading(state, reason="", source="", at=None, session=None, week=None):
+    return {"state": state, "reason": reason, "source": source,
+            "at": at or dt.datetime.now().astimezone().isoformat(timespec="seconds"), "session": session, "week": week}
+
+
+def cached_usage():
+    """The cached reading if it is younger than the cache lifetime and well formed, else None."""
+    c = load_json(usage_cache_path(), None)
+    if not isinstance(c, dict) or c.get("state") not in ("ok", "unknown") or not isinstance(c.get("reason"), str):
+        return None
+    try:
+        age = (dt.datetime.now().astimezone() - dt.datetime.fromisoformat(c["at"])).total_seconds()
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not 0 <= age < usage_cache_seconds():
+        return None
+    parts = [c.get("session"), c.get("week")]
+    if c["state"] == "ok" and not all(isinstance(x, dict) and usage_item(x, "pct") for x in parts):
+        return None
+    if c["state"] == "ok":
+        parts = [usage_item(x, "pct") for x in parts]
+    else:
+        parts = [None, None]
+    return usage_reading(c["state"], c["reason"], "cache", c["at"], *parts)
+
+
+def save_usage_cache(reading):
+    """Write the reading to the cache (never the token); a cache that can't be written is skipped."""
+    path = usage_cache_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({k: v for k, v in reading.items() if k != "source"}, f)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def fetch_usage(token):
+    """One GET to the usage endpoint: a reading, with a plain reason when it fails. Server bodies and exception
+    texts never go into the reason (they can repeat the token)."""
+    import urllib.error
+    import urllib.request
+    url = env_value("USAGE_URL", USAGE_URL)
+    if not url.startswith(("https://", "http://")):
+        return usage_reading("unknown", "the usage server address isn't an http(s) address")
+    req = urllib.request.Request(url, method="GET", headers={
+        "Authorization": "Bearer " + token, "anthropic-beta": "oauth-2025-04-20", "Accept": "application/json",
+        "User-Agent": f"{SLUG}-usage"})
+    try:
+        with urllib.request.urlopen(req, timeout=USAGE_TIMEOUT) as r:
+            body = r.read(1_000_000)
+    except urllib.error.HTTPError as e:
+        why = "the sign-in was refused" if e.code in (401, 403) else "it had a problem"
+        return usage_reading("unknown", f"the usage server answered with error {e.code} ({why})")
+    except (TimeoutError, OSError) as e:
+        slow = isinstance(e, TimeoutError) or isinstance(getattr(e, "reason", None), TimeoutError)
+        return usage_reading("unknown", f"the usage server didn't answer within {USAGE_TIMEOUT} seconds" if slow
+                             else "couldn't reach the usage server")
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return usage_reading("unknown", "the usage server's answer wasn't valid JSON")
+    session, week = parse_usage(data)
+    if not (session and week):
+        return usage_reading("unknown", "the usage server's answer had no session and weekly percentages")
+    return usage_reading("ok", source="endpoint", session=session, week=week)
+
+
+def usage_settings(cfg):
+    return {**DEFAULTS["usage"], **((cfg or {}).get("usage") or {})}
+
+
+def read_usage(cfg=None, fresh=False):
+    """The plan's usage now: {state ok|unknown|not_plan, reason, source endpoint|cache|"", at, session, week}.
+    Cached for REGISTA_USAGE_CACHE_SECONDS (60); fresh skips the cache. Never raises."""
+    try:
+        if usage_settings(cfg).get("enabled") is False:
+            return usage_reading("unknown", "the usage meter is off (usage.enabled is false in config.json)")
+        for var, what in (("CLAUDE_CODE_USE_BEDROCK", "Amazon Bedrock"), ("CLAUDE_CODE_USE_VERTEX", "Google Vertex")):
+            if os.environ.get(var, "").strip() not in ("", "0"):
+                return usage_reading("not_plan", f"this session runs on {what}, which has no plan limits")
+        hit = None if fresh else cached_usage()
+        if hit:
+            return hit
+        token = usage_token()
+        if not token:
+            if os.environ.get("ANTHROPIC_API_KEY"):
+                return usage_reading("not_plan", "this session uses an API key, which has no plan limits")
+            return usage_reading("unknown", "no Claude Code sign-in found (no access token in the credentials"
+                                 + (" or the Keychain)" if sys.platform == "darwin" else " file)"))
+        reading = fetch_usage(token)
+        del token
+        reading["source"] = "endpoint" if reading["state"] == "ok" else ""
+        save_usage_cache(reading)
+        return reading
+    except Exception as e:  # never fail a hook, a gate or a commit; the type only, its text could hold the token
+        return usage_reading("unknown", f"an unexpected problem while reading usage ({type(e).__name__})")
+
+
+def local_time_text(iso):
+    """An ISO time in the machine's time zone, like "Friday 6 November, 07:00"."""
+    d = dt.datetime.fromisoformat(iso).astimezone()
+    return f"{d:%A} {d.day} {d:%B}, {d:%H:%M}"
+
+
+def format_usage(reading):
+    """The text `regista.py usage` prints."""
+    if reading.get("state") == "not_plan":
+        return f"Plan usage: not on a Claude plan ({reading.get('reason') or 'no plan limits'})."
+    if reading.get("state") != "ok":
+        return f"Plan usage unknown: {reading.get('reason') or 'no reading'}."
+    lines = ["Plan usage" + (" (cached reading):" if reading.get("source") == "cache" else ":")]
+    for label, part in (("This session", reading["session"]), ("This week", reading["week"])):
+        resets = f", resets {local_time_text(part['resets_at'])}" if part.get("resets_at") else ""
+        lines.append(f"  {label + ':':<14}{round(part['pct'], 1):g}% used{resets}")
+    return "\n".join(lines)
+
+
 # --- roles ----------------------------------------------------------------------------------
 
 ROLES = ("builder", "test-writer", "reviewer", "researcher")
@@ -9256,6 +9460,9 @@ def main():
     tr.add_argument("which", nargs="?", help="a milestone (M1) or a requirement ID")
     tr.add_argument("--ask", action="store_true", help="(the user, in a terminal) walk through each check and record it")
     sub.add_parser("review-status", help="does the current change set need a review, and is there one?")
+    us = sub.add_parser("usage", help="the Claude plan's session and weekly usage, with their reset times")
+    us.add_argument("--json", action="store_true", help="the reading as one JSON object")
+    us.add_argument("--fresh", action="store_true", help="ask the usage server, not the 60-second cache")
     cx = sub.add_parser("context")
     cx.add_argument("transcript")
     rf = sub.add_parser("refusals", help="what the hooks refused, newest first; `refusals label <n> real|false_alarm "
@@ -9290,6 +9497,15 @@ def main():
     if a.cmd == "detect":
         print(json.dumps(detect(find_root() or os.path.abspath(os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())),
                          indent=2, ensure_ascii=False))
+        return
+    if a.cmd == "usage":  # works without a project too; always exits 0
+        try:
+            root = find_root()
+            cfg = load_config(root) if root else {}
+        except (OSError, ValueError):
+            cfg = {}
+        reading = read_usage(cfg, fresh=a.fresh)
+        print(json.dumps(reading, ensure_ascii=False) if a.json else format_usage(reading))
         return
     if a.cmd == "context":
         root = find_root()
