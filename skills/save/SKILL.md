@@ -11,7 +11,10 @@ clear it properly. The CLI path is in the session-start context: `python "${CLAU
 1. **Gates.** `python "${CLAUDE_PLUGIN_ROOT}/scripts/regista.py" gate`. Record pass/fail; never hide a failure. If a metric gate
    improved and the user agrees the new numbers are the new floor, run `gate <name> --accept`.
 2. **Status file.** Tick finished plan steps, update "Latest results" (date, numbers, how they were
-   measured), and set "Next" to the single next concrete step.
+   measured), and set "Next" to the single next concrete step. Run
+   `python "${CLAUDE_PLUGIN_ROOT}/scripts/regista.py" usage report` and put the current milestone's cost so far in
+   "Latest results", in its own words: the share of the week and the tokens (e.g. "M1 so far: 3.7% of the week,
+   3.7 million tokens"), with its note when other sessions were running at the same time.
 3. **Commit locally** if the gates pass and there are changes. Check `git status` first so nothing
    secret or confidential gets staged. The commit hook runs the gates again; if it blocks, fix the
    cause instead of committing around it. If gates fail, don't commit; say so in the handoff.

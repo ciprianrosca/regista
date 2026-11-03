@@ -21,6 +21,7 @@ CLI (run from anywhere inside the project):
   python regista.py context TRANSCRIPT         context use of a session transcript (tokens, window, %)
   python regista.py usage [--json] [--fresh]   the Claude plan's session and weekly usage and reset times
                                           (cached 60 seconds; --fresh asks again); always exits 0
+  python regista.py usage report [M1] [--json] what each step and milestone cost (share of the week, tokens)
   python regista.py review-status              does the current change set need a review, and is there one?
   python regista.py review-record              (reviewer agent only) record the review draft, reviews/draft.json
   python regista.py requirements               requirements, their coverage and pass/fail (set by the gates)
@@ -1240,6 +1241,9 @@ def resume_text(root, cfg, detailed=False):
     parts.append("\n(For the user: what's done, what's next and what needs them, in plain words. Milestone codes, commit "
                  "hashes and dated gate results go in a short Details part at the end, if at all.)")
     if detailed:
+        cost = quietly(usage_status_line, "", root, cfg)
+        if cost:
+            parts.append("\n## Plan usage\n" + cost)
         parts.append("\n## Recent commits\n" + git(root, "log", "--oneline", "-8"))
         if dirty:
             parts.append("\n## Uncommitted\n" + "\n".join(dirty[:30]))
@@ -2889,7 +2893,23 @@ def open_session(folder, name, mode=""):
     return True, lines + problems
 
 
-WORKER_RECORDS = ("hooks.log", "gates/history.jsonl", "compactions.jsonl")  # a worker's untracked records
+WORKER_RECORDS = ("hooks.log", "gates/history.jsonl", "compactions.jsonl", "usage.jsonl")  # a worker's untracked records
+
+
+def join_usage_lines(root, src):
+    """Append the lines of a worker's usage.jsonl (`src`) to the project's that it doesn't have yet, in order."""
+    dest = harness_path(root, "usage.jsonl")
+    with open(src, "rb") as f:
+        theirs = [ln.rstrip(b"\r") for ln in f.read().split(b"\n") if ln.strip()]
+    mine = b""
+    if os.path.isfile(dest):
+        with open(dest, "rb") as f:
+            mine = f.read()
+    have = {ln.rstrip(b"\r") for ln in mine.split(b"\n")}
+    new = [ln for ln in dict.fromkeys(theirs) if ln not in have]
+    if new:
+        with open(dest, "ab") as f:
+            f.write((b"\n" if mine and not mine.endswith(b"\n") else b"") + b"\n".join(new) + b"\n")
 
 
 def worker_records(root, wt):
@@ -2932,10 +2952,12 @@ def keep_worker_records(root, name, w, wt):
             to = os.path.join(dest, *r.split("/"))
             os.makedirs(os.path.dirname(to), exist_ok=True)
             shutil.copyfile(harness_path(wt, *r.split("/")), to)
+        if "usage.jsonl" in copy:
+            join_usage_lines(root, harness_path(wt, "usage.jsonl"))
         index = {"worker": name, "milestone": w.get("milestone") or "", "task": w.get("task") or "",
-                 "branch": w.get("branch") or "", "session_id": w.get("session_id") or "",
-                 "session_name": w.get("session_name") or "", "worktree": wt, "started": w.get("started") or "",
-                 "merged_at": w.get("merged_at") or "", "copied_at": now_iso(), "files": copy}
+                  "branch": w.get("branch") or "", "session_id": w.get("session_id") or "",
+                  "session_name": w.get("session_name") or "", "worktree": wt, "started": w.get("started") or "",
+                  "merged_at": w.get("merged_at") or "", "copied_at": now_iso(), "files": copy}
         with open(os.path.join(dest, "index.json"), "w", encoding="utf-8") as f:
             json.dump(index, f, indent=2, ensure_ascii=False)
             f.write("\n")
@@ -5630,6 +5652,222 @@ def record_step(root, cfg, data):
     reqs = spec[2].get("requirements") if isinstance(spec[2], dict) else None
     record_usage(root, cfg, data, "step", fresh=True, spec=spec, commit_files=files, lines_changed=lines,
                  requirements=len(reqs) if isinstance(reqs, list) else 0)
+
+
+# --- usage report: what each step and milestone cost, from usage.jsonl (`regista.py usage report`) ----------
+# A step is its agent records and its last step record with files in it (save and status-only commits have none).
+# Its share of the week runs from its first agent_start (else the previous counted step record) to that record.
+
+USAGE_KINDS = ("agent_start", "agent_stop", "step")
+RESET_SLACK = 3600  # seconds: reset times further apart than this mean the week (or session) reset in between
+
+
+def num(x):
+    """x as a float when it's a finite number (not a bool), else None."""
+    if isinstance(x, bool) or not isinstance(x, (int, float)) or x != x or x in (float("inf"), float("-inf")):
+        return None
+    return float(x)
+
+
+def usage_records(root):
+    """The well-formed records in usage.jsonl, in file order; anything else is skipped."""
+    out = []
+    try:
+        if not root:
+            return out
+        with open(harness_path(root, "usage.jsonl"), "rb") as f:
+            raw = f.read().split(b"\n")
+    except (OSError, ValueError):
+        return out
+    for line in raw:
+        try:
+            r = json.loads(line.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            continue
+        if (isinstance(r, dict) and r.get("kind") in USAGE_KINDS and isinstance(r.get("milestone"), str)
+                and isinstance(r.get("step"), str)):
+            out.append(r)
+    return out
+
+
+def usage_pct(r, key):
+    u = r.get("usage") if r else None
+    return num(u.get(key)) if isinstance(u, dict) else None
+
+
+def resets_differ(a, b, key):
+    """Whether two records' reset times (usage.<key>) are both known and more than RESET_SLACK apart."""
+    ta, tb = (quietly(lambda: dt.datetime.fromisoformat(r["usage"][key]), None) for r in (a, b))
+    return bool(ta and tb) and abs(quietly(lambda: (ta - tb).total_seconds(), 0)) > RESET_SLACK
+
+
+def pct_rise(a, b, key, resets_key):
+    """(b's percentage minus a's, rounded, or None when unknown; whether the limit reset in between: the reset
+    times differ, or the percentage fell, which only a reset can explain, so a cost is never negative)."""
+    x, y = usage_pct(a, key), usage_pct(b, key)
+    if x is None or y is None:
+        return None, False
+    if resets_differ(a, b, resets_key) or y < x:
+        return None, True
+    return round(y - x, 6), False
+
+
+def tokens_sum(t):
+    """A tokens object's total (input + output + cache_write + cache_read); anything unreadable counts 0."""
+    return int(sum(num(t.get(k)) or 0 for k, _ in TOKEN_FIELDS)) if isinstance(t, dict) else 0
+
+
+def busy(r):
+    return (num(r.get("other_sessions")) or 0) > 0
+
+
+def usage_report(root, cfg, milestone=None):
+    """The cost of each counted step and milestone, and the running estimate of tokens per 1% of the week (from
+    the steps run alone with a rise in the percentage). `milestone` keeps that milestone's steps only; the estimate
+    always rests on every step. Never raises."""
+    try:
+        return build_usage_report(usage_records(root), milestone)
+    except Exception:  # noqa: BLE001
+        return {"steps": [], "milestones": [], "tokens_per_pct": None, "tokens_per_pct_based_on": 0, "records": 0}
+
+
+def record_time(r):
+    """A record's `at` as seconds since the epoch (offsets compared as real times), or None when unreadable."""
+    return quietly(lambda: dt.datetime.fromisoformat(r["at"]).timestamp(), None)
+
+
+def time_order(recs):
+    """The records sorted by their `at` time; those without a readable time keep their file order after them."""
+    timed = [(t, i) for i, t in enumerate(record_time(r) for r in recs) if t is not None]
+    untimed = [r for r in recs if record_time(r) is None]
+    return [recs[i] for _, i in sorted(timed)] + untimed
+
+
+def build_usage_report(recs, milestone=None):
+    recs = time_order(recs)
+    last = {}
+    for i, r in enumerate(recs):
+        if r["kind"] == "step" and r["step"].strip() and (num(r.get("commit_files")) or 0) > 0:
+            last[(r["milestone"], r["step"])] = i
+    counted = sorted(last.values())
+    steps = []
+    for n, i in enumerate(counted):
+        end, key = recs[i], (recs[i]["milestone"], recs[i]["step"])
+        mine = [j for j, r in enumerate(recs) if r["kind"] != "step" and (r["milestone"], r["step"]) == key]
+        first = next((j for j in mine if j < i and recs[j]["kind"] == "agent_start"), None)
+        first = counted[n - 1] if first is None and n else first
+        a = recs[first] if first is not None else None
+        week, reset = pct_rise(a, end, "week_pct", "week_resets_at")
+        session, _ = pct_rise(a, end, "session_pct", "session_resets_at")
+        by_role = {}
+        for j in mine:
+            if recs[j]["kind"] == "agent_stop":
+                role = recs[j].get("role") if isinstance(recs[j].get("role"), str) and recs[j]["role"] else "other"
+                by_role[role] = by_role.get(role, 0) + tokens_sum(recs[j].get("tokens"))
+        t0, t1 = (quietly(lambda: dt.datetime.fromisoformat(r["at"]), None) for r in (a or {}, end))
+        secs = quietly(lambda: round((t1 - t0).total_seconds(), 1), None) if t0 and t1 else None
+        steps.append({"milestone": key[0], "step": key[1], "week_pct": week, "session_pct": session,
+                      "tokens_total": sum(by_role.values()), "tokens_by_role": by_role,
+                      "agents": sum(recs[j]["kind"] == "agent_stop" for j in mine), "seconds": secs,
+                      "commit_files": int(num(end.get("commit_files")) or 0),
+                      "lines_changed": int(num(end.get("lines_changed")) or 0),
+                      "requirements": int(num(end.get("requirements")) or 0),
+                      "other_sessions": busy(end) or any(busy(recs[j]) for j in mine), "week_reset": reset,
+                      "_from": first, "_to": i})
+    milestones = []
+    for ms in dict.fromkeys(s["milestone"] for s in steps):
+        own = [s for s in steps if s["milestone"] == ms]
+        a = next(r for r in recs if r["milestone"] == ms)  # the milestone's earliest record of any kind, by time
+        week, _ = pct_rise(a, recs[own[-1]["_to"]], "week_pct", "week_resets_at")
+        by_role = {}
+        for s in own:
+            for role, t in s["tokens_by_role"].items():
+                by_role[role] = by_role.get(role, 0) + t
+        milestones.append({"milestone": ms, "steps": len(own), "week_pct": week, "tokens_total": sum(by_role.values()),
+                           "tokens_by_role": by_role, "other_sessions": any(s["other_sessions"] for s in own)})
+    clean = [s for s in steps if s["week_pct"] is not None and s["week_pct"] > 0 and not s["other_sessions"]]
+    pcts = sum(s["week_pct"] for s in clean)
+    for s in steps:
+        del s["_from"], s["_to"]
+    if milestone:
+        want = str(milestone).lower()
+        steps = [s for s in steps if s["milestone"].lower() == want]
+        milestones = [m for m in milestones if m["milestone"].lower() == want]
+    return {"steps": steps, "milestones": milestones,
+            "tokens_per_pct": sum(s["tokens_total"] for s in clean) / pcts if clean else None,
+            "tokens_per_pct_based_on": len(clean), "records": len(recs)}
+
+
+def tokens_text(n, unit=" tokens"):
+    """3,241,627 -> '3.2 million tokens'; under 50,000 the exact count."""
+    return f"{n / 1e6:.1f} million{unit}" if n >= 50_000 else f"{n:,}{unit}"
+
+
+def pct_text(x):
+    return f"{round(x, 2):g}%"
+
+
+def cost_text(c):
+    """'2.5% of the week, 3.2 million tokens: builder 2.0 million, reviewer 1.2 million'."""
+    if c["week_pct"] is not None:
+        week = f"{pct_text(c['week_pct'])} of the week"
+    elif c.get("week_reset"):
+        week = "share of the week unknown (the weekly limit reset during it)"
+    else:
+        week = "share of the week unknown (no usage reading before it, or one was missing)"
+    roles = [f"{role} {tokens_text(t, '')}" for role, t in sorted(c["tokens_by_role"].items(), key=lambda x: -x[1]) if t]
+    return f"{week}, {tokens_text(c['tokens_total'])}" + (": " + ", ".join(roles) if roles else "")
+
+
+def duration_text(secs):
+    m = int(round(secs / 60))
+    return (f"{m // 60} h" + (f" {m % 60} min" if m % 60 else "")) if m >= 60 else f"{m} min"
+
+
+SHARED_NOTE = "Other sessions were active at the same time, so the percentage includes their use."
+
+
+def format_usage_report(report):
+    """The text `regista.py usage report` prints: plain sentences, one per step and milestone."""
+    try:
+        if not report.get("milestones"):
+            return ("No usage has been recorded yet." if not report.get("records") else
+                    "No committed step here has usage records yet.")
+        out = []
+        for m in report["milestones"]:
+            n = m["steps"]
+            out.append(f"Milestone {m['milestone']} ({n} step{'s' if n != 1 else ''}): {cost_text(m)}."
+                       + (f" {SHARED_NOTE}" if m["other_sessions"] else ""))
+            for s in [s for s in report["steps"] if s["milestone"] == m["milestone"]]:
+                extra = [f"{s['agents']} agent{'s' if s['agents'] != 1 else ''}"]
+                if s["seconds"] is not None and s["seconds"] >= 0:
+                    extra.append(f"about {duration_text(s['seconds'])}")
+                out.append(f"  Step {s['step']} ({s['milestone']}): {cost_text(s)} ({', '.join(extra)})."
+                           + (f" {SHARED_NOTE}" if s["other_sessions"] else ""))
+            out.append("")
+        rate, n = report.get("tokens_per_pct"), report.get("tokens_per_pct_based_on") or 0
+        if rate:
+            out.append(f"Estimate: about {tokens_text(int(round(rate)))} per 1% of the week, based on {n} "
+                       f"step{'s' if n != 1 else ''} that ran alone and raised the weekly percentage.")
+        else:
+            out.append("No estimate of tokens per 1% of the week yet: it needs a step that ran alone and raised the "
+                       "weekly percentage.")
+        out.append("A single small step can show little or no change in the weekly percentage; "
+                   "the milestone total is more reliable.")
+        return "\n".join(out)
+    except Exception:  # noqa: BLE001
+        return "The usage records couldn't be read as a report."
+
+
+def usage_status_line(root, cfg):
+    """One line for `regista.py status`: the current milestone's cost so far (the first with unticked steps)."""
+    ms = next((m["id"] for m in quietly(plan_milestones, [], root, cfg) if m["open_steps"]), None)
+    mine = usage_report(root, cfg, milestone=ms)["milestones"] if ms else []
+    if not mine:
+        return ""
+    m = mine[0]
+    return (f"{ms} so far ({m['steps']} committed step{'s' if m['steps'] != 1 else ''}): {cost_text(m)}."
+            + (f" {SHARED_NOTE}" if m["other_sessions"] else "") + f" Details: `{PY} \"{DD}\" usage report`.")
 
 
 # --- roles ----------------------------------------------------------------------------------
@@ -8542,7 +8780,7 @@ def doctor(root, cfg):
 LOCAL_STATE = ["gates/last.json", "gates/history.jsonl", "gates/passed.json", "gates/.lock", "gates/detached.json",
                "context.json",
                "compactions.jsonl", "hosts.json", "approvals.json", "hooks.log", "agents/", "reviews/draft.json",
-               "run.json", "typed.json", "worker.json", "fleet/", "worktrees/"]
+               "run.json", "typed.json", "worker.json", "fleet/", "worktrees/", "usage.jsonl"]
 
 
 def ensure_gitignore(root):
@@ -9681,8 +9919,11 @@ def main():
     tr.add_argument("which", nargs="?", help="a milestone (M1) or a requirement ID")
     tr.add_argument("--ask", action="store_true", help="(the user, in a terminal) walk through each check and record it")
     sub.add_parser("review-status", help="does the current change set need a review, and is there one?")
-    us = sub.add_parser("usage", help="the Claude plan's session and weekly usage, with their reset times")
-    us.add_argument("--json", action="store_true", help="the reading as one JSON object")
+    us = sub.add_parser("usage", help="the Claude plan's session and weekly usage, with their reset times; "
+                                      "`usage report [M<n>]`: what each step and milestone cost")
+    us.add_argument("action", nargs="?", choices=["report"], help="the cost of each step and milestone")
+    us.add_argument("milestone", nargs="?", help="(report) only this milestone, e.g. M1")
+    us.add_argument("--json", action="store_true", help="the reading (or the report) as one JSON object")
     us.add_argument("--fresh", action="store_true", help="ask the usage server, not the 60-second cache")
     cx = sub.add_parser("context")
     cx.add_argument("transcript")
@@ -9720,6 +9961,7 @@ def main():
                          indent=2, ensure_ascii=False))
         return
     if a.cmd == "usage":  # works without a project too; always exits 0
+        root = None
         try:
             root = find_root()
             cfg = load_config(root) if root else {}
@@ -9728,6 +9970,10 @@ def main():
         except Exception:  # a section of the wrong type: read_usage judges the raw usage section
             raw = load_json(harness_path(root, "config.json"), {})
             cfg = raw if isinstance(raw, dict) else {}
+        if a.action == "report":
+            rep = usage_report(root or "", cfg, milestone=a.milestone)
+            print(json.dumps(rep, ensure_ascii=False) if a.json else format_usage_report(rep))
+            return
         reading = read_usage(cfg, fresh=a.fresh)
         print(json.dumps(reading, ensure_ascii=False) if a.json else format_usage(reading))
         return
