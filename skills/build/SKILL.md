@@ -26,7 +26,10 @@ start hook tells each one the project root, the CLI path and its own rules.
 
 ## `/regista:build next` · `/regista:build M<n>`
 
-1. **Resume** if this session hasn't (`/regista:start`).
+1. **Resume** if this session hasn't (`/regista:start`). Before `build M<n>` starts a milestone, offer the
+   estimate unless the user already saw one this session: run `regista.py estimate M<n>` and give its first
+   lines (the cost as a share of the week, what's left before the stop, when the week resets, whether it
+   fits), then ask whether to start. Skip the offer for `build next` in the middle of a milestone.
 2. **Milestone gates: build in parallel, gate the claims** (`config.json → milestones`).
    - `parallel` (default): the next milestone's code may be built while an earlier milestone's gate
      is still open. But a milestone is marked **done**, and its results called final, only after
@@ -113,6 +116,9 @@ context says so).
    `regista.py plan add-milestone "<title>" [--after M<n>] --files "<globs>" --gate "<criterion>" --step "<step>" …`
    (repeat `--gate` and `--step`) writes it in the plan's format; `--files` names the files it will change.
    Show the plan to the user only where it changes or leaves out something the spec asks for.
+   Before `build all` starts the run, offer the estimate (`/regista:estimate`): run `regista.py estimate all`
+   and give the cost as a share of the week, what's left before the stop and when the week resets, and whether
+   it fits, so the user can decide to start now, build one milestone, or wait for the reset.
 2. **Start the run:** `python "${CLAUDE_PLUGIN_ROOT}/scripts/regista.py" run start`. While the run is active, the
    Stop hook sends you back to work each time you try to end your turn, as long as you've committed
    something since its last nudge. A run that stops twice without a new commit ends itself, so it can
@@ -134,6 +140,10 @@ context says so).
      spec asks. If writing it forced a choice that spec doesn't make, that's a decision: see above.
    - **Context warning:** finish the step, commit it, run `/regista:save`, and carry on. The session
      compacts itself at the limit and the run survives it.
+   - **Weekly limit:** after a commit the hook says when the plan's weekly usage passes the warning level
+     (`usage.warn_at_weekly_pct`, 75% by default). At the stop level (`usage.stop_at_weekly_pct`, 90%) start no
+     more steps: run `/regista:save`, end the run with `regista.py run end --reason` naming the weekly limit and
+     the reset time, and say in the final report that the build can go on after the reset.
    - **A change from the user** (`/regista:change`, shown at session start and in every nudge): fold it
      into the plan before the next step, as the change skill says, then `regista.py change done <n> --where M<n>`.
      "Build this last" or "after What-if" becomes an `After: all` or `After: M8` line on the milestone.

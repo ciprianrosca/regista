@@ -400,6 +400,43 @@ class Milestones(ReportBase):
             self.assertNotIn(other, text)
 
 
+class MilestoneWeekReset(ReportBase):
+    def test_a_milestone_knows_the_week_reset_during_it(self):  # covers: UREP-13
+        rep = self.report(MILESTONE_ROWS)
+        self.assertTrue(self.milestone(rep, "M3")["week_reset"])  # 96% at delta's start, 2% at epsilon's commit
+        self.assertFalse(self.milestone(rep, "M1")["week_reset"])
+        self.assertFalse(self.milestone(rep, "M2")["week_reset"])
+        text = regista.format_usage_report(self.report(MILESTONE_ROWS, milestone="M3")).lower()
+        self.assertRegex(text, r"week[^.\n]*reset|reset[^.\n]*week", text)
+        self.assertNotIn("missing", text)  # its steps have their percentages: nothing was missing
+
+    def test_a_missing_reading_is_not_a_reset(self):  # covers: UREP-13
+        rep = self.report([*built("M1", "alpha", 0, 40.0, 41.0, 100),
+                           start("M1", "beta", 20, 41.0), done("M1", "beta", 30, None, session=None)])
+        m1 = self.milestone(rep, "M1")
+        self.assertIsNone(m1["week_pct"])
+        self.assertFalse(m1["week_reset"])
+        self.assertNotIn("reset", regista.format_usage_report(rep).lower())
+
+
+class BadTokenCounts(ReportBase):
+    def test_negative_or_non_numeric_counts_are_zero(self):  # covers: UREP-14
+        rep = self.report([
+            start("M1", "alpha", 0, 40.0),
+            stop("M1", "alpha", 3, 40.2, tokens={"input": -5, "output": "12", "cache_write": 3, "cache_read": 1000}),
+            stop("M1", "alpha", 4, 40.3, agent_id="a2", role="reviewer",
+                 tokens={"input": -100, "output": -1, "cache_write": None, "cache_read": [7]}),
+            stop("M1", "alpha", 5, 40.4, agent_id="a3", tokens={"input": 10, "output": "lots", "cache_write": {},
+                                                                "cache_read": -2000000}),
+            done("M1", "alpha", 10, 41.0),
+        ])
+        alpha = self.step(rep, "M1", "alpha")
+        self.assertEqual(alpha["tokens_total"], 1013)
+        self.assertEqual(alpha["tokens_by_role"].get("builder"), 1013)
+        self.assertEqual(alpha["tokens_by_role"].get("reviewer", 0), 0)
+        self.assertEqual(self.milestone(rep, "M1")["tokens_total"], 1013)
+
+
 class Estimate(ReportBase):
     def test_tokens_per_pct_from_clean_steps_only(self):  # covers: UREP-6
         rep = self.report([

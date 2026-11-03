@@ -2573,6 +2573,9 @@ def run_nudge(root, cfg, data):
     if agents_running(root, data):
         return None  # the session waits on its agents; their completion notices wake it, so this isn't a stall
     head = git(root, "rev-parse", "HEAD")
+    wk = quietly(week_limit, None, cfg)  # None (meter off, usage unknown): the run goes on as before
+    if wk and wk["level"] == "stop":
+        return week_stop(root, cfg, run, head, wk)
     if run.get("nudged_at") == head:
         run_end(root, cfg, "the session tried to stop twice without committing anything new", outcome="stalled")
         return {"systemMessage": f"{DISPLAY_NAME}: the build-all run stopped because no new step was committed since the "
@@ -2588,7 +2591,35 @@ def run_nudge(root, cfg, data):
             f"next step that isn't blocked ({cmd_name('build')} all).{save_note}\nMilestones:\n" + "\n".join(lines) +
             f"\nIf every milestone is done, or everything left waits on the user (a decision, a manual check, a "
             f"step that stayed blocked), or the user asked you to stop: save, run `{PY} \"{DD}\" run end --reason "
-            f"\"<why>\"`, and give the final report."}
+            f"\"<why>\"`, and give the final report." + week_warning(wk)}
+
+
+def week_warning(wk):
+    """The nudge's line at the weekly warning level; "" below it, or when the usage is unknown."""
+    if not wk or wk["level"] != "warn":
+        return ""
+    return (f"\nThis week's plan usage is at {pct_text(wk['pct'])}; the run stops at {pct_text(wk['stop'])}"
+            + (f" (the week resets {wk['when']})." if wk["when"] else "."))
+
+
+def week_stop(root, cfg, run, head, wk):
+    """Stop hook, during a build-all run, with the week's usage at the stop: no more steps. The first time, the
+    session is told to save and end the run; if it stops again with nothing committed since, the run ends here."""
+    resets = f" The week resets {wk['when']}." if wk["when"] else ""
+    if run.get("week_stop_at") == head:
+        run_end(root, cfg, week_stop_reason(wk), outcome="stopped")
+        return {"systemMessage": f"{DISPLAY_NAME}: the build-all run stopped at the weekly plan limit "
+                                 f"({pct_text(wk['pct'])} used, the stop is at {pct_text(wk['stop'])}).{resets} Save "
+                                 f"with {cmd_name('save')} if it isn't saved yet; after the reset, "
+                                 f"{cmd_name('build')} all picks the build up again."}
+    run.update(week_stop_at=head)
+    save_json(run_path(root), run)
+    return {"decision": "block", "reason":
+            f"{DISPLAY_NAME}: this week's plan usage is at {pct_text(wk['pct'])}, at or over the {pct_text(wk['stop'])} "
+            f"where the build-all run stops.{resets} Start no more steps: commit the step in hand if it's built "
+            f"and reviewed, otherwise leave it for after the reset. Run {cmd_name('save')}, then end the run with "
+            f"`{PY} \"{DD}\" run end --reason \"{week_stop_reason(wk)}\"`, and give the final report: what was "
+            "built, what's left, and that the build can go on after the reset."}
 
 
 def waits_on_agents(root, data):
@@ -5713,8 +5744,9 @@ def pct_rise(a, b, key, resets_key):
 
 
 def tokens_sum(t):
-    """A tokens object's total (input + output + cache_write + cache_read); anything unreadable counts 0."""
-    return int(sum(num(t.get(k)) or 0 for k, _ in TOKEN_FIELDS)) if isinstance(t, dict) else 0
+    """A tokens object's total (input + output + cache_write + cache_read); anything unreadable or negative
+    counts 0."""
+    return int(sum(max(0.0, num(t.get(k)) or 0) for k, _ in TOKEN_FIELDS)) if isinstance(t, dict) else 0
 
 
 def busy(r):
@@ -5778,13 +5810,14 @@ def build_usage_report(recs, milestone=None):
     for ms in dict.fromkeys(s["milestone"] for s in steps):
         own = [s for s in steps if s["milestone"] == ms]
         a = next(r for r in recs if r["milestone"] == ms)  # the milestone's earliest record of any kind, by time
-        week, _ = pct_rise(a, recs[own[-1]["_to"]], "week_pct", "week_resets_at")
+        week, reset = pct_rise(a, recs[own[-1]["_to"]], "week_pct", "week_resets_at")
         by_role = {}
         for s in own:
             for role, t in s["tokens_by_role"].items():
                 by_role[role] = by_role.get(role, 0) + t
         milestones.append({"milestone": ms, "steps": len(own), "week_pct": week, "tokens_total": sum(by_role.values()),
-                           "tokens_by_role": by_role, "other_sessions": any(s["other_sessions"] for s in own)})
+                           "tokens_by_role": by_role, "other_sessions": any(s["other_sessions"] for s in own),
+                           "week_reset": reset})
     clean = [s for s in steps if s["week_pct"] is not None and s["week_pct"] > 0 and not s["other_sessions"]]
     pcts = sum(s["week_pct"] for s in clean)
     for s in steps:
@@ -5868,6 +5901,276 @@ def usage_status_line(root, cfg):
     m = mine[0]
     return (f"{ms} so far ({m['steps']} committed step{'s' if m['steps'] != 1 else ''}): {cost_text(m)}."
             + (f" {SHARED_NOTE}" if m["other_sessions"] else "") + f" Details: `{PY} \"{DD}\" usage report`.")
+
+
+# --- the estimate before a build (`regista.py estimate [M<n> | all]`) ---------------------------------------
+# A typical step's agent tokens (25th to 75th percentile of the past steps), times the steps left, turned into a
+# share of the week with the tokens per 1% the same past steps show. The past steps are this project's; when it
+# has fewer than ESTIMATE_MIN_STEPS, the other projects' on the machine are added; with none, a rough default.
+
+ESTIMATE_MIN_STEPS = 4
+DEFAULT_STEP_TOKENS = (4_000_000, 12_000_000)  # one step's agent tokens, low and high, with no records at all
+DEFAULT_TOKENS_PER_PCT = 100_000_000  # measured on 3 November 2026: about 100 million tokens per 1% of the week
+DEFAULT_STEP_MINUTES = (20, 60)
+
+
+def percentile(xs, q):
+    """The q-th percentile (0 to 100) of a sorted list, by linear interpolation between the closest ranks."""
+    pos = (len(xs) - 1) * q / 100
+    lo = int(pos)
+    hi = min(lo + 1, len(xs) - 1)
+    return xs[lo] + (xs[hi] - xs[lo]) * (pos - lo)
+
+
+def typical_range(values):
+    """(low, high) for one step: the 25th and 75th percentiles, or the lowest and highest under 4 values."""
+    xs = sorted(values)
+    return (xs[0], xs[-1]) if len(xs) < 4 else (percentile(xs, 25), percentile(xs, 75))
+
+
+def other_usage_roots(root):
+    """The other projects in the machine-wide usage-projects list: absolute folders that exist, each once, never
+    the project at `root`. Anything else in the list is skipped."""
+    listed = load_json(usage_projects_path(), [])
+    if not isinstance(listed, list):
+        return []
+    seen = {os.path.realpath(root)} if root else set()
+    out = []
+    for x in listed:
+        if not isinstance(x, str) or not x or not os.path.isabs(x) or not os.path.isdir(x):
+            continue
+        real = os.path.realpath(x)
+        if real not in seen:
+            seen.add(real)
+            out.append(x)
+    return out
+
+
+def past_steps(root):
+    """The counted steps (usage_report) of a project that recorded at least one agent: a step without agent
+    records says nothing about what a step costs."""
+    return [s for s in usage_report(root, {})["steps"] if s.get("agents") or s.get("tokens_total")]
+
+
+def steps_rate(steps):
+    """Tokens per 1% of the week over these steps, by usage_report's rule (UREP-6), or None."""
+    clean = [s for s in steps if s["week_pct"] is not None and s["week_pct"] > 0 and not s["other_sessions"]]
+    pcts = sum(s["week_pct"] for s in clean)
+    return sum(s["tokens_total"] for s in clean) / pcts if clean and pcts > 0 else None
+
+
+def estimate_week(cfg):
+    """The week's and session's usage now, as the estimate shows them."""
+    reading = read_usage(cfg)
+    ok = reading.get("state") == "ok"
+    w, s = [(reading.get(k) or {}) if ok else {} for k in ("week", "session")]
+    return ({"pct": num(w.get("pct")), "resets_at": w.get("resets_at"), "state": reading.get("state") or "unknown",
+             "reason": reading.get("reason") or ""},
+            {"pct": num(s.get("pct")), "resets_at": s.get("resets_at")})
+
+
+def week_settings(cfg):
+    """(stop_at, warn_at): the usage section's weekly percentages, the defaults when unreadable."""
+    s = usage_settings(cfg)
+    stop, warn = num(s.get("stop_at_weekly_pct")), num(s.get("warn_at_weekly_pct"))
+    stop = DEFAULTS["usage"]["stop_at_weekly_pct"] if stop is None else stop
+    warn = DEFAULTS["usage"]["warn_at_weekly_pct"] if warn is None else warn
+    return (int(stop) if stop == int(stop) else stop), (int(warn) if warn == int(warn) else warn)
+
+
+def week_limit(cfg):
+    """During a build-all run: where the week's usage stands against the warning and the stop. None when the meter
+    is off or the usage is unknown (the run then goes on as before); else {pct, stop, warn, level stop|warn|"",
+    when (the reset in local time, or "")}."""
+    if usage_settings(cfg).get("enabled") is False:
+        return None
+    week, _ = estimate_week(cfg)
+    if week["state"] != "ok" or week["pct"] is None:
+        return None
+    stop, warn = week_settings(cfg)
+    pct = week["pct"]
+    when = quietly(local_time_text, "", week["resets_at"]) if week.get("resets_at") else ""
+    return {"pct": pct, "stop": stop, "warn": warn, "when": when,
+            "level": "stop" if pct >= stop else "warn" if pct >= warn else ""}
+
+
+def week_stop_reason(wk):
+    return (f"the weekly plan limit: {pct_text(wk['pct'])} used, at or over the {pct_text(wk['stop'])} stop"
+            + (f"; it resets {wk['when']}" if wk["when"] else ""))
+
+
+def week_note(root, cfg):
+    """The commit hook's note during a build-all run, at the warning level or the stop; "" otherwise."""
+    if not load_json(run_path(root), {}).get("active"):
+        return ""
+    wk = week_limit(cfg)
+    if not wk or not wk["level"]:
+        return ""
+    resets = f" The week resets {wk['when']}." if wk["when"] else ""
+    if wk["level"] == "warn":
+        return (f"{DISPLAY_NAME}: this week's plan usage is at {pct_text(wk['pct'])}. The build-all run stops at "
+                f"{pct_text(wk['stop'])}.{resets}")
+    return (f"{DISPLAY_NAME}: this week's plan usage is at {pct_text(wk['pct'])}, at or over the "
+            f"{pct_text(wk['stop'])} where the build-all run stops.{resets} Start no more steps. Run "
+            f"{cmd_name('save')}, then end the run with `{PY} \"{DD}\" run end --reason \"{week_stop_reason(wk)}\"` "
+            "and give the final report, saying the build can go on after the reset.")
+
+
+def usage_estimate(root, cfg, target=None):
+    """What building `target` (a milestone like 'M2', 'all', or None for the next milestone with unticked steps)
+    should cost, in % of the week, tokens and minutes, and whether it fits before the stop. Never raises."""
+    try:
+        return build_estimate(root, cfg if isinstance(cfg, dict) else {}, target)
+    except Exception:  # noqa: BLE001
+        lo, hi = DEFAULT_STEP_TOKENS
+        return {"target": str(target or ""), "steps_left": 0, "pct_low": 0.0, "pct_high": 0.0, "tokens_low": 0,
+                "tokens_high": 0, "minutes_low": None, "minutes_high": None, "tokens_by_role": {},
+                "based_on": {"project": 0, "other_projects": 0}, "source": "default",
+                "tokens_per_pct": DEFAULT_TOKENS_PER_PCT, "week": {"pct": None, "resets_at": None, "state": "unknown"},
+                "session": {"pct": None, "resets_at": None}, "stop_at": DEFAULTS["usage"]["stop_at_weekly_pct"],
+                "fits": "unknown", "plan_milestones": [], "problem": "The estimate couldn't be worked out."}
+
+
+def build_estimate(root, cfg, target):
+    plan = quietly(plan_milestones, [], root, {"plan": cfg.get("plan") or ""}) if root else []
+    ids = [m["id"] for m in plan]
+    want, problem = str(target or "").strip(), ""
+    if want.lower() == "all":
+        target, steps_left = "all", sum(m["open_steps"] for m in plan)
+    elif want:
+        hit = next((m for m in plan if m["id"].lower() == want.lower()), None)
+        target, steps_left = (hit["id"], hit["open_steps"]) if hit else (want, 0)
+        if not hit:
+            problem = (f"{want} isn't a milestone in the plan. Its milestones are {', '.join(ids)}." if ids else
+                       f"{want} isn't in the plan: the plan has no milestones yet.")
+    else:
+        nxt = next((m for m in plan if m["open_steps"]), None)
+        target, steps_left = (nxt["id"], nxt["open_steps"]) if nxt else ("", 0)
+        if not nxt:
+            problem = ("Every step in the plan is ticked: nothing is left to build." if ids else
+                       "There's no plan with milestones yet, so there's nothing to estimate.")
+    mine = quietly(past_steps, [], root) if root else []
+    others = []
+    if len(mine) < ESTIMATE_MIN_STEPS:
+        for other in quietly(other_usage_roots, [], root):
+            others += quietly(past_steps, [], other)
+    steps = mine + others
+    source = "default" if not steps else "machine" if others else "project"
+    if steps:
+        tok_lo, tok_hi = typical_range([s["tokens_total"] for s in steps])
+        roles = {}
+        for s in steps:
+            for role, t in s["tokens_by_role"].items():
+                roles.setdefault(role, []).append(t)
+        by_role = {role: int(round(percentile(sorted(ts), 50))) for role, ts in roles.items()}
+        rate = steps_rate(steps) or DEFAULT_TOKENS_PER_PCT
+    else:
+        (tok_lo, tok_hi), by_role, rate = DEFAULT_STEP_TOKENS, {}, DEFAULT_TOKENS_PER_PCT
+    secs = [s["seconds"] for s in steps if s.get("seconds") is not None and s["seconds"] >= 0]
+    min_lo, min_hi = (x / 60 for x in typical_range(secs)) if secs else DEFAULT_STEP_MINUTES
+    tokens_low, tokens_high = int(round(tok_lo * steps_left)), int(round(tok_hi * steps_left))
+    pct_low, pct_high = round(tokens_low / rate, 4), round(tokens_high / rate, 4)
+    week, session = estimate_week(cfg)
+    stop_at, _ = week_settings(cfg)
+    if week["pct"] is None:
+        fits = "unknown"
+    elif round(week["pct"] + pct_high, 6) <= stop_at:
+        fits = "yes"
+    elif round(week["pct"] + pct_low, 6) > stop_at:
+        fits = "no"
+    else:
+        fits = "maybe"
+    return {"target": target, "steps_left": steps_left, "pct_low": pct_low, "pct_high": pct_high,
+            "tokens_low": tokens_low, "tokens_high": tokens_high,
+            "minutes_low": int(round(min_lo * steps_left)), "minutes_high": int(round(min_hi * steps_left)),
+            "tokens_by_role": by_role, "based_on": {"project": len(mine), "other_projects": len(others)},
+            "source": source, "tokens_per_pct": rate, "week": week, "session": session, "stop_at": stop_at,
+            "fits": fits, "plan_milestones": ids, "problem": problem}
+
+
+def range_text(low, high):
+    """'3 to 5', '0.06 to 0.12': as few decimals as make the two differ and keep a non-zero low above 0."""
+    for d in range(0, 4):
+        a, b = round(low, d), round(high, d)
+        if a != b and (a > 0 or low <= 0):
+            return f"{a:.{d}f} to {b:.{d}f}"
+    return f"{round(high, 3):g}"
+
+
+def minutes_text(low, high):
+    """'40 to 80 minutes', '1 to 2 hours', '30 minutes to 2.5 hours'."""
+    def hours(m):
+        return f"{round(m / 30) / 2:g}"
+    if high < 90:
+        return f"{low} minutes" if low == high else f"{low} to {high} minutes"
+    if low < 60:
+        return f"{low} minutes to {hours(high)} hours"
+    return f"{hours(low)} hours" if hours(low) == hours(high) else f"{hours(low)} to {hours(high)} hours"
+
+
+def format_estimate(est):
+    """The text `regista.py estimate` prints: the cost first, in plain sentences a person reads on a phone."""
+    try:
+        return estimate_text(est)
+    except Exception:  # noqa: BLE001
+        return "The estimate couldn't be worked out from the usage records."
+
+
+def estimate_text(est):
+    n, target = est["steps_left"], est["target"]
+    what = "the whole plan" if target == "all" else target
+    out = []
+    if est.get("problem") and not n:
+        out.append(est["problem"])
+    elif not n:
+        out.append(f"{what[0].upper() + what[1:]} has no steps left to build.")
+    else:
+        cost = range_text(est["pct_low"], est["pct_high"]) + "%"
+        out.append(f"Building {what} ({n} step{'s' if n != 1 else ''} left) should take about {cost} of your week.")
+    week, stop = est["week"], est["stop_at"]
+    if week.get("pct") is not None:
+        used = week["pct"]
+        when = f" The week resets {local_time_text(week['resets_at'])}." if week.get("resets_at") else ""
+        left = max(0.0, stop - used)
+        out.append(f"You have used {pct_text(used)} of this week's limit. {DISPLAY_NAME} stops a build-all run at "
+                   f"{pct_text(stop)}, so {pct_text(left)} is left before it stops.{when}")
+        if n:
+            top, bottom = (pct_text(round(used + est[k], 1)) for k in ("pct_high", "pct_low"))
+            out.append({"yes": f"It fits: even at the high end you would be at about {top}.",
+                        "maybe": f"It may not fit: at the high end you would reach about {top}, past the "
+                                 f"stop at {pct_text(stop)}. If it gets there, {DISPLAY_NAME} finishes the step it's "
+                                 "on, saves and stops the run.",
+                        "no": f"It doesn't fit: even at the low end you would reach about {bottom}, past "
+                              f"the stop at {pct_text(stop)}. Build part of it now, or wait for the reset."
+                        }[est["fits"]])
+        session = est.get("session") or {}
+        if session.get("pct") is not None:
+            resets = f", resets {local_time_text(session['resets_at'])}" if session.get("resets_at") else ""
+            out.append(f"The current 5-hour session window is at {pct_text(session['pct'])}{resets}.")
+    else:
+        why = f" ({week['reason']})" if week.get("reason") else ""
+        out.append(f"Your current weekly usage is unknown{why}, so whether it fits is unknown too.")
+    if n:
+        out.append(f"It should take roughly {minutes_text(est['minutes_low'], est['minutes_high'])}.")
+        roles = [f"{role} {tokens_text(t, '')}" for role, t in
+                 sorted(est["tokens_by_role"].items(), key=lambda x: -x[1]) if t]
+        tok = (f"That is about {est['tokens_low'] / 1e6:.1f} to {est['tokens_high'] / 1e6:.1f} million tokens for "
+               f"the agents")
+        out.append(tok + ("; a typical step: " + ", ".join(roles) + "." if roles else "."))
+    mine, others = est["based_on"]["project"], est["based_on"]["other_projects"]
+    if not n:
+        pass
+    elif est["source"] == "default":
+        out.append("There are no usage records of past steps yet, so these figures are a rough default "
+                   f"({DEFAULT_STEP_TOKENS[0] / 1e6:g} to {DEFAULT_STEP_TOKENS[1] / 1e6:g} million tokens a step, "
+                   f"about {DEFAULT_TOKENS_PER_PCT / 1e6:g} million tokens per 1% of the week).")
+    else:
+        here = f"{mine} past step{'s' if mine != 1 else ''} in this project"
+        there = f"{others} past step{'s' if others != 1 else ''} in other projects on this machine"
+        rests = here + (f" and {there}" if others and mine else "") if mine else there
+        out.append(f"The estimate rests on {rests}." + (" With so few, it's rough."
+                                                         if mine + others < ESTIMATE_MIN_STEPS else ""))
+    return "\n".join(out)
 
 
 # --- roles ----------------------------------------------------------------------------------
@@ -7732,6 +8035,9 @@ def commit_check(root, cfg, data=None):
         record_requirements(root, cfg, results)
     HOOK_CTX.setdefault("notes", []).extend(tick_committed_steps(root, cfg, files))
     quietly(record_step, None, root, cfg, data or HOOK_CTX.get("data") or {})
+    week = quietly(week_note, "", root, cfg)
+    if week:
+        HOOK_CTX.setdefault("notes", []).append(week)
     loose = config_loosened(root, cfg) + tests_removed(root, cfg)
     if loose:
         ask(f"{DISPLAY_NAME}: this commit loosens the harness's checks compared with the last commit: " + "; ".join(loose)
@@ -9925,6 +10231,10 @@ def main():
     us.add_argument("milestone", nargs="?", help="(report) only this milestone, e.g. M1")
     us.add_argument("--json", action="store_true", help="the reading (or the report) as one JSON object")
     us.add_argument("--fresh", action="store_true", help="ask the usage server, not the 60-second cache")
+    es = sub.add_parser("estimate", help="what building a milestone (or `all`) should cost in %% of the weekly limit, "
+                                         "whether it fits before the stop, and roughly how long it takes")
+    es.add_argument("target", nargs="?", help="a milestone (M2) or `all`; by default the next milestone")
+    es.add_argument("--json", action="store_true", help="the estimate as one JSON object")
     cx = sub.add_parser("context")
     cx.add_argument("transcript")
     rf = sub.add_parser("refusals", help="what the hooks refused, newest first; `refusals label <n> real|false_alarm "
@@ -9976,6 +10286,17 @@ def main():
             return
         reading = read_usage(cfg, fresh=a.fresh)
         print(json.dumps(reading, ensure_ascii=False) if a.json else format_usage(reading))
+        return
+    if a.cmd == "estimate":  # works without a project or a plan too; always exits 0
+        root, cfg = None, {}
+        try:
+            root = find_root()
+            cfg = load_config(root) if root else {}
+        except Exception:  # noqa: BLE001 (an unreadable config: the defaults)
+            raw = load_json(harness_path(root, "config.json"), {}) if root else {}
+            cfg = raw if isinstance(raw, dict) else {}
+        est = usage_estimate(root or "", cfg, target=a.target)
+        print(json.dumps(est, ensure_ascii=False) if a.json else format_estimate(est))
         return
     if a.cmd == "context":
         root = find_root()
