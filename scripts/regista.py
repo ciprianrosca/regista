@@ -1210,6 +1210,22 @@ def speed_words(cmd):
     return out
 
 
+TEST_PATH = re.compile(r"^[\w./*-]*test[\w./*-]*\.(py|js|mjs|ts)(::[\w\[\].:,=-]+)?$")
+
+
+def only_more_tests(a, b):
+    """Is command b command a with only test files or test ids added (`tests/test_x.py`,
+    `tests/test_x.py::test_y`), every word of a kept in order? Adding tests makes a gate check more
+    (Ciprian, 12 November 2026: adding 17 files to the slow gate asked him twice)."""
+    k = 0
+    for w in b:
+        if k < len(a) and w == a[k]:
+            k += 1
+        elif not TEST_PATH.match(w):
+            return False
+    return k == len(a)
+
+
 def gate_change_loosens(old, new):
     """What a change to one gate loosens, [] when it only makes the gate faster or stricter, or None when that
     can't be told (a new command, other than speed flags; a long check's start or status; anything unknown).
@@ -1223,7 +1239,7 @@ def gate_change_loosens(old, new):
         return None
     if old.get("run") != new.get("run"):
         a, b = speed_words(old.get("run") or ""), speed_words(new.get("run") or "")
-        if a is None or b is None or a != b:
+        if a is None or b is None or not only_more_tests(a, b):
             return None
     if old.get("evidence") != new.get("evidence"):
         return None

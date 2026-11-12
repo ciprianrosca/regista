@@ -1185,7 +1185,15 @@ class GateRuns(unittest.TestCase):
         g["metrics"]["errors"]["max"] = 2
         regista.save_json(cfgfile, c)
         self.assertIsNone(decision(self.commit()))  # faster, and one metric stricter
+        sh(self.p.root, "git", "add", "-A")
+        sh(self.p.root, "git", "commit", "-q", "-m", "faster")
+        g["run"] += " tests/test_more.py tests/test_other.py::test_x"
+        regista.save_json(cfgfile, c)
+        self.assertIsNone(decision(self.commit()))  # more test files: it checks more
+        sh(self.p.root, "git", "add", "-A")
+        sh(self.p.root, "git", "commit", "-q", "-m", "more tests")
         for weaker, said in (({"run": f"nice -n 5 {P} -q -m 'not slow and not ui' -n 4"}, "was changed"),
+                             ({"run": g["run"].replace(" tests/test_more.py", "")}, "was changed"),
                              ({"metrics": {"errors": {"better": "lower", "max": 5}}}, "allows more"),
                              ({"metrics": {}}, "no longer checked"),
                              ({"when_changed": ["src/**"]}, "fewer changed files"),
@@ -1197,6 +1205,7 @@ class GateRuns(unittest.TestCase):
             self.assertEqual(decision(out), "ask", weaker)
             self.assertIn(said, out["hookSpecificOutput"]["permissionDecisionReason"])
         c["speedups_without_asking"] = False
+        c["gates"][0]["run"] += " tests/test_third.py"
         regista.save_json(cfgfile, c)
         self.assertEqual(decision(self.commit()), "ask")  # without the setting, any change to a gate asks
 
