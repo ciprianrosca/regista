@@ -1038,6 +1038,12 @@ def detached_collect(root, cfg, names=None, accept=False, budget=None):
         m = ", ".join(f"{k}={v}" for k, v in metrics.items())
         lines.append(f"- {r['gate']} on {r['sha'][:7]}: {'PASSED' if not fails else 'FAILED'}" + (f" ({m})" if m else "")
                      + "".join(f"\n    · {x}" for x in fails))
+        if fails and r.get("deployed") and "rollback_to" in r and not r.get("rolled_back"):
+            live = load_json(deployed_path(root), {})
+            if (live.get("tag") or live.get("commit")) == r["deployed"]:  # still what's live: put the last good one back
+                lines += ["  " + x for x in rollback(root, cfg, r["rollback_to"],
+                                                     f"the long check {r['gate']} failed on {r['deployed']}")]
+                r["rolled_back"] = now_iso()
         if not fails and accept and metrics:
             baseline[r["gate"]] = {"metrics": metrics, "date": r["collected"], "commit": r["sha"][:7]}
             save_json(baseline_path(root), baseline)
@@ -2266,6 +2272,9 @@ def release(root, cfg, level=None, check=False, push=True):
             [f"- {x}" for x in plan["problems"]]
     kind = ("the first release" if plan["level"] == "first" else f"a {plan['level']} release after {prev}")
     gates = release_gates(root, cfg, plan)
+    deploys = bool(rs["deploy"] and (cfg.get("deploy") or {}).get("run"))
+    after_gates = [g for g in gates if g.get("after_deploy") and not g.get("_skip")] if deploys else []
+    gates = [g for g in gates if g not in after_gates]  # those run once the release is live, and roll it back if they fail
     ignore = [f for f, _, _ in plan["bump"]] + ([cl] if cl else [])  # the release's own edits don't void a long check
     longs = [detached_result(root, cfg, g, ignore) for g in gates if detached(g) and not g.get("_skip")]
     if check:
@@ -2274,6 +2283,9 @@ def release(root, cfg, level=None, check=False, push=True):
             lines.append(f"- It sets the version to {new} in {', '.join(f for f, _, _ in plan['bump'])}.")
         lines.append("- The gates run first: " + (", ".join(g["name"] for g in gates if not detached(g) and not g.get("_skip"))
                                                   or "none") + " (a run that passed on exactly these files counts).")
+        if after_gates:
+            lines.append("- Once it's live: " + ", ".join(g["name"] for g in after_gates) + "; if one fails, the previous "
+                         "release goes back live.")
         lines += [f"- {r['name']}: " + ("its pass holds for this code." if r["status"] == "pass" else r["fails"][0])
                   for r in longs]
         commits = plan["bump"] or (cl and cl in changed_files(root))
@@ -2369,10 +2381,65 @@ def release(root, cfg, level=None, check=False, push=True):
                     code, out = 1, str(e)
                 lines.append(f"- Published the release page on GitHub from the changelog's {new} section." if code == 0
                              else f"- The GitHub release page failed ({out.strip()[-300:]}). Create it with: {later[1]}.")
-    if rs["deploy"] and (cfg.get("deploy") or {}).get("run"):
+    if deploys:
+        before = load_json(deployed_path(root), {})
         ok, dlines = deploy(root, cfg)
         lines += ["", *dlines]
+        if ok and after_gates:
+            ok2, alines = after_deploy_checks(root, cfg, after_gates, before, tag)
+            lines += ["", *alines]
+            ok = ok and ok2
         return ok, lines
+    return True, lines
+
+
+def live_ref(rec):
+    """The release or commit a deploy record put live, or "" when it wasn't a good deploy."""
+    return (rec.get("tag") or rec.get("commit") or "") if rec.get("ok") else ""
+
+
+def rollback(root, cfg, to, why):
+    """Put release `to` back live with the project's deploy command, record it and say so. Returns lines."""
+    d = cfg.get("deploy") or {}
+    if not to:
+        return [f"- {why}, but there's no earlier good deploy to go back to: the new release stays live. Fix it now."]
+    code, out = run_shell(fill(d["run"], ref=to), root, d.get("timeout", 1200),
+                          env={**os.environ, ENV_PREFIX + "DEPLOY_REF": to})
+    rec = load_json(deployed_path(root), {})
+    if code == 0:
+        rec = {"commit": git(root, "rev-parse", "--short", to + "^{commit}") or to, "tag": to, "ok": True,
+               "at": dt.datetime.now().isoformat(timespec="seconds"), "rolled_back": {"from": rec.get("tag") or
+                                                                                   rec.get("commit"), "why": why}}
+        save_json(deployed_path(root), rec)
+        note = commit_records(root, [harness_rel("gates", "deployed.json", root=root)], f"Roll back to {to}: {why}")
+        return [f"- {why}, so {to} is live again (rolled back)."] + ([note] if note else [])
+    return [f"- {why}, and putting {to} back live FAILED (exit {code}): the new release is still live. Fix it now.",
+            "\n".join(out.strip().splitlines()[-15:])]
+
+
+def after_deploy_checks(root, cfg, gates, before, tag):
+    """The release's gates marked "after_deploy": the ones that run here run now, and a failure puts the previous
+    release back live; long checks start on the release, and the one that fails rolls it back when it's
+    collected. Returns (ok, lines)."""
+    lines, to = [], live_ref(before)
+    here = [g for g in gates if not detached(g)]
+    if here:
+        results = run_gates(root, cfg, here)
+        lines.append("Checks after the deploy:\n" + format_results(results))
+        failed = [r for r in results if r["status"] == "fail"]
+        if failed:
+            lines += rollback(root, cfg, to, f"{', '.join(r['name'] for r in failed)} failed on {tag}")
+            return False, lines
+    for g in [g for g in gates if detached(g)]:
+        ok, out = detached_start(root, cfg, g, ref=tag or "HEAD")
+        lines += out
+        runs = detached_runs(root)
+        sha = git(root, "rev-parse", (tag or "HEAD") + "^{commit}")
+        mine = [r for r in runs if r.get("gate") == g["name"] and r.get("sha") == sha and r.get("state") == "running"]
+        if ok and mine:
+            mine[-1].update(deployed=tag or sha[:7], rollback_to=to)
+            save_detached_runs(root, runs)
+            lines.append(f"  If it fails, {to or 'nothing (no earlier good deploy)'} goes back live.")
     return True, lines
 
 

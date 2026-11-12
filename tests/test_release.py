@@ -392,6 +392,51 @@ class Releases(unittest.TestCase):
         self.assertEqual(r.returncode, 1)
         self.assertIn("rulers: FAIL", r.stdout)
 
+    def test_checks_after_the_deploy_roll_a_failing_release_back(self):
+        # Klotho, 12 November 2026: the heavy tests and the long real-photo checks held the test server's new release
+        # back by about an hour. Marked "after_deploy", they run once it's live, and a failure puts the last good
+        # release back.
+        status, flag = os.path.join(self.box, "status"), os.path.join(self.box, "heavy-fails")
+        set_config(self.p, gates=[{"name": "tests", "run": "echo ok"},
+                                  {"name": "heavy", "run": f"test ! -f {flag}", "when": ["release"],
+                                   "after_deploy": True},
+                                  {"name": "real", "kind": "detached", "when": ["release"], "after_deploy": True,
+                                   "start": f"echo running > {status}", "status": f"cat {status}"}])
+        self.changelog("0.5.3")
+        r = cli(self.p, "release", env=self.env)  # nothing to wait for before the deploy
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(text(self.deployed).strip(), "v0.5.3")
+        self.assertIn("heavy: PASS", r.stdout)
+        self.assertIn("Started the long check 'real'", r.stdout)
+        with open(status, "w") as f:
+            f.write("pass")
+        cli(self.p, "gate", "--collect")
+        self.assertEqual(text(self.deployed).strip(), "v0.5.3")
+        # a release whose heavy tests fail after the deploy: the last good one goes back live
+        open(flag, "w").close()
+        self.p.commit("src/b.py", "y = 1\n")
+        self.changelog("0.5.4")
+        r = cli(self.p, "release", env=self.env)
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("heavy failed on v0.5.4, so v0.5.3 is live again", r.stdout)
+        self.assertEqual(text(self.deployed).strip(), "v0.5.3")
+        self.assertIn("Live: v0.5.3", cli(self.p, "status").stdout)
+        # a release whose long check fails once it's collected: rolled back then, once
+        os.remove(flag)
+        self.p.commit("src/c.py", "z = 1\n")
+        self.changelog("0.5.5")
+        with open(status, "w") as f:
+            f.write("running")
+        r = cli(self.p, "release", env=self.env)
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertEqual(text(self.deployed).strip(), "v0.5.5")
+        with open(status, "w") as f:
+            f.write("fail")
+        out = cli(self.p, "gate", "--collect").stdout
+        self.assertIn("the long check real failed on v0.5.5, so v0.5.3 is live again", out)
+        self.assertEqual(text(self.deployed).strip(), "v0.5.3")
+        self.assertNotIn("live again", cli(self.p, "gate", "--collect").stdout)
+
     def test_release_waits_for_a_long_check_on_this_code(self):
         status = os.path.join(self.box, "status")
         set_config(self.p, gates=[{"name": "real", "kind": "detached", "when": ["release"],

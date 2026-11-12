@@ -593,6 +593,11 @@ The same `regista.py` runs Codex's hooks with `--host codex` (`hooks/codex-hooks
   current commit that passes and is as good or better on every number becomes the new baseline, without
   `--accept`. A number that improved by less than its tolerance keeps its old value, so a lucky run doesn't
   tighten the gate; a run that is worse on any number moves nothing.
+- **Checks after the deploy.** `"after_deploy": true` on a release gate: the release goes live without waiting
+  for it. A gate that runs here runs right after the deploy, and a long check starts on the release; when one
+  fails, the last good release goes back live with the project's deploy command (once, and only while the
+  failing release is still the one live). Use it for slow checks of a test server that people can live without
+  for an hour, never for a production site whose users would see the failure.
 - **Speed-ups without asking.** With `"speedups_without_asking": true` (switching it on needs the user's
   OK), a change to a gate goes through without asking when it only makes the gate faster or stricter: a new
   timeout or budget, more events or paths that start it, more test files, tighter metrics, and in its
