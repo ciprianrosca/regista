@@ -98,6 +98,7 @@ In a project's repo root (in Codex, `$regista:<name>` instead of `/regista:<name
 /regista:build M2      keep going until milestone 2's gate passes or a step is blocked
 /regista:build all     build every milestone in the plan, one after another; stop only for what needs you
 /regista:oversee       the same with parallel workers: this session oversees, workers build side by side
+/regista:ff <name> <what>   build a feature fast on its own branch and try it, before it goes near main
 /regista:try           what to try yourself, step by step (you record it with /regista:verify)
 /regista:verify UI-3 ok    record a check only you can make (or: fail <what happened>; all ok; M3 ok)
 /regista:change <what you want>   change what gets built, at any time, also during a run
@@ -353,35 +354,45 @@ do what they say. In a project Claude Code hasn't opened before, the first worke
 Code's "do you trust this folder" question; `regista.py fleet spawn` says so, and you answer it once with
 `tmux attach -t <session>`.
 
-### Prototypes: fast-forward workers
+### Fast-forward: a feature on a branch, to try it out
 
-The full process (test writer, builder, reviewer, every gate on every commit) is right for code that ships, and
-slow for an idea you want to see working today. A fast-forward worker is a prototype on its own branch, built with
-the light rules:
+The full process (test writer, builder, reviewer, every gate on every commit) is right for code that goes into
+the project, and slow for an idea you want to try today. A fast-forward branch builds the idea on `ff/<name>`, in
+its own folder, with the light rules, and the project's main branch isn't touched until you say so. In any
+session, type `/regista:ff <name> <what to build>`, or run the commands yourself:
 
 ```
-regista.py fleet spawn round-button --fast --task "try a round capture button with a live level"
+regista.py ff start round-button --task "a round capture button"   # the branch and its folder; cd there
+regista.py ff try                                                  # run it as a separate copy, with a link
+regista.py ff land                                                 # keep it: one change, under the full rules
+regista.py ff merge round-button                                   # into the project, gates on the merged code
+regista.py ff drop round-button                                    # or throw it away
+regista.py ff list
 ```
 
-- **In the prototype**, the worker's session edits the code itself: no test writer, builder or reviewer, no
-  requirement specs, no handoffs. A commit runs only the gates named in `fast_forward.gates`, which is empty
-  by default, so no tests run at all. A project can name a check that takes seconds, like its linter.
-  Nothing a prototype commits counts as passing a requirement. The worker keeps a short `PROTOTYPE.md` that
-  says what it faked or left out.
-- **Looking at it**: `regista.py preview` (in the prototype's worktree) or `regista.py fleet preview <name>`
-  (from the overseer) runs the project's `fast_forward.preview.run` command in that worktree, with `{name}`,
-  `{slot}`, `{ref}` and `{worktree}` filled in: a second copy of the app on its own port, say. It serves the
-  worktree as it is, so it doesn't wait for a commit. No tests run.
-- **It never ships as it is**: in a prototype, `deploy` and `release` refuse, `fleet merge` refuses, and a
-  `git merge`, `cherry-pick`, `rebase` or `pull` of its branch is refused anywhere else.
-- **Landing**: when you like it, `regista.py fleet land <name>` starts a normal worker, `<name>-land`, from the
-  project's current code with the prototype's whole change uncommitted in its worktree. That worker takes it
-  through the full process (specs, tests, review, every gate) and merges like any other.
-  Afterwards `fleet remove <name> --force` deletes the prototype's branch.
+- **On the branch** the session edits the code itself: no test writer, builder or reviewer, no requirement
+  specs, no handoffs and no save reminders. A commit runs only the gates named in `fast_forward.gates`, empty by
+  default, so no tests run at all; a project can name a check that takes seconds, like its linter. Nothing a
+  fast-forward branch commits counts as passing a requirement. The session keeps a short `PROTOTYPE.md` that says
+  what it faked or left out. The branch's folder is `.regista/worktrees/ff-<name>`, a git worktree.
+- **Trying it**: `ff try` runs the project's `fast_forward.preview.run` command in the branch's folder, with
+  `{name}`, `{slot}` (11, 12, … one per branch), `{ref}` and `{worktree}` filled in: a second copy of the app on
+  its own port, say. It serves the folder as it is, so it doesn't wait for a commit, and runs no tests.
+  `fast_forward.preview.stop` (with `{name}`) stops it when the branch is merged or dropped.
+- **It never ships as it is**: on a fast-forward branch `deploy` and `release` refuse, and a `git merge`,
+  `cherry-pick`, `rebase` or `pull` of `ff/<name>` is refused anywhere else.
+- **Keeping it**: `ff land` (in the branch's folder) turns the branch into one uncommitted change on
+  `land/<name>`, from the project's current code, in the same folder. The full rules apply again: specs, tests,
+  review, every gate. When it's committed, `ff merge <name>` from the project folder merges it like a worker's
+  branch (the commit gates run on the merged code) and clears the folder and both branches.
 
 ```json
-"fast_forward": {"gates": ["lint"], "preview": {"run": "scripts/preview.sh {worktree} {slot}", "timeout": 900}}
+"fast_forward": {"gates": ["lint"], "preview": {"run": "sh scripts/preview.sh {worktree} {slot} {name}",
+                                                 "stop": "sh scripts/preview.sh stop {name}", "timeout": 300}}
 ```
+
+The overseer can also start a fast-forward branch as a worker session of its own:
+`regista.py fleet spawn <name> --fast --task "…"`, with `fleet preview <name>` and `fleet land <name>`.
 
 ### Context budget
 

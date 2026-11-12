@@ -1874,7 +1874,7 @@ def deploy(root, cfg):
     """Deploy HEAD and check the live result. Returns (ok, lines)."""
     if fast_mode(root):
         return False, [f"{DISPLAY_NAME}: this is a prototype (a fast-forward worker), so it doesn't deploy. "
-                       f"`{PY} \"{DD}\" preview` shows it; the overseer's `fleet land` brings it in for a real release."]
+                       f"`{PY} \"{DD}\" ff try` shows it; `{PY} \"{DD}\" ff land` brings it in for a real release."]
     d = cfg.get("deploy") or {}
     if not d.get("run"):
         return False, ["No deploy configured: add \"deploy\": {\"run\": \"<your deploy command>\"} to "
@@ -2274,7 +2274,7 @@ def release(root, cfg, level=None, check=False, push=True):
     """Make a release. Returns (ok, lines), in plain language."""
     if fast_mode(root):
         return False, [f"{DISPLAY_NAME}: this is a prototype (a fast-forward worker), so it doesn't release. "
-                       f"`{PY} \"{DD}\" preview` shows it; the overseer's `fleet land` brings it in for a real release."]
+                       f"`{PY} \"{DD}\" ff try` shows it; `{PY} \"{DD}\" ff land` brings it in for a real release."]
     rs = release_settings(cfg)
     plan = release_plan(root, cfg, level)
     if worker_info(root):
@@ -2910,7 +2910,7 @@ def worker_file(root):
 def fleet_local(root, folder=None):
     """What stays out of git: the worktrees, the fleet's records and a worktree's worker.json (in `folder`,
     by default the harness folder the project at `root` uses)."""
-    return [f"{folder or harness_dir(root)}/{x}" for x in ("worktrees/", "fleet/", "worker.json")]
+    return [f"{folder or harness_dir(root)}/{x}" for x in ("worktrees/", "fleet/", "worker.json", "ff.json")]
 
 
 def exclude_block(lines):
@@ -2927,9 +2927,23 @@ def worker_info(root):
     return load_json(worker_file(root), {}) if root else {}
 
 
+FF_BRANCH = "ff/"      # fast-forward branches: ff/<name>, each in its own worktree
+LAND_BRANCH = "land/"  # a fast-forward branch on its way into the project, under the full rules
+
+
+def ff_file(root):
+    return harness_path(root, "ff.json")
+
+
+def ff_info(root):
+    """This worktree's fast-forward record (written by `ff start`), or {}."""
+    return load_json(ff_file(root), {}) if root else {}
+
+
 def fast_mode(root):
-    """True in a fast-forward worker's worktree: a prototype, built with the light rules."""
-    return bool(worker_info(root).get("fast"))
+    """True on a fast-forward branch (or in a fast-forward worker's worktree): a prototype, built with the light
+    rules."""
+    return bool(worker_info(root).get("fast") or ff_info(root).get("name"))
 
 
 def prototype_gates(root, cfg, gates):
@@ -2943,8 +2957,10 @@ def prototype_gates(root, cfg, gates):
 
 def fast_branches(root):
     """The branches of the project's fast-forward workers (prototypes), which only `fleet land` brings in."""
-    home = overseer_root(root) or root
-    return [w["branch"] for w in load_workers(home).values() if w.get("fast") and w.get("branch")]
+    home = overseer_root(root) or ff_info(root).get("project_root") or root
+    ff = git(home, "for-each-ref", "--format=%(refname:short)", f"refs/heads/{FF_BRANCH}").splitlines()
+    return [w["branch"] for w in load_workers(home).values() if w.get("fast") and w.get("branch")] + \
+        [b.strip() for b in ff if b.strip()]
 
 
 def overseer_root(root):
@@ -3879,15 +3895,17 @@ def fleet_land(root, cfg, name, force=False):
 
 def preview(root, cfg, name=""):
     """Run the project's preview command for a prototype: in its worktree, or the named worker's. Returns (ok, lines)."""
-    if name:
+    if name and not ff_info(root):
         w = load_workers(root).get(name)
-        if not w or w.get("state") == "removed":
-            return False, [f"There's no worker {name}. `regista.py fleet` lists them."]
-        root = p(root, w["worktree"])
+        wt = p(root, w["worktree"]) if w and w.get("state") != "removed" else ff_dir(root, name)
+        if not os.path.isdir(wt):
+            return False, [f"There's no fast-forward branch or worker called {name}. `regista.py ff list` lists the "
+                           "branches."]
+        root = wt
         cfg = load_config(root)
-    w = worker_info(root)
-    if not w.get("fast"):
-        return False, [f"{DISPLAY_NAME}: previews are for prototypes (fast-forward workers). Real code reaches the "
+    w = ff_info(root) or worker_info(root)
+    if not fast_mode(root):
+        return False, [f"{DISPLAY_NAME}: previews are for fast-forward branches (prototypes). Real code reaches the "
                        f"test server through a release and `{PY} \"{DD}\" deploy`."]
     pv = cfg["fast_forward"].get("preview") or {}
     if not pv.get("run"):
@@ -3903,6 +3921,173 @@ def preview(root, cfg, name=""):
                                                             else "") + "): " + ("ready" if code == 0 else
                                                                                 f"FAILED (exit {code})")
                        + f" in {secs} s.", tail]
+
+
+def ff_dir(root, name):
+    return p(root, harness_rel("worktrees", f"ff-{slugify(name)}", root=root))
+
+
+def ff_rules(root, cfg, info):
+    """What a session on a fast-forward branch needs to know."""
+    gates = cfg["fast_forward"].get("gates") or []
+    quick = ", ".join(gates) if gates else "no gate (no tests at all)"
+    show = (f"`{PY} \"{DD}\" ff try` runs it as a separate copy the user can open (it serves this folder as it is, "
+            "no commit needed)" if (cfg["fast_forward"].get("preview") or {}).get("run") else
+            "this project has no preview command yet (fast_forward.preview.run in the config): tell the user how to "
+            "try it")
+    return (f"{DISPLAY_NAME}: this is the fast-forward branch {info['branch']} (\"{info['name']}\"): a feature built "
+            f"fast so the user can try it, away from the project's main branch. The task: {info.get('task') or 'ask the user'}.\n"
+            f"Work in {info.get('worktree') or root}, and nowhere else:\n"
+            "- Speed over polish. Edit the code yourself: no test writer, builder or reviewer agents, no requirement "
+            f"specs, no handoffs. Commits run only {quick}; nothing committed here counts as passing a requirement.\n"
+            f"- Get something the user can try as early as possible, then improve it in small steps. {show}.\n"
+            "- Keep it honest: write what's faked, hard-coded or left out in PROTOTYPE.md at the root of this folder.\n"
+            "- Never push, deploy, release, or merge this branch into the project. When the user wants to keep it, "
+            f"`{PY} \"{DD}\" ff land` (here) turns it into one change on a branch of its own, under the full rules: "
+            f"specs, tests, review, every gate. Then `ff merge {info['name']}` from the project folder brings it in. "
+            f"To throw it away: `ff drop {info['name']}` from the project folder.")
+
+
+def ff_start(root, cfg, name, task=""):
+    """A fast-forward branch: ff/<name> in its own worktree, with the light rules. Returns (ok, lines)."""
+    if worker_info(root) or ff_info(root):
+        return False, ["Start a fast-forward branch from the project folder, not from a worker's or another branch's "
+                       "worktree."]
+    name = slugify(name)
+    if not name:
+        return False, ["Name the branch: `regista.py ff start <name> --task \"what to build\"`."]
+    branch, wt = FF_BRANCH + name, ff_dir(root, name)
+    if os.path.exists(wt) or git(root, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"):
+        return False, [f"There's already a fast-forward branch called {name}. Carry on in it (`cd {wt}`), or "
+                       f"`regista.py ff drop {name}` first."]
+    exclude_local(root)
+    code, out = call(["git", "-C", root, "worktree", "add", "-q", "-b", branch, wt, "HEAD"])
+    if code:
+        return False, [f"git couldn't make the worktree: {out.strip()[-300:]}"]
+    for f in cfg["fleet"].get("copy") or []:
+        if os.path.isfile(p(root, f)) and not os.path.exists(p(wt, f)):
+            os.makedirs(os.path.dirname(p(wt, f)), exist_ok=True)
+            shutil.copy2(p(root, f), p(wt, f))
+    base = os.path.dirname(wt)
+    used = {ff_info(os.path.join(base, d)).get("slot") for d in os.listdir(base) if d.startswith("ff-")}
+    info = {"name": name, "task": task, "branch": branch, "worktree": wt, "project_root": root,
+            "slot": next(k for k in range(11, 1000) if k not in used), "base": git(root, "rev-parse", "HEAD"),
+            "started": now_iso()}
+    save_json(ff_file(wt), info)
+    setup = cfg["fleet"].get("setup")
+    if setup:
+        code, out = run_shell(setup, wt, 1800)
+        if code:
+            call(["git", "-C", root, "worktree", "remove", "--force", wt])
+            call(["git", "-C", root, "branch", "-D", branch])
+            return False, [f"The setup command (`{setup}`) failed in the new worktree, so nothing was started:",
+                           out.strip()[-800:]]
+    return True, [f"Started the fast-forward branch {branch}, from the project's current code, in {wt}.",
+                  f"Move this session there before you change anything: `cd {wt}`. The project folder keeps its "
+                  "full rules.", "", ff_rules(wt, cfg, info)]
+
+
+def ff_land(root, cfg, name=""):
+    """Turn a fast-forward branch into one uncommitted change on land/<name>, from the project's current code, in
+    the same worktree, under the full rules. Returns (ok, lines)."""
+    wt = root if ff_info(root) else ff_dir(root, name) if name else ""
+    info = ff_info(wt) if wt else {}
+    if not info:
+        return False, ["Run `regista.py ff land` in the fast-forward branch's folder, or `ff land <name>` from the "
+                       "project folder."]
+    if uncommitted_work(wt, cfg):
+        return False, ["Commit what's on the branch first (`git add -A && git commit`): landing takes the branch's "
+                       "commits."]
+    home = info["project_root"]
+    head = git(home, "rev-parse", "HEAD")
+    if git(wt, "rev-list", "--count", f"{head}..HEAD") in ("", "0"):
+        return False, [f"{info['branch']} has nothing the project doesn't have yet."]
+    land = LAND_BRANCH + info["name"]
+    code, out = call(["git", "-C", wt, "checkout", "-q", "-b", land, head])
+    if code:
+        return False, [f"git couldn't start {land}: {out.strip()[-300:]}"]
+    code, out = call(["git", "-C", wt, "merge", "--squash", info["branch"]])
+    if code:
+        call(["git", "-C", wt, "reset", "-q", "--hard"])
+        call(["git", "-C", wt, "checkout", "-q", info["branch"]])
+        call(["git", "-C", wt, "branch", "-D", land])
+        return False, [f"The branch's change doesn't apply cleanly to the project as it is now, so nothing changed. "
+                       f"Bring the project's work in first (`git merge {git(home, 'rev-parse', '--abbrev-ref', 'HEAD')}` "
+                       f"here), settle the conflicts, commit, and land again. Git said: {out.strip()[-400:]}"]
+    os.remove(ff_file(wt))
+    notes = (" Read PROTOTYPE.md first (what was faked or left out), then delete it." if
+             os.path.isfile(p(wt, "PROTOTYPE.md")) else "")
+    return True, [f"{info['branch']} is now one uncommitted change on {land}, from the project's current code, in the "
+                  f"same folder ({wt}). The full rules apply here again: the requirements as a spec, the test writer, "
+                  f"the builder, the review, and every commit gate.{notes} Drop what was only there for the demo.",
+                  f"When it's committed, bring it into the project from the project folder: `{PY} \"{DD}\" ff merge "
+                  f"{info['name']}` (the commit gates run on the merged code)."]
+
+
+def ff_merge(root, cfg, name, wait=None):
+    """Merge a landed branch (land/<name>) into the project like a worker's, then clear its worktree and branches."""
+    if worker_info(root) or ff_info(root):
+        return False, ["Merge from the project folder."]
+    name = slugify(name)
+    land, wt = LAND_BRANCH + name, ff_dir(root, name)
+    if not git(root, "rev-parse", "--verify", "--quiet", f"refs/heads/{land}"):
+        return False, [f"There's no {land}: land the branch first (`regista.py ff land {name}`), and commit it under "
+                       "the full rules."]
+    key = f"ff-{name}"
+    workers = load_workers(root)
+    workers[key] = {"milestone": "", "title": "", "task": f"the fast-forward branch {name}", "branch": land,
+                    "worktree": os.path.relpath(wt, root).replace("\\", "/"), "state": "landing", "how": "none",
+                    "session_name": key, "slot": 0}
+    save_workers(root, workers)
+    ok, lines = fleet_merge(root, cfg, key, wait=0)
+    if ok:
+        lines += ff_clear(root, cfg, name)
+    return ok, lines
+
+
+def ff_clear(root, cfg, name):
+    """Remove a fast-forward branch's worktree, its branches and its preview. Returns lines."""
+    wt, out = ff_dir(root, name), []
+    stop = (cfg["fast_forward"].get("preview") or {}).get("stop")
+    if stop and os.path.isdir(wt):
+        run_shell(fill(stop, name=name, worktree=wt), wt, 120)
+    if os.path.isdir(wt):
+        call(["git", "-C", root, "worktree", "remove", "--force", wt])
+    for b in (FF_BRANCH + name, LAND_BRANCH + name):
+        if git(root, "rev-parse", "--verify", "--quiet", f"refs/heads/{b}"):
+            call(["git", "-C", root, "branch", "-D", b])
+            out.append(f"Deleted the branch {b}.")
+    workers = load_workers(root)
+    if f"ff-{name}" in workers:
+        workers[f"ff-{name}"]["state"] = "removed"
+        save_workers(root, workers)
+    return out
+
+
+def ff_drop(root, cfg, name):
+    if worker_info(root) or ff_info(root):
+        return False, ["Drop a fast-forward branch from the project folder."]
+    name = slugify(name)
+    if not os.path.isdir(ff_dir(root, name)) and not git(root, "rev-parse", "--verify", "--quiet",
+                                                          f"refs/heads/{FF_BRANCH}{name}"):
+        return False, [f"There's no fast-forward branch called {name}. `regista.py ff list` lists them."]
+    return True, [f"Threw away the fast-forward branch {name} and its folder."] + ff_clear(root, cfg, name)
+
+
+def ff_list(root, cfg):
+    base = p(root, harness_rel("worktrees", root=root))
+    rows = []
+    for d in sorted(os.listdir(base)) if os.path.isdir(base) else []:
+        if not d.startswith("ff-"):
+            continue
+        wt, name = os.path.join(base, d), d[3:]
+        info = ff_info(wt)
+        branch = git(wt, "rev-parse", "--abbrev-ref", "HEAD")
+        ahead = git(root, "rev-list", "--count", f"HEAD..{branch}") or "0"
+        state = "being tried (light rules)" if info else f"landing on {branch} (full rules)"
+        rows.append(f"- {name}: {state}; {ahead} commit(s) the project doesn't have; folder {wt}"
+                    + (f"; the task: {info['task']}" if info.get("task") else ""))
+    return "\n".join(rows) if rows else "No fast-forward branches. Start one: `regista.py ff start <name> --task \"…\"`."
 
 
 def fleet_merge_many(root, cfg, names, force=False, wait=None):
@@ -8464,8 +8649,8 @@ def hook_pre_bash(root, cfg, data):
             hit = [b for b in fast_branches(root) if any(b in a for a in g["args"])]
             if hit:
                 deny(f"{DISPLAY_NAME}: {hit[0]} is a prototype's branch (a fast-forward worker): its commits skipped the "
-                     f"tests and the review, so it doesn't merge as it is. `{PY} \"{DD}\" fleet land <name>` takes it "
-                     "through the full process.", "prototype_merge")
+                     f"tests and the review, so it doesn't merge as it is. `{PY} \"{DD}\" ff land <name>` takes it "
+                     "through the full process, and `ff merge <name>` brings it in.", "prototype_merge")
         elif g["sub"] == "push":
             if cfg["push"] == "block":
                 deny(f"{DISPLAY_NAME}: pushing is disabled for this project (config push=block). Ask the user to push.",
@@ -8753,7 +8938,7 @@ def hook_stop(root, cfg, data):
     nudge = run_nudge(root, cfg, data)
     if nudge:
         emit(nudge)
-    if again or cfg["stop"] == "off" or waits_on_agents(root, data):
+    if again or cfg["stop"] == "off" or waits_on_agents(root, data) or fast_mode(root):
         return
     unsaved = unsaved_commits(root, cfg)
     if not unsaved:
@@ -8785,7 +8970,9 @@ def hook_session_start(root, cfg, data):
                 "written for a person coming back to it cold: what's done, what's next, and what needs them, a "
                 "sentence or two each in plain words. Milestone codes, commit hashes and dated gate results go in a "
                 "short Details line at the end, only if they help.\n\n")
-    if worker_info(root):
+    if ff_info(root).get("name"):
+        lead = ff_rules(root, cfg, ff_info(root)) + "\n\n" + lead
+    elif worker_info(root):
         lead = worker_note(root, cfg) + "\n\n" + lead
     elif load_workers(root):
         text += "\n\nThe overseer's workers (`regista.py fleet`):\n" + fleet_text(root, cfg)
@@ -10708,6 +10895,11 @@ def main():
     sub.add_parser("deploy", help="deploy HEAD with config deploy.run, then run the live checks (gates when: deploy)")
     sub.add_parser("preview", help="in a prototype's worktree (a fast-forward worker): run fast_forward.preview.run, "
                                    "so the user can look at it")
+    ff = sub.add_parser("ff", help="fast-forward branches: build a feature on ff/<name> with the light rules and try "
+                                   "it as a separate copy; land it (full rules) and merge it only when the user wants")
+    ff.add_argument("action", choices=["start", "try", "land", "merge", "drop", "list"])
+    ff.add_argument("name", nargs="?", default="", help="the branch's name (start, drop, merge; optional in its folder)")
+    ff.add_argument("--task", default="", help="(start) what to build, in words")
     rl = sub.add_parser("release", help="raise the version, check the changelog and the gates, commit, tag, push "
                                         "(with the user's OK), publish the notes and deploy")
     rl.add_argument("level", nargs="?", choices=LEVELS, help="which number to raise (default patch); above patch: the user only")
@@ -10937,6 +11129,17 @@ def main():
                   + "\n".join(lines))
         else:
             print(run_text(root, cfg))
+    elif a.cmd == "ff":
+        if a.action == "list":
+            print(ff_list(root, cfg))
+            sys.exit(0)
+        if a.action in ("start", "merge", "drop") and not a.name:
+            sys.exit(f"Name the branch: `regista.py ff {a.action} <name>`.")
+        ok, lines = {"start": lambda: ff_start(root, cfg, a.name, a.task), "try": lambda: preview(root, cfg, a.name),
+                     "land": lambda: ff_land(root, cfg, a.name), "merge": lambda: ff_merge(root, cfg, a.name),
+                     "drop": lambda: ff_drop(root, cfg, a.name)}[a.action]()
+        print("\n".join(lines))
+        sys.exit(0 if ok else 1)
     elif a.cmd == "preview":
         ok, lines = preview(root, cfg)
         print("\n".join(lines))

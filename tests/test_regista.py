@@ -2989,7 +2989,7 @@ class Fleet(unittest.TestCase):
         self.assertEqual(self.fleet("preview", "proto").returncode, 0)
         os.remove(os.path.join(w, "preview.txt"))
         r = subprocess.run([PY, TOOL, "preview"], cwd=self.p.root, capture_output=True, text=True, encoding="utf-8")
-        self.assertIn("previews are for prototypes", r.stdout)
+        self.assertIn("previews are for fast-forward branches", r.stdout)
         # landing: a normal worker gets the whole change, uncommitted, under the full rules
         r = self.fleet("land", "proto")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
@@ -3012,6 +3012,125 @@ class Fleet(unittest.TestCase):
         self.hook("subagent-stop", {"session_id": "w1", "agent_id": "b7", "agent_type": "regista:builder"}, cwd=self.wt())
         out = self.hook("stop", {"session_id": "w1"}, cwd=self.wt())
         self.assertEqual(out["decision"], "block")  # its agents are done: the run's nudge (and report) are back
+
+
+class FastForwardBranches(unittest.TestCase):
+    """Ciprian, 12 November 2026: "fast-forward mode was supposed to implement features but not in main, just on a
+    branch, so we can test it out", as few tests as possible, tried as a separate copy."""
+
+    def setUp(self):
+        self.runs = tempfile.mktemp(prefix="regista-runs-")
+        self.p = Project(gates=[{"name": "lint", "run": f'echo lint >> "{self.runs}"', "when": ["commit"]},
+                                {"name": "tests", "run": f'echo all >> "{self.runs}"', "when": ["commit"]}],
+                         review={"required_for": ["src/**"], "min_changed_lines": 0},
+                         requirements={"enforce_coverage": False, "milestone_needs_e2e": False},
+                         deploy={"run": f'echo deployed >> "{self.runs}"'},
+                         fast_forward={"gates": [], "preview": {"run": 'echo "{name} on slot {slot}" > preview.txt',
+                                                                "stop": f'echo "stop {{name}}" >> "{self.runs}"'}})
+
+    def tearDown(self):
+        sh(self.p.root, "git", "worktree", "prune")
+        self.p.cleanup()
+        if os.path.exists(self.runs):
+            os.remove(self.runs)
+
+    def cli(self, *args, cwd=None):
+        env = {k: v for k, v in os.environ.items() if k not in regista.HOST_PROJECT_VARS}
+        return subprocess.run([PY, TOOL, *args], cwd=cwd or self.p.root, capture_output=True, text=True,
+                              encoding="utf-8", env=env)
+
+    def hook(self, event, payload, cwd):
+        return self.p.hook(event, {"cwd": cwd, **payload})
+
+    def runs_seen(self):
+        if not os.path.exists(self.runs):
+            return []
+        with open(self.runs, encoding="utf-8") as f:
+            return f.read().split()
+
+    def build(self, w, text, msg):
+        os.makedirs(os.path.join(w, "src"), exist_ok=True)
+        with open(os.path.join(w, "src", "button.py"), "w", encoding="utf-8") as f:
+            f.write(text)
+        out = self.hook("pre-tool", bash(f'git add -A && git commit -m "{msg}"'), cwd=w)
+        self.assertIsNone(decision(out), out)
+        sh(w, "git", "add", "-A")
+        sh(w, "git", "commit", "-q", "-m", msg)
+
+    def test_a_feature_is_built_on_its_branch_tried_and_only_then_landed(self):
+        r = self.cli("ff", "start", "round-button", "--task", "a round capture button")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        w = os.path.join(self.p.root, ".regista", "worktrees", "ff-round-button")
+        self.assertIn(f"cd {w}", r.stdout)
+        self.assertEqual(sh(w, "git", "rev-parse", "--abbrev-ref", "HEAD").strip(), "ff/round-button")
+        self.assertEqual(sh(self.p.root, "git", "status", "--porcelain").strip(), "")  # main stays clean
+        # the session edits the code itself, its commits run no gate and need no review, and main doesn't move
+        main_head = sh(self.p.root, "git", "rev-parse", "HEAD")
+        self.assertIsNone(decision(self.hook("pre-tool", {"tool_name": "Edit", "tool_input": {
+            "file_path": os.path.join(w, "src", "button.py")}}, cwd=w)))
+        self.build(w, "round = True\n", "feat: a round button")
+        self.assertEqual(self.runs_seen(), [])
+        self.assertEqual(sh(self.p.root, "git", "rev-parse", "HEAD"), main_head)
+        self.assertIsNone(self.hook("stop", {"session_id": "s1"}, cwd=w))  # no save reminder on the branch
+        self.assertIn("fast-forward branch ff/round-button", self.hook("session-start", {"session_id": "s1"}, cwd=w)[
+            "hookSpecificOutput"]["additionalContext"])
+        # the project folder keeps the full rules
+        self.assertEqual(decision(self.hook("pre-tool", {"tool_name": "Edit", "tool_input": {
+            "file_path": os.path.join(self.p.root, "src", "button.py")}}, cwd=self.p.root)), "deny")
+        # tried as a separate copy, from its folder or the project's; never deployed or merged as it is
+        r = self.cli("ff", "try", cwd=w)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        with open(os.path.join(w, "preview.txt"), encoding="utf-8") as f:
+            self.assertEqual(f.read().strip(), "round-button on slot 11")
+        os.remove(os.path.join(w, "preview.txt"))
+        self.assertEqual(self.cli("ff", "try", "round-button").returncode, 0)
+        os.remove(os.path.join(w, "preview.txt"))
+        r = self.cli("deploy", cwd=w)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertNotIn("deployed", self.runs_seen())
+        self.assertEqual(decision(self.hook("pre-tool", bash("git merge ff/round-button"), cwd=self.p.root)), "deny")
+        self.assertIn("being tried", self.cli("ff", "list").stdout)
+        # landing: one uncommitted change from the project's code, in the same folder, under the full rules
+        self.p.commit("NOTES.md", "main moved on\n", "notes")
+        r = self.cli("ff", "land", cwd=w)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(sh(w, "git", "rev-parse", "--abbrev-ref", "HEAD").strip(), "land/round-button")
+        self.assertEqual(sh(w, "git", "rev-parse", "HEAD"), sh(self.p.root, "git", "rev-parse", "HEAD"))
+        self.assertIn("src/button.py", sh(w, "git", "status", "--porcelain"))
+        self.assertEqual(decision(self.hook("pre-tool", {"tool_name": "Edit", "tool_input": {
+            "file_path": os.path.join(w, "src", "button.py")}}, cwd=w)), "deny")
+        out = self.hook("pre-tool", bash('git add -A && git commit -m "feat: round button"'), cwd=w)
+        self.assertEqual(decision(out), "deny")  # every gate ran, and the review is needed
+        self.assertEqual(self.runs_seen(), ["lint", "all"])
+        self.assertIn("landing on land/round-button", self.cli("ff", "list").stdout)
+        sh(w, "git", "add", "-A")
+        sh(w, "git", "commit", "-q", "-m", "feat: a round button, tested and reviewed")
+        # the merge runs the gates on the merged code and clears the folder and both branches
+        r = self.cli("ff", "merge", "round-button")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(sh(self.p.root, "git", "show", "HEAD:src/button.py"), "round = True\n")
+        self.assertIn("reused", r.stdout)  # the gates passed on exactly this code before the landing commit
+        self.assertEqual(self.runs_seen()[2:], ["stop", "round-button"])  # and the preview stops
+        self.assertFalse(os.path.exists(w))
+        self.assertEqual(sh(self.p.root, "git", "branch", "--list", "ff/*", "land/*").strip(), "")
+
+    def test_a_branch_nobody_wants_is_dropped_and_the_quick_checks_are_the_projects_choice(self):
+        c = jload(os.path.join(self.p.root, ".regista", "config.json"))
+        c["fast_forward"]["gates"] = ["lint"]
+        jsave(os.path.join(self.p.root, ".regista", "config.json"), c)
+        sh(self.p.root, "git", "commit", "-qam", "lint on fast-forward branches")
+        self.assertEqual(self.cli("ff", "start", "idea").returncode, 0)
+        w = os.path.join(self.p.root, ".regista", "worktrees", "ff-idea")
+        self.assertIn("already", self.cli("ff", "start", "idea").stdout)
+        self.assertIn("project folder", self.cli("ff", "start", "other", cwd=w).stdout)
+        self.build(w, "idea = 1\n", "feat: an idea")
+        self.assertEqual(self.runs_seen(), ["lint"])
+        self.assertIn("land the branch first", self.cli("ff", "merge", "idea").stdout)
+        r = self.cli("ff", "drop", "idea")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertFalse(os.path.exists(w))
+        self.assertEqual(sh(self.p.root, "git", "branch", "--list", "ff/*").strip(), "")
+        self.assertIn("No fast-forward branches", self.cli("ff", "list").stdout)
 
 
 class Launcher(unittest.TestCase):
