@@ -2926,6 +2926,84 @@ class Fleet(unittest.TestCase):
         with open(runs, encoding="utf-8") as f:
             self.assertEqual(f.read().split(), ["all"])
 
+    def test_a_prototype_runs_almost_no_checks_and_lands_only_through_the_full_process(self):
+        # Klotho, 12 November 2026: "we need a fast-forward mode, so we can see prototypes fast", running as few
+        # tests as possible.
+        runs = os.path.join(self.fake, "runs.log")
+        cfg_path = os.path.join(self.p.root, ".regista", "config.json")
+        c = jload(cfg_path)
+        c["gates"] = [{"name": "lint", "run": f'echo lint >> "{runs}"', "when": ["commit"]},
+                      {"name": "tests", "run": f'echo all >> "{runs}"', "run_affected": f'echo some >> "{runs}"',
+                       "when": ["commit"]}]
+        c["review"] = {"required_for": ["src/**"], "min_changed_lines": 0}
+        c["mode"] = "orchestrated"
+        c["deploy"] = {"run": f'echo deployed >> "{runs}"'}
+        jsave(cfg_path, c)
+        sh(self.p.root, "git", "commit", "-qam", "gates, a review and a deploy")
+        self.assertIn("A prototype is a task", self.spawn("M2", "--fast").stdout)
+        r = self.spawn("proto", "--fast", "--task", "try a round button")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        w = self.wt("proto")
+        self.assertTrue(jload(os.path.join(w, ".regista", "worker.json"))["fast"])
+        self.assertIn("a prototype (fast-forward)", self.fleet().stdout)
+        note = self.hook("session-start", {"session_id": "w1"}, cwd=w)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("fast-forward worker", note)
+        self.assertIn("no gate (no tests at all)", note)
+        # the session edits code itself, and its commit runs no gate, needs no review and records nothing
+        self.assertIsNone(decision(self.hook("pre-tool", {"tool_name": "Edit", "tool_input": {
+            "file_path": os.path.join(w, "src", "button.py")}}, cwd=w)))
+        os.makedirs(os.path.join(w, "src"), exist_ok=True)
+        with open(os.path.join(w, "src", "button.py"), "w", encoding="utf-8") as f:
+            f.write("round = True\n")
+        out = self.hook("pre-tool", bash('git add -A && git commit -m "feat: a round button"'), cwd=w)
+        self.assertIsNone(decision(out), out)
+        self.assertFalse(os.path.exists(runs))
+        sh(w, "git", "add", "-A")
+        sh(w, "git", "commit", "-q", "-m", "feat: a round button")
+        # a project that names a quick check gets that one alone
+        c["fast_forward"] = {"gates": ["lint"], "preview": {"run": 'echo "{name} on slot {slot}" > preview.txt'}}
+        jsave(os.path.join(w, ".regista", "config.json"), c)
+        with open(os.path.join(w, "src", "button.py"), "a", encoding="utf-8") as f:
+            f.write("size = 3\n")
+        self.assertIsNone(decision(self.hook("pre-tool", bash('git add -A && git commit -m "bigger"'), cwd=w)))
+        with open(runs, encoding="utf-8") as f:
+            self.assertEqual(f.read().split(), ["lint"])
+        sh(w, "git", "add", "-A")
+        sh(w, "git", "commit", "-q", "-m", "feat: a bigger round button")
+        # it never ships or merges as it is
+        r = subprocess.run([PY, TOOL, "deploy"], cwd=w, capture_output=True, text=True, encoding="utf-8")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("prototype", r.stdout)
+        with open(runs, encoding="utf-8") as f:
+            self.assertNotIn("deployed", f.read())
+        r = self.fleet("merge", "proto")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("fleet land proto", r.stdout)
+        self.assertEqual(decision(self.hook("pre-tool", bash("git merge regista/proto"))), "deny")
+        # the preview runs in its worktree, from the worker or the overseer; never for real code
+        r = subprocess.run([PY, TOOL, "preview"], cwd=w, capture_output=True, text=True, encoding="utf-8")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        with open(os.path.join(w, "preview.txt"), encoding="utf-8") as f:
+            self.assertEqual(f.read().strip(), "proto on slot 1")
+        os.remove(os.path.join(w, "preview.txt"))
+        self.assertEqual(self.fleet("preview", "proto").returncode, 0)
+        os.remove(os.path.join(w, "preview.txt"))
+        r = subprocess.run([PY, TOOL, "preview"], cwd=self.p.root, capture_output=True, text=True, encoding="utf-8")
+        self.assertIn("previews are for prototypes", r.stdout)
+        # landing: a normal worker gets the whole change, uncommitted, under the full rules
+        r = self.fleet("land", "proto")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        lw = self.wt("proto-land")
+        info = jload(os.path.join(lw, ".regista", "worker.json"))
+        self.assertEqual((info.get("fast"), info["landing"]), (None, "proto"))
+        self.assertIn("src/button.py", sh(lw, "git", "status", "--porcelain"))
+        self.assertEqual(sh(lw, "git", "rev-parse", "HEAD"), sh(self.p.root, "git", "rev-parse", "HEAD"))
+        self.assertEqual(decision(self.hook("pre-tool", {"tool_name": "Edit", "tool_input": {
+            "file_path": os.path.join(lw, "src", "button.py")}}, cwd=lw)), "deny")  # orchestrated again
+        out = self.hook("pre-tool", bash('git add -A && git commit -m "feat: round button"'), cwd=lw)
+        self.assertEqual(decision(out), "deny")  # the review is needed again
+        self.assertIn("landing the prototype proto", self.fleet().stdout)
+
     def test_a_worker_waiting_on_its_agents_isnt_sent_to_report(self):
         self.spawn()
         self.worker_commit("src/pages.py", "pages = 1\n")

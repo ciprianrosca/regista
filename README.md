@@ -353,6 +353,36 @@ do what they say. In a project Claude Code hasn't opened before, the first worke
 Code's "do you trust this folder" question; `regista.py fleet spawn` says so, and you answer it once with
 `tmux attach -t <session>`.
 
+### Prototypes: fast-forward workers
+
+The full process (test writer, builder, reviewer, every gate on every commit) is right for code that ships, and
+slow for an idea you want to see working today. A fast-forward worker is a prototype on its own branch, built with
+the light rules:
+
+```
+regista.py fleet spawn round-button --fast --task "try a round capture button with a live level"
+```
+
+- **In the prototype**, the worker's session edits the code itself: no test writer, builder or reviewer, no
+  requirement specs, no handoffs. A commit runs only the gates named in `fast_forward.gates`, which is empty
+  by default, so no tests run at all. A project can name a check that takes seconds, like its linter.
+  Nothing a prototype commits counts as passing a requirement. The worker keeps a short `PROTOTYPE.md` that
+  says what it faked or left out.
+- **Looking at it**: `regista.py preview` (in the prototype's worktree) or `regista.py fleet preview <name>`
+  (from the overseer) runs the project's `fast_forward.preview.run` command in that worktree, with `{name}`,
+  `{slot}`, `{ref}` and `{worktree}` filled in: a second copy of the app on its own port, say. It serves the
+  worktree as it is, so it doesn't wait for a commit. No tests run.
+- **It never ships as it is**: in a prototype, `deploy` and `release` refuse, `fleet merge` refuses, and a
+  `git merge`, `cherry-pick`, `rebase` or `pull` of its branch is refused anywhere else.
+- **Landing**: when you like it, `regista.py fleet land <name>` starts a normal worker, `<name>-land`, from the
+  project's current code with the prototype's whole change uncommitted in its worktree. That worker takes it
+  through the full process (specs, tests, review, every gate) and merges like any other.
+  Afterwards `fleet remove <name> --force` deletes the prototype's branch.
+
+```json
+"fast_forward": {"gates": ["lint"], "preview": {"run": "scripts/preview.sh {worktree} {slot}", "timeout": 900}}
+```
+
 ### Context budget
 
 ```json

@@ -181,7 +181,14 @@ DEFAULTS["fleet"] = {"max_workers": 3, "launch": "auto", "setup": "", "copy": ["
 # The plan usage meter (`regista.py usage`): off with enabled false; build all warns and stops at these weekly
 # percentages.
 DEFAULTS["usage"] = {"enabled": True, "stop_at_weekly_pct": 90, "warn_at_weekly_pct": 75}
-NESTED = ("context", "roles", "review", "requirements", "fleet", "usage")
+# Fast-forward workers (`fleet spawn <name> --fast --task "…"`): prototypes to look at quickly, on their own branch.
+# There the session edits code itself, and a commit runs only the gates named in `gates` (by default none: list only
+# checks that take seconds, like a linter), with no review, no requirement coverage and no recorded results. A prototype never
+# deploys, releases or merges: `fleet land <name>` brings it in through the full process. `preview.run` puts a
+# prototype where the user can look at it ({name}, {slot}, {ref} and {worktree} filled in), run by
+# `regista.py preview` in its worktree or `regista.py fleet preview <name>` from the overseer.
+DEFAULTS["fast_forward"] = {"gates": [], "preview": {"run": "", "timeout": 900}}
+NESTED = ("context", "roles", "review", "requirements", "fleet", "usage", "fast_forward")
 HOOK_GATE_BUDGET = 3300  # seconds of gate runs per commit; the hook itself times out at 3600 and would fail open
 
 
@@ -1865,6 +1872,9 @@ def deployed_path(root):
 
 def deploy(root, cfg):
     """Deploy HEAD and check the live result. Returns (ok, lines)."""
+    if fast_mode(root):
+        return False, [f"{DISPLAY_NAME}: this is a prototype (a fast-forward worker), so it doesn't deploy. "
+                       f"`{PY} \"{DD}\" preview` shows it; the overseer's `fleet land` brings it in for a real release."]
     d = cfg.get("deploy") or {}
     if not d.get("run"):
         return False, ["No deploy configured: add \"deploy\": {\"run\": \"<your deploy command>\"} to "
@@ -2262,6 +2272,9 @@ def release_gates(root, cfg, plan):
 
 def release(root, cfg, level=None, check=False, push=True):
     """Make a release. Returns (ok, lines), in plain language."""
+    if fast_mode(root):
+        return False, [f"{DISPLAY_NAME}: this is a prototype (a fast-forward worker), so it doesn't release. "
+                       f"`{PY} \"{DD}\" preview` shows it; the overseer's `fleet land` brings it in for a real release."]
     rs = release_settings(cfg)
     plan = release_plan(root, cfg, level)
     if worker_info(root):
@@ -2905,13 +2918,33 @@ def exclude_block(lines):
     return f"# {DISPLAY_NAME} workers\n" + "\n".join(lines) + "\n"
 
 
-FLEET_WRITES = ("spawn", "merge", "stop", "resume", "remove", "allow")
-FLEET_FROM_PROJECT = ("spawn", "merge", "resume", "remove", "sync", "allow")  # refused from a session started elsewhere
+FLEET_WRITES = ("spawn", "merge", "stop", "resume", "remove", "allow", "land")
+FLEET_FROM_PROJECT = ("spawn", "merge", "resume", "remove", "sync", "allow", "land")  # refused from a session started elsewhere
 
 
 def worker_info(root):
     """This worktree's worker record (written by the overseer when it started the worker), or {}."""
     return load_json(worker_file(root), {}) if root else {}
+
+
+def fast_mode(root):
+    """True in a fast-forward worker's worktree: a prototype, built with the light rules."""
+    return bool(worker_info(root).get("fast"))
+
+
+def prototype_gates(root, cfg, gates):
+    """In a fast-forward worker, only the gates the project names in fast_forward.gates (by default none): a
+    prototype runs as few checks as possible. Elsewhere the gates as they are."""
+    if not fast_mode(root):
+        return gates
+    keep = cfg["fast_forward"].get("gates") or []
+    return [g for g in gates if g["name"] in keep and not g.get("_skip")]
+
+
+def fast_branches(root):
+    """The branches of the project's fast-forward workers (prototypes), which only `fleet land` brings in."""
+    home = overseer_root(root) or root
+    return [w["branch"] for w in load_workers(home).values() if w.get("fast") and w.get("branch")]
 
 
 def overseer_root(root):
@@ -3263,13 +3296,17 @@ def remove_worktree(root, wt, branch, name="", w=None):
     return [f"Its records are kept in {where}."] if where else []
 
 
-def fleet_spawn(root, cfg, milestone="", name="", task="", force=False):
+def fleet_spawn(root, cfg, milestone="", name="", task="", force=False, fast=False, squash="", landing=""):
     """Start a worker: a worktree on its own branch, and a Claude Code session in it that builds the
-    milestone (or does the task). Returns (ok, lines)."""
+    milestone (or does the task). `fast` makes it a fast-forward worker (a prototype, light rules); `squash`
+    puts that branch's whole change, uncommitted, in the new worktree (how `fleet land` starts). Returns (ok, lines)."""
     if worker_info(root):
         return False, [f"{DISPLAY_NAME}: only the overseer starts workers. Send it what you need (SendMessage)."]
     if not milestone and not task:
         return False, ["Say what the worker does: a milestone (`fleet spawn M3`) or a task (`--task \"…\"`)."]
+    if fast and milestone:
+        return False, ["A prototype is a task, not a milestone: `fleet spawn <name> --fast --task \"what to try\"`. "
+                       "A milestone's steps need the full process."]
     if not tool_exe("claude"):
         return False, ["Claude Code's `claude` command isn't on the PATH, so no worker can start here."]
     workers = load_workers(root)
@@ -3322,7 +3359,7 @@ def fleet_spawn(root, cfg, milestone="", name="", task="", force=False):
     slot = next(k for k in range(1, 1000) if k not in used)
     info = {"name": name, "milestone": milestone, "title": title, "task": task, "branch": branch, "slot": slot,
             "overseer_root": root, "overseer": me["name"], "base": git(root, "rev-parse", "HEAD"),
-            "started": now_iso()}
+            "started": now_iso(), **({"fast": True} if fast else {}), **({"landing": landing} if landing else {})}
     save_json(worker_file(wt), info)
     if milestone:  # the worker keeps building until its milestone is done, like a build-all run
         save_json(run_path(wt), {"active": True, "started": now_iso(), "worker": name,
@@ -3334,6 +3371,14 @@ def fleet_spawn(root, cfg, milestone="", name="", task="", force=False):
             kept = remove_worktree(root, wt, branch, name, info)
             return False, [f"The setup command (`{setup}`) failed in the new worktree, so no worker started:",
                            out.strip()[-800:]] + kept
+    if squash:  # the prototype's whole change, uncommitted, for the landing worker to bring up to standard
+        code, out = call(["git", "-C", wt, "merge", "--squash", squash])
+        if code:
+            call(["git", "-C", wt, "reset", "-q", "--hard"])
+            kept = remove_worktree(root, wt, branch, name, info)
+            return False, [f"The prototype's change doesn't apply cleanly to the project as it is now, so no landing "
+                           f"worker started. Ask the prototype's worker to run `fleet sync` and settle the conflicts, "
+                           f"then land it again. Git said: {out.strip()[-400:]}"] + kept
     # A new session never takes an earlier worker's name: Remote Control keeps old sessions listed under
     # theirs, and a message addressed to a shared name doesn't arrive.
     generation = workers.get(name, {}).get("generation", 0) + 1
@@ -3347,7 +3392,8 @@ def fleet_spawn(root, cfg, milestone="", name="", task="", force=False):
     workers[name] = {"milestone": milestone, "title": title, "task": task, "branch": branch, "worktree": rel,
                      "slot": slot, "base": info["base"], "started": info["started"], "state": "running", "how": how,
                      "ref": ref, "url": url, "session_name": sname, "mode": mode, "generation": generation,
-                     "session_id": find_session_id(sname)}
+                     "session_id": find_session_id(sname), **({"fast": True} if fast else {}),
+                     **({"landing": landing} if landing else {})}
     save_workers(root, workers)
     what = f"{milestone} — {title}" if milestone else task
     fleet_event(root, name, "started", what)
@@ -3373,7 +3419,9 @@ def worker_line(root, name, w, sessions):
     what = f"{w['milestone']} — {w['title']}" if w.get("milestone") else (w.get("task") or "")[:100]
     ahead = git(root, "rev-list", "--count", f"HEAD..{w['branch']}") or "0"
     wt = p(root, w["worktree"])
-    parts = []
+    parts = ["a prototype (fast-forward)"] if w.get("fast") else []
+    if w.get("landing"):
+        parts.append(f"landing the prototype {w['landing']}")
     if w["state"] == "running":
         parts.append(f"session {s.get('status') or 'running'}" if s else
                      "no session running (it ended or the machine restarted: `fleet resume`)")
@@ -3707,6 +3755,10 @@ def fleet_merge(root, cfg, name, force=False, wait=None, gates_run=True):
     w = workers.get(name)
     if not w or w.get("state") == "removed":
         return False, [f"There's no worker {name}. `regista.py fleet` lists them."]
+    if w.get("fast"):
+        return False, [f"{name} is a prototype (a fast-forward worker): its commits skipped the tests and the review, "
+                       f"so it doesn't merge. `{PY} \"{DD}\" fleet land {name}` starts a worker that takes the whole "
+                       "change through the full process, and that one merges."]
     others = uncommitted_work(root, cfg)
     if others:
         return False, [f"The project folder has uncommitted changes ({', '.join(others[:6])}). Commit them first, so "
@@ -3793,6 +3845,64 @@ def fleet_merge(root, cfg, name, force=False, wait=None, gates_run=True):
         lines.append(f"Still running from an older commit: {', '.join(others)}. If one touches the same files, tell it "
                      "to bring this work into its branch with `regista.py fleet sync`.")
     return True, lines
+
+
+def fleet_land(root, cfg, name, force=False):
+    """Bring a prototype in: a normal worker starts from the project's HEAD with the prototype's whole change
+    uncommitted in its worktree, and takes it through the tests, the review and the gates. Returns (ok, lines)."""
+    if worker_info(root):
+        return False, [f"{DISPLAY_NAME}: only the overseer lands a prototype. Tell it the prototype is ready (SendMessage)."]
+    w = load_workers(root).get(name)
+    if not w or w.get("state") == "removed":
+        return False, [f"There's no worker {name}. `regista.py fleet` lists them."]
+    if not w.get("fast"):
+        return False, [f"{name} isn't a prototype: merge it with `fleet merge {name}`."]
+    if git(root, "rev-list", "--count", f"HEAD..{w['branch']}") in ("", "0"):
+        return False, [f"{name} has no commits to land yet."]
+    wt = p(root, w["worktree"])
+    if os.path.isdir(wt) and uncommitted_work(wt, cfg) and not force:
+        return False, [f"{name} has uncommitted changes. Ask it to commit them first (or --force to land only what's "
+                       "committed)."]
+    notes = ""
+    if os.path.isfile(p(wt, "PROTOTYPE.md")):
+        notes = " Its PROTOTYPE.md says what was faked or left out: read it first, then delete it."
+    task = (f"Land the prototype \"{name}\" ({w.get('task') or 'see the overseer'}). Its whole change is in this "
+            f"worktree, uncommitted.{notes} Bring it up to the project's standard with the normal build loop: write "
+            "the requirements it meets as a spec, have the test writer cover them, have the builder fix what the tests "
+            "and the review find, and drop what was only there for the demo. Commit when the review approves and the "
+            "gates pass, then tell the overseer it's ready to merge.")
+    ok, lines = fleet_spawn(root, cfg, name=f"{name}-land", task=task, force=force, squash=w["branch"], landing=name)
+    if ok:
+        lines.append(f"When {name}-land is merged, `fleet remove {name} --force` clears the prototype's branch.")
+    return ok, lines
+
+
+def preview(root, cfg, name=""):
+    """Run the project's preview command for a prototype: in its worktree, or the named worker's. Returns (ok, lines)."""
+    if name:
+        w = load_workers(root).get(name)
+        if not w or w.get("state") == "removed":
+            return False, [f"There's no worker {name}. `regista.py fleet` lists them."]
+        root = p(root, w["worktree"])
+        cfg = load_config(root)
+    w = worker_info(root)
+    if not w.get("fast"):
+        return False, [f"{DISPLAY_NAME}: previews are for prototypes (fast-forward workers). Real code reaches the "
+                       f"test server through a release and `{PY} \"{DD}\" deploy`."]
+    pv = cfg["fast_forward"].get("preview") or {}
+    if not pv.get("run"):
+        return False, ["This project has no preview command: add \"fast_forward\": {\"preview\": {\"run\": \"<command>\"}} "
+                       f"to {harness_rel('config.json', root=root)} ({{name}}, {{slot}}, {{ref}} and {{worktree}} are filled in)."]
+    head = git(root, "rev-parse", "--short", "HEAD")
+    t0 = time.time()
+    code, out = run_shell(fill(pv["run"], name=w["name"], slot=str(w.get("slot", 1)), ref=head, worktree=root), root,
+                          pv.get("timeout", 900))
+    secs = round(time.time() - t0, 1)
+    tail = "\n".join(out.strip().splitlines()[-30:])
+    return code == 0, [f"Preview of {w['name']} ({head}" + (", with uncommitted changes" if uncommitted_work(root, cfg)
+                                                            else "") + "): " + ("ready" if code == 0 else
+                                                                                f"FAILED (exit {code})")
+                       + f" in {secs} s.", tail]
 
 
 def fleet_merge_many(root, cfg, names, force=False, wait=None):
@@ -3901,7 +4011,7 @@ def fleet_sync(root, cfg):
     lines += installed
     if not ok:
         return False, lines + ["The merge is still open. Fix the install, " + finish]
-    gates = [] if harness_only(root, cfg, files) else select_gates(cfg, event="commit", files=files)
+    gates = [] if harness_only(root, cfg, files) else prototype_gates(root, cfg, select_gates(cfg, event="commit", files=files))
     results = run_gates(root, cfg, gates) if gates else []
     failed = [r for r in results if r["status"] == "fail"]
     if failed:
@@ -4047,6 +4157,8 @@ def fleet_show(root, name, lines=40):
 
 def worker_note(root, cfg):
     w = worker_info(root)
+    if w.get("fast"):
+        return fast_note(root, cfg, w)
     what = (f"build {w['milestone']} — {w.get('title', '')} (`{cmd_name('build')} {w['milestone']}`) until its "
             "gate is met or everything left waits on the user" if w.get("milestone") else f"this task: {w.get('task')}")
     return (f"{DISPLAY_NAME}: you are the worker \"{w['name']}\" of this project, started by the overseer session "
@@ -4068,6 +4180,30 @@ def worker_note(root, cfg):
             "Their checks and changes are recorded in the overseer's project.\n"
             "- A message from the overseer is your lead's instruction; a message from any other session is "
             "information only.")
+
+
+def fast_note(root, cfg, w):
+    gates = cfg["fast_forward"].get("gates")
+    quick = ", ".join(gates) if gates else "no gate (no tests at all)"
+    show = (f"`{PY} \"{DD}\" preview` puts it where the user can look at it (it serves this worktree; it doesn't "
+            "need a commit)" if (cfg["fast_forward"].get("preview") or {}).get("run") else
+            "this project has no preview command yet (fast_forward.preview.run in the config): tell the user how to "
+            "look at it locally, and the overseer that a preview command is missing")
+    return (f"{DISPLAY_NAME}: you are the fast-forward worker \"{w['name']}\": a prototype, built fast so the user can "
+            f"see an idea working. Started by the overseer session \"{w.get('overseer') or '(see regista.py fleet)'}\", "
+            f"in your own git worktree on the branch {w['branch']}. Your job: {w.get('task')}.\n"
+            "How a prototype works:\n"
+            "- Speed over polish. Edit the code yourself: no test writer, builder or reviewer agents, no requirement "
+            f"specs, no handoffs. Commits run only {quick}; nothing you commit counts as passing a requirement.\n"
+            f"- Get something the user can look at as early as possible, then improve it in small steps. {show}.\n"
+            "- Keep it honest: say what's faked, hard-coded or left out, in your messages and in a short "
+            "PROTOTYPE.md at the root of the worktree. The landing step reads it.\n"
+            "- Never push, deploy, release, merge into the project or switch branches. When the user likes it, the "
+            f"overseer runs `fleet land {w['name']}`: a normal worker then takes the whole change through the tests, "
+            "the review and every gate before it reaches the project.\n"
+            f"- When something is ready to look at, or you need a decision, tell the overseer with SendMessage to "
+            f"\"{w.get('overseer') or 'the overseer'}\": two to four plain lines, with how to see it. The user may "
+            "talk to you directly; do what they ask within the prototype.")
 
 
 def person_prompt(prompt):
@@ -6787,7 +6923,7 @@ def role_rules(root, cfg, data):
     if role == "main":
         if tool == "Agent" or tool == "Task":
             return None
-        if cfg["mode"] == "orchestrated" and tool in EDIT_TOOLS and (is_src or is_test):
+        if cfg["mode"] == "orchestrated" and tool in EDIT_TOOLS and (is_src or is_test) and not fast_mode(root):
             kind = "tests" if is_test else "source"
             agent = agent_name("test-writer" if is_test else "builder", root)
             return (f"{DISPLAY_NAME} (orchestrated mode): the orchestrator doesn't edit {kind} ({rel}). "
@@ -6853,7 +6989,7 @@ def role_rules(root, cfg, data):
                     f"Notes go under {harness_rel('research', root=root)}/; scratch files outside the project are fine.")
         return None
     # Other subagents (Explore, general-purpose, ...) in orchestrated mode: no source or test edits.
-    if cfg["mode"] == "orchestrated" and tool in EDIT_TOOLS and (is_src or is_test):
+    if cfg["mode"] == "orchestrated" and tool in EDIT_TOOLS and (is_src or is_test) and not fast_mode(root):
         return (f"{DISPLAY_NAME} (orchestrated mode): only {agent_name('builder', root)} edits source and only "
                 f"{agent_name('test-writer', root)} edits tests ({rel}).")
     return None
@@ -8324,6 +8460,12 @@ def hook_pre_bash(root, cfg, data):
             if why:
                 deny(why, "nested_repo_stage")
             commit_check(root, cfg, data)
+        elif g["sub"] in ("merge", "cherry-pick", "rebase", "pull") and not fast_mode(root):
+            hit = [b for b in fast_branches(root) if any(b in a for a in g["args"])]
+            if hit:
+                deny(f"{DISPLAY_NAME}: {hit[0]} is a prototype's branch (a fast-forward worker): its commits skipped the "
+                     f"tests and the review, so it doesn't merge as it is. `{PY} \"{DD}\" fleet land <name>` takes it "
+                     "through the full process.", "prototype_merge")
         elif g["sub"] == "push":
             if cfg["push"] == "block":
                 deny(f"{DISPLAY_NAME}: pushing is disabled for this project (config push=block). Ask the user to push.",
@@ -8395,14 +8537,17 @@ def stage_all_refusal(root, eff):
 
 def commit_check(root, cfg, data=None):
     """The commit hook: coverage, gates (unless only the harness's own records change), the review,
-    then the requirement results, which describe the commit. A loosened config needs the user."""
-    problems = coverage_problems(root, cfg)
+    then the requirement results, which describe the commit. A loosened config needs the user. In a
+    fast-forward worker (a prototype) only the quick gates run: no coverage, no review, no recorded results."""
+    fast = fast_mode(root)
+    problems = [] if fast else coverage_problems(root, cfg)
     if problems:
         deny(f"{DISPLAY_NAME} blocked this commit: requirements in {harness_rel('specs', root=root)}/ aren't covered or aren't valid.\n- "
              + "\n- ".join(problems[:15]) + "\nSend the missing tests to the test writer (it adds "
              "`covers: <ID>`), or mark a spec not started yet as \"state\": \"planned\".", "coverage")
     files = changed_files(root)
     gates = [] if harness_only(root, cfg, files) else select_gates(cfg, event="commit", files=files)
+    gates = prototype_gates(root, cfg, gates)
     results = []
     if gates:
         results = run_gates(root, cfg, scope_affected_gates(root, cfg, scope_e2e_gates(root, cfg, gates, files), files),
@@ -8416,12 +8561,13 @@ def commit_check(root, cfg, data=None):
             deny(f"{DISPLAY_NAME} blocked this commit: a gate failed.\n" + format_results(results) +
                  "\n\nFix the cause (or revert the change) and commit again. Never weaken a gate to pass it.\n\n" + tails,
                  "gate_failed")
-    why = review_status(root, cfg)
+    why = None if fast else review_status(root, cfg)
     if why:
         deny(why, "review_missing")
-    if results:
+    if results and not fast:
         record_requirements(root, cfg, results)
-    HOOK_CTX.setdefault("notes", []).extend(tick_committed_steps(root, cfg, files))
+    if not fast:
+        HOOK_CTX.setdefault("notes", []).extend(tick_committed_steps(root, cfg, files))
     quietly(record_step, None, root, cfg, data or HOOK_CTX.get("data") or {})
     week = quietly(week_note, "", root, cfg)
     if week:
@@ -10560,6 +10706,8 @@ def main():
     rn.add_argument("action", nargs="?", choices=["status", "start", "end"], default="status")
     rn.add_argument("--reason", default="", help="(end) why the run ends: all done, or what waits on the user")
     sub.add_parser("deploy", help="deploy HEAD with config deploy.run, then run the live checks (gates when: deploy)")
+    sub.add_parser("preview", help="in a prototype's worktree (a fast-forward worker): run fast_forward.preview.run, "
+                                   "so the user can look at it")
     rl = sub.add_parser("release", help="raise the version, check the changelog and the gates, commit, tag, push "
                                         "(with the user's OK), publish the notes and deploy")
     rl.add_argument("level", nargs="?", choices=LEVELS, help="which number to raise (default patch); above patch: the user only")
@@ -10583,12 +10731,15 @@ def main():
     fl = sub.add_parser("fleet", help="the overseer's workers: list them, start one, merge, stop, resume, remove, "
                                       "show its screen, or read their news; pass on the user's OK to one; in a worker, sync brings in the project's work")
     fl.add_argument("action", nargs="?", default="status",
-                    choices=["status", "spawn", "merge", "stop", "resume", "remove", "show", "news", "sync", "allow"])
+                    choices=["status", "spawn", "merge", "stop", "resume", "remove", "show", "news", "sync", "allow",
+                             "land", "preview"])
     fl.add_argument("target", nargs="?", default="", help="(spawn) a milestone, e.g. M3; (merge) a worker's name, or several separated by commas (m2,m3) "
                                                     "to run the gates once on all of them; (others) the worker's name")
     fl.add_argument("once", nargs="?", choices=["once"], help="(allow) the user's OK covers that one action, once")
     fl.add_argument("--name", default="", help="(spawn) the worker's name (default: the milestone)")
     fl.add_argument("--task", default="", help="(spawn) a task in words, instead of or on top of a milestone")
+    fl.add_argument("--fast", action="store_true", help="(spawn) a fast-forward worker: a prototype built with the light "
+                                                         "rules, which only `fleet land` brings into the project")
     fl.add_argument("--force", action="store_true", help="start a milestone that isn't ready, merge a busy worker, "
                                                          "or remove one with unmerged work")
     fl.add_argument("--all", action="store_true", help="(news) every event, not just the new ones")
@@ -10786,6 +10937,10 @@ def main():
                   + "\n".join(lines))
         else:
             print(run_text(root, cfg))
+    elif a.cmd == "preview":
+        ok, lines = preview(root, cfg)
+        print("\n".join(lines))
+        sys.exit(0 if ok else 1)
     elif a.cmd == "deploy":
         ok, lines = deploy(root, cfg)
         print("\n".join(lines))
@@ -10861,7 +11016,11 @@ def main():
         if a.action == "spawn":
             is_m = bool(re.fullmatch(r"M\d+[a-z]?", a.target or "", re.I))
             ok, lines = fleet_spawn(root, cfg, milestone=a.target if is_m else "",
-                                    name=a.name or ("" if is_m else a.target), task=a.task, force=a.force)
+                                    name=a.name or ("" if is_m else a.target), task=a.task, force=a.force, fast=a.fast)
+        elif a.action == "land":
+            ok, lines = fleet_land(root, cfg, a.target, a.force)
+        elif a.action == "preview":
+            ok, lines = preview(root, cfg, a.target)
         elif a.action == "merge":
             names = [x.strip() for x in a.target.split(",") if x.strip()]
             ok, lines = (fleet_merge_many(root, cfg, names, a.force, wait=a.when_idle) if len(names) > 1

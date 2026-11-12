@@ -79,6 +79,13 @@ Run `regista.py fleet` first: it shows each worker's state, its unmerged commits
 - **A worker is blocked:** read what it tried. Unblock it with information, or stop it
   (`regista.py fleet stop <name>`) and put the step on the board. Never do its work in its worktree: the
   hooks refuse your edits there.
+- **The user wants to see an idea quickly** (a prototype, "just show me"): start a fast-forward worker,
+  `regista.py fleet spawn <name> --fast --task "<what to try>"`. It builds with the light rules (it edits
+  the code itself, its commits run almost no checks, no review) and can't deploy or merge.
+  `regista.py fleet preview <name>` shows it; pass the user how to look at it. When they like it,
+  `regista.py fleet land <name>` starts a normal worker that takes the whole change through the full
+  process; merge that one as usual, then `fleet remove <name> --force`. A prototype nobody wants: `fleet
+  remove <name> --force`.
 - **A worker is quiet too long** (no news, no idle notice for an hour while `regista.py fleet` says busy):
   look at its screen (`regista.py fleet show <name>`) before you message it.
 - **A worker's session is gone** (`regista.py fleet` says no session running): `regista.py fleet resume <name>`
