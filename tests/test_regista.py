@@ -2354,6 +2354,47 @@ class Fleet(unittest.TestCase):
         self.assertEqual(regista.merge_json(["x"], ["x", "y"], ["x", "z"]), ["x", "y", "z"])
         self.assertEqual(regista.merge_json({"k": 1, "gone": 1}, {"k": 1, "gone": 1}, {"k": 2}), {"k": 2})
 
+    def test_records_merge_when_the_branches_share_two_ancestors(self):
+        # Klotho, 11 November 2026: after criss-cross merges, git's ancestor copy of requirements.json held
+        # conflict markers, so the records merger gave up and `fleet sync` stopped.
+        root = tempfile.mkdtemp(prefix="regista-crisscross-")
+        self.addCleanup(shutil.rmtree, root, True)
+        rec = os.path.join(root, ".regista", "gates", "requirements.json")
+        os.makedirs(os.path.dirname(rec))
+
+        def put(data, msg):
+            with open(rec, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, indent=2)
+            sh(root, "git", "add", "-A")
+            sh(root, "git", "commit", "-q", "-m", msg)
+        sh(root, "git", "init", "-q", "-b", "main")
+        sh(root, "git", "config", "user.email", "t@t")
+        sh(root, "git", "config", "user.name", "t")
+        put({"A": {"passes": True, "at": "1"}}, "base")
+        sh(root, "git", "checkout", "-q", "-b", "w")
+        put({"A": {"passes": True, "at": "1"}, "W1": {"passes": True, "at": "2"}}, "w1")
+        sh(root, "git", "checkout", "-q", "main")
+        put({"A": {"passes": True, "at": "1"}, "M1": {"passes": True, "at": "2"}}, "m1")
+        w1, m1 = sh(root, "git", "rev-parse", "w").strip(), sh(root, "git", "rev-parse", "main").strip()
+        both = {"A": {"passes": True, "at": "1"}, "M1": {"passes": True, "at": "2"}, "W1": {"passes": True, "at": "2"}}
+        # criss-cross: each side merges the other's first commit, resolving the records differently
+        subprocess.run(["git", "-C", root, "merge", "-q", "--no-ff", "--no-commit", w1], capture_output=True)
+        put(dict(both, A={"passes": False, "at": "3"}), "main takes w1")
+        sh(root, "git", "checkout", "-q", "w")
+        subprocess.run(["git", "-C", root, "merge", "-q", "--no-ff", "--no-commit", m1], capture_output=True)
+        put(dict(both, A={"passes": True, "at": "4"}), "w takes m1")
+        put(dict(both, A={"passes": True, "at": "4"}, W2={"passes": True, "at": "5"}), "w2")
+        sh(root, "git", "checkout", "-q", "main")
+        put(dict(both, A={"passes": False, "at": "3"}, M2={"passes": False, "at": "5"}), "m2")
+        self.assertEqual(len(sh(root, "git", "merge-base", "--all", "main", "w").split()), 2)
+        subprocess.run(["git", "-C", root, "merge", "--no-ff", "--no-commit", "w"], capture_output=True)
+        self.assertIn("<<<<<<<", sh(root, "git", "show", ":1:.regista/gates/requirements.json"))  # the bad ancestor
+        self.assertEqual(regista.resolve_records(root, dict(regista.DEFAULTS), 2), [])
+        merged = jload(rec)
+        self.assertEqual(set(merged), {"A", "M1", "W1", "M2", "W2"})
+        self.assertEqual(merged["A"], {"passes": True, "at": "4"})  # the newer result wins
+        self.assertEqual(sh(root, "git", "diff", "--name-only", "--diff-filter=U").strip(), "")
+
     def test_stop_resume_remove(self):
         self.spawn()
         self.assertEqual(self.fleet("stop", "m2").returncode, 0)

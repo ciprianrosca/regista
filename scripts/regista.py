@@ -3369,6 +3369,22 @@ def abort_merge(root, moved):
             os.replace(p(root, to), p(root, f))
 
 
+def record_base(root, f):
+    """The common ancestor's copy of a JSON record in a merge under way. When the branches have more than one
+    common ancestor, git's ancestor copy is its own merge of them and can hold conflict markers (Klotho, 11
+    November 2026: `fleet sync` stopped on requirements.json); then the first real ancestor whose copy reads is
+    used, or nothing, so both sides' entries are kept. Returns the parsed record, or None."""
+    for rev in [f":1:{f}"] + [f"{b}:{f}" for b in git(root, "merge-base", "--all", "HEAD", "MERGE_HEAD").split()]:
+        text = git(root, "show", rev, strip=False)
+        if not text:
+            continue
+        try:
+            return json.loads(text)
+        except ValueError:
+            continue
+    return None
+
+
 def resolve_records(root, cfg, main_side):
     """Resolve a merge's conflicts in the harness's records: the status and the board as the main branch
     has them (`main_side` is git's stage for it: 2 when merging into it, 3 when bringing it in), the
@@ -3389,11 +3405,11 @@ def resolve_records(root, cfg, main_side):
                 fh.write(merged)
         elif f.startswith(harness_rel(root=root) + "/") and f.endswith(".json"):
             try:
-                sides = [json.loads(git(root, "show", f":{k}:{f}", strip=False) or "null") for k in (1, 2, 3)]
+                sides = [json.loads(git(root, "show", f":{k}:{f}", strip=False) or "null") for k in (2, 3)]
             except ValueError:
                 unresolved.append(f)
                 continue
-            save_json(p(root, f), merge_json(*sides))
+            save_json(p(root, f), merge_json(record_base(root, f), *sides))
         else:
             unresolved.append(f)
             continue
