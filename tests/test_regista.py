@@ -1161,6 +1161,45 @@ class GateRuns(unittest.TestCase):
         self.assertIn("'lint' was removed", reason)
         self.assertIn("data/**", reason)
 
+    def test_a_gate_made_only_faster_goes_through_when_the_project_allows_it(self):
+        # Ciprian, 12 November 2026: gate changes that only make checks faster may go through without asking him;
+        # anything that weakens a gate still goes to him.
+        P = 'python3 -c \'print("{\\"errors\\": 0}")\' pytest'  # prints the metric; the rest are its arguments
+        cfgfile = os.path.join(self.p.root, ".regista", "config.json")
+        c = regista.load_json(cfgfile, {})
+        c["gates"] = [{"name": "tests", "run": f"nice -n 10 {P} -q -m 'not slow' -n 2", "timeout": 600,
+                       "metrics": {"errors": {"better": "lower", "max": 3}}}]
+        regista.save_json(cfgfile, c)
+        sh(self.p.root, "git", "add", "-A")
+        sh(self.p.root, "git", "commit", "-q", "-m", "a pytest gate")
+        c["speedups_without_asking"] = True
+        regista.save_json(cfgfile, c)
+        out = self.commit()
+        self.assertEqual(decision(out), "ask")  # switching it on is the user's call
+        self.assertIn("only make a gate faster", out["hookSpecificOutput"]["permissionDecisionReason"])
+        sh(self.p.root, "git", "add", "-A")
+        sh(self.p.root, "git", "commit", "-q", "-m", "speed-ups allowed")
+        g = c["gates"][0]
+        g.update(run=f"nice -n 5 {P} -q -m 'not slow' -n 4 --maxfail=1 --durations=20 -p no:cacheprovider",
+                 timeout=900, when_changed=[])
+        g["metrics"]["errors"]["max"] = 2
+        regista.save_json(cfgfile, c)
+        self.assertIsNone(decision(self.commit()))  # faster, and one metric stricter
+        for weaker, said in (({"run": f"nice -n 5 {P} -q -m 'not slow and not ui' -n 4"}, "was changed"),
+                             ({"metrics": {"errors": {"better": "lower", "max": 5}}}, "allows more"),
+                             ({"metrics": {}}, "no longer checked"),
+                             ({"when_changed": ["src/**"]}, "fewer changed files"),
+                             ({"when": ["manual"]}, "no longer runs at commit")):
+            c2 = json.loads(json.dumps(c))
+            c2["gates"][0].update(weaker)
+            regista.save_json(cfgfile, c2)
+            out = self.commit()
+            self.assertEqual(decision(out), "ask", weaker)
+            self.assertIn(said, out["hookSpecificOutput"]["permissionDecisionReason"])
+        c["speedups_without_asking"] = False
+        regista.save_json(cfgfile, c)
+        self.assertEqual(decision(self.commit()), "ask")  # without the setting, any change to a gate asks
+
     def test_requirement_results_describe_commits_and_dont_churn(self):
         self.p.write(".regista/specs/stats.json", json.dumps({**SPEC, "requirements": [SPEC["requirements"][0]]}))
         self.p.write("tests/test_stats.py", "# covers: STATS-1\n")
@@ -2660,6 +2699,46 @@ class Fleet(unittest.TestCase):
         with open(runs, encoding="utf-8") as f:
             self.assertEqual(len(f.read().splitlines()), 3)
 
+    def worker_commit_in(self, name, rel, text, msg="feat: work"):
+        fp = os.path.join(self.wt(name), *rel.split("/"))
+        os.makedirs(os.path.dirname(fp), exist_ok=True)
+        with open(fp, "w", encoding="utf-8") as f:
+            f.write(text)
+        sh(self.wt(name), "git", "add", "-A")
+        sh(self.wt(name), "git", "commit", "-q", "-m", msg)
+
+    def test_merging_several_workers_runs_the_gates_once(self):
+        # Klotho's 0.6.8 (12 November 2026): two merges in a row each ran the 15-minute suite, the first on code
+        # the second replaced a quarter of an hour later.
+        runs = os.path.join(self.fake, "runs.log")
+        cfg_path = os.path.join(self.p.root, ".regista", "config.json")
+        c = jload(cfg_path)
+        c["gates"] = [{"name": "tests", "run": f'echo run >> "{runs}"; test ! -f broken.txt', "when": ["commit"]}]
+        jsave(cfg_path, c)
+        sh(self.p.root, "git", "commit", "-qam", "counting gate")
+        self.assertEqual(self.spawn("M2").returncode, 0)
+        self.assertEqual(self.spawn("M3").returncode, 0)
+        self.worker_commit_in("m2", "src/pages.py", "pages = 1\n")
+        self.worker_commit_in("m3", "src/charts.py", "charts = 1\n")
+        start = sh(self.p.root, "git", "rev-parse", "HEAD").strip()
+        self.worker_commit_in("m3", "broken.txt", "x\n")
+        r = self.fleet("merge", "m2,m3")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("back where it was", r.stdout)
+        self.assertEqual(sh(self.p.root, "git", "rev-parse", "HEAD").strip(), start)  # m2's merge went too
+        self.assertFalse(os.path.exists(os.path.join(self.p.root, "src", "pages.py")))
+        self.assertFalse(jload(os.path.join(self.p.root, ".regista", "fleet", "workers.json"))["m2"].get("merged_at"))
+        sh(self.wt("m3"), "git", "rm", "-q", "broken.txt")
+        sh(self.wt("m3"), "git", "commit", "-q", "-m", "fix")
+        os.remove(runs)
+        r = self.fleet("merge", "m2,m3")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("The gates ran once", r.stdout)
+        with open(runs, encoding="utf-8") as f:
+            self.assertEqual(len(f.read().splitlines()), 1)  # one run, on both
+        for rel in ("src/pages.py", "src/charts.py"):
+            self.assertTrue(os.path.isfile(os.path.join(self.p.root, *rel.split("/"))))
+
     def test_the_fingerprint_is_the_content_and_nothing_else(self):
         root, cfg = self.p.root, regista.load_config(self.p.root)
         fp = regista.state_fingerprint(root, cfg)
@@ -2682,6 +2761,32 @@ class Fleet(unittest.TestCase):
         os.rename(os.path.join(root, "src", "a.py"), os.path.join(root, "src", "b.py"))
         sh(root, "git", "add", "-A")
         self.assertNotEqual(regista.state_fingerprint(root, cfg), dirty)  # a rename moves the content
+
+    def test_a_release_commit_keeps_the_fingerprint_of_the_code_that_passed(self):
+        # Klotho's 0.6.8 (12 November 2026): the release commit set the version and added the changelog entry, and
+        # the 15-minute test suite ran a third time on code it had just passed.
+        root = self.p.root
+        lock = ('version = 1\n\n[[package]]\nname = "a"\nversion = "{a}"\n\n'
+                '[[package]]\nname = "app"\nversion = "{v}"\n')
+        proj = '[project]\nname = "app"\nversion = "{v}"\ndependencies = ["a=={d}"]\n'
+        self.p.write("pyproject.toml", proj.format(v="1.0.0", d=1))
+        self.p.write("uv.lock", lock.format(a="1.0.0", v="1.0.0"))
+        self.p.write("CHANGELOG.md", "# Changelog\n")
+        sh(root, "git", "add", "-A")
+        sh(root, "git", "commit", "-q", "-m", "files")
+        plain = regista.load_config(root)
+        cfg = {**plain, "release": {"version_files": ["pyproject.toml", "uv.lock"]}}
+        fp, fp_plain = regista.state_fingerprint(root, cfg), regista.state_fingerprint(root, plain)
+        self.p.write("pyproject.toml", proj.format(v="1.0.1", d=1))
+        self.p.write("uv.lock", lock.format(a="1.0.0", v="1.0.1"))
+        self.p.write("CHANGELOG.md", "# Changelog\n\n## [1.0.1]\n- Fixed things.\n")
+        self.assertEqual(regista.state_fingerprint(root, cfg), fp)  # only the release's own edits
+        self.assertNotEqual(regista.state_fingerprint(root, plain), fp_plain)  # without release settings, they count
+        self.p.write("uv.lock", lock.format(a="1.0.2", v="1.0.1"))
+        self.assertNotEqual(regista.state_fingerprint(root, cfg), fp)  # a dependency's version is code
+        self.p.write("uv.lock", lock.format(a="1.0.0", v="1.0.1"))
+        self.p.write("pyproject.toml", proj.format(v="1.0.1", d=2))
+        self.assertNotEqual(regista.state_fingerprint(root, cfg), fp)  # so is anything else in a version file
 
     def test_a_worker_brings_in_the_projects_work(self):
         # Regista's own build: a worker couldn't merge the main branch into its own, because the results file
@@ -2789,6 +2894,37 @@ class Fleet(unittest.TestCase):
         sh(w, "git", "commit", "-q", "-m", "feat: the pages")
         self.assertIn("- [x] the pages", sh(w, "git", "show", "HEAD:.regista/plan.md"))
         self.assertIn("- [ ] the pages", sh(self.p.root, "git", "show", "HEAD:.regista/plan.md"))
+
+    def test_a_workers_commit_runs_only_the_affected_tests_and_the_merge_runs_them_all(self):
+        # Klotho, 12 November 2026: every worker commit waited 15 minutes for 2,124 tests, whatever it changed.
+        runs = os.path.join(self.fake, "runs.log")
+        cfg_path = os.path.join(self.p.root, ".regista", "config.json")
+        c = jload(cfg_path)
+        c["gates"] = [{"name": "tests", "run": f'echo all >> "{runs}"',
+                       "run_affected": f'echo some {{files}} >> "{runs}"', "when": ["commit"]}]
+        jsave(cfg_path, c)
+        sh(self.p.root, "git", "commit", "-qam", "a gate with an affected-tests command")
+        self.spawn()
+        w = self.wt()
+        os.makedirs(os.path.join(w, "src"), exist_ok=True)
+        with open(os.path.join(w, "src", "pages.py"), "w", encoding="utf-8") as f:
+            f.write("pages = 1\n")
+        out = self.hook("pre-tool", bash('git add -A && git commit -m "feat: the pages"'), cwd=w)
+        self.assertIsNone(decision(out), out)
+        sh(w, "git", "add", "-A")
+        sh(w, "git", "commit", "-q", "-m", "feat: the pages")
+        with open(runs, encoding="utf-8") as f:
+            self.assertEqual(f.read().split(), ["some", "src/pages.py"])
+        r = self.fleet("merge", "m2")  # the same code: the partial run doesn't stand in for the whole gate
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("reused", r.stdout)
+        with open(runs, encoding="utf-8") as f:
+            self.assertEqual(f.read().split()[-1], "all")
+        self.p.write("src/own.py", "own = 1\n")  # the overseer's own commit runs everything
+        os.remove(runs)
+        self.assertIsNone(decision(self.p.hook("pre-tool", bash('git add -A && git commit -m "own"'))))
+        with open(runs, encoding="utf-8") as f:
+            self.assertEqual(f.read().split(), ["all"])
 
     def test_a_worker_waiting_on_its_agents_isnt_sent_to_report(self):
         self.spawn()

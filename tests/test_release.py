@@ -216,6 +216,37 @@ class LongChecks(unittest.TestCase):
         self.assertIn("FAILED", out)
         self.assertIn("> max 1.5", out)
 
+    def test_a_ratchet_gate_moves_its_baseline_when_every_number_is_as_good(self):
+        # Klotho, 11-12 November 2026: new real captures joined the end-to-end set; the check "failed" only because
+        # its totals grew, and the new baseline waited about 16 hours for a hand-run script.
+        self.gate["metrics"] = {"captures": {"better": "higher"}, "lost": {"better": "lower", "max": 0},
+                                "spread_pct": {"better": "lower", "tolerance": 0.5}}
+        self.gate["ratchet"] = True
+        set_config(self.p, gates=[self.gate])
+        path = os.path.join(self.p.root, ".regista", "gates", "baseline.json")
+        base = lambda: json.loads(text(path))["real"]["metrics"]  # noqa: E731
+
+        n = [1]
+
+        def run(line):  # a new commit each time: a pass on the same code isn't run again
+            n[0] += 1
+            self.p.commit("src/a.py", f"x = {n[0]}\n", "code")
+            cli(self.p, "gate", "real", "--start")
+            self.say(line)
+            return cli(self.p, "gate", "--collect").stdout
+        self.assertIn("baseline moved", run('{"captures": 52, "lost": 0, "spread_pct": 5.5}'))  # the first one
+        out = run('{"captures": 82, "lost": 0, "spread_pct": 5.3}')
+        self.assertIn("PASSED", out)
+        self.assertIn("baseline moved", out)
+        self.assertEqual(base(), {"captures": 82, "lost": 0, "spread_pct": 5.5})  # 0.2 better is within the noise
+        self.assertNotIn("baseline moved", run('{"captures": 82, "lost": 0, "spread_pct": 5.9}'))  # passes, worse
+        self.assertEqual(base()["spread_pct"], 5.5)
+        self.assertIn("FAILED", run('{"captures": 80, "lost": 0, "spread_pct": 5.5}'))  # two captures gone
+        self.assertEqual(base()["captures"], 82)
+        self.gate["ratchet"] = False
+        set_config(self.p, gates=[self.gate])
+        self.assertNotIn("baseline moved", run('{"captures": 90, "lost": 0, "spread_pct": 5.5}'))
+
     def test_status_it_cant_read_keeps_it_open(self):
         cli(self.p, "gate", "real", "--start")
         self.say("ssh: connect to host staging: Connection refused")

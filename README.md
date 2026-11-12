@@ -583,6 +583,22 @@ The same `regista.py` runs Codex's hooks with `--host codex` (`hooks/codex-hooks
   browser suites on one test database collide). A gate that passed on exactly the current files (the
   harness's own records aside) isn't run again: the builder's or the reviewer's passing run counts for
   the commit. `regista.py gate --fresh` runs everything anyway; `"reuse_passing_runs": false` turns it off.
+  A release's own edits don't count either: with `release` settings, the changelog and the version number
+  in each version file are left out, so the release commit reuses the pass of the code before it (anything
+  else in those files, a dependency say, still counts).
+- **Several workers, one gate run.** `regista.py fleet merge m2,m3` merges each in turn and runs the commit
+  gates once, on the last merge, which holds them all. If a merge or the gates fail, the project goes back
+  to where it was and none of them is merged.
+- **A baseline that moves forward on its own.** `"ratchet": true` on a gate with metrics: a run on the
+  current commit that passes and is as good or better on every number becomes the new baseline, without
+  `--accept`. A number that improved by less than its tolerance keeps its old value, so a lucky run doesn't
+  tighten the gate; a run that is worse on any number moves nothing.
+- **Speed-ups without asking.** With `"speedups_without_asking": true` (switching it on needs the user's
+  OK), a change to a gate goes through without asking when it only makes the gate faster or stricter: a new
+  timeout or budget, more events or paths that start it, more test files, tighter metrics, and in its
+  command only pytest's parallel workers, stopping at the first failure, the run order, timings, output and
+  cache, or the memory and priority caps around it. Any other change to its command, a dropped event, path,
+  test file or metric, or a looser metric still asks.
 - **Gate commands run only through the harness.** An agent (or the main session) that runs a gate's
   command itself, `npm run e2e` with or without extra arguments, is refused and told to run
   `regista.py gate e2e`, which takes the lock. A gate's command is the last one in its `run` that isn't

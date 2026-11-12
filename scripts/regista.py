@@ -455,6 +455,25 @@ def select_gates(cfg, names=None, event=None, include_manual=False, files=None):
     return out
 
 
+def scope_affected_gates(root, cfg, gates, files):
+    """In a worker's commit, a gate with a `run_affected` command runs that instead of `run`, its {files}
+    placeholder filled with the commit's changed files: the project's own script picks the tests they affect.
+    Such a run is never kept as a pass of the whole gate, and doesn't record which requirements pass; the
+    whole gate runs at the merge, at a release, before a deploy, with `regista.py gate`, and in the overseer's
+    own commits."""
+    if not worker_info(root) or not files:
+        return gates
+    import shlex
+    out = []
+    for g in gates:
+        if g.get("run_affected") and not g.get("_skip") and not g.get("_only") and not detached(g) \
+                and not g.get("metrics"):
+            out.append({**g, "_affected": fill(g["run_affected"], files=" ".join(shlex.quote(f) for f in files))})
+        else:
+            out.append(g)
+    return out
+
+
 def scope_e2e_gates(root, cfg, gates, files):
     """At an ordinary commit, an end-to-end gate with a `run_some` command (its {files} placeholder gets the
     test files) runs only its test files that cover requirements of the milestones the commit works on, plus
@@ -553,11 +572,38 @@ def state_fingerprint(root, cfg):
             mode = (before[path].split(" ")[0] if os.name == "nt" else  # Windows keeps no executable bit
                     "100755" if os.stat(p(root, path)).st_mode & 0o100 else "100644")
             tree[path] = f"{mode} {oid}"
+    for path, oid in release_edits_out(root, cfg).items():  # a release's own edits don't void a passing run
+        if path in tree:
+            tree[path] = tree[path].split(" ")[0] + " " + oid
     h = hashlib.sha256()
     for path in sorted(tree):
         if not bookkeeping(root, cfg, path):
             h.update(path.encode() + b"\0" + tree[path].encode() + b"\n")
     return h.hexdigest()[:20]
+
+
+def release_edits_out(root, cfg):
+    """What a release writes, taken out of the files it writes to: the changelog counts as empty, and each
+    version file counts with its version number replaced by a placeholder. Returns {path: content id} for the
+    files there are, so a release commit that only sets the version and adds its changelog entry has the
+    fingerprint of the code that passed before it. Only for projects with release settings; anything else in
+    those files (a dependency, a script) still changes the fingerprint."""
+    import hashlib
+    if not cfg.get("release"):
+        return {}
+    out = {}
+    cl = release_settings(cfg).get("changelog")
+    if cl and os.path.isfile(p(root, cl)):
+        out[cl] = "changelog"
+    for path, rx in version_spots(root, cfg):
+        text = read_exact(p(root, path)) if rx and os.path.isfile(p(root, path)) else None
+        if text is None:
+            continue
+        m = re.search(rx, text)
+        if m:
+            text = text[:m.start(1)] + "{version}" + text[m.end(1):]
+        out[path] = "version:" + hashlib.sha1(text.encode("utf-8", "surrogateescape")).hexdigest()
+    return out
 
 
 def passed_path(root):
@@ -672,7 +718,7 @@ def _run_gates(root, cfg, gates, accept, budget, started, reuse):
                                 "tail": "Make the commit gates faster, or move slow ones to when: [\"manual\"]."})
                 continue
             timeout = min(timeout, int(left))
-        cmd = g["run"]
+        cmd = g.get("_affected") or g["run"]
         if g.get("_only"):  # only some of its test files (scope_e2e_gates)
             import shlex
             cmd = fill(g["run_some"], files=" ".join(shlex.quote(f) for f in g["_only"]))
@@ -681,6 +727,8 @@ def _run_gates(root, cfg, gates, accept, budget, started, reuse):
         res = {"name": g["name"], "exit": code, "seconds": round(time.time() - t0, 1)}
         if g.get("_only"):
             res.update(only=g["_only"], of=g["_of"], milestones=g["_for"])
+        if g.get("_affected"):
+            res["affected"] = True
         fails = [] if code == 0 else [f"command exited {code}"]
         if g.get("metrics"):
             values = last_json(out) or {}
@@ -701,7 +749,7 @@ def _run_gates(root, cfg, gates, accept, budget, started, reuse):
     with open(harness_path(root, "gates", "history.jsonl"), "a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
     fresh = [r for r in results if r["status"] == "pass" and not r.get("reused") and not r.get("elsewhere")
-             and not r.get("only")]  # a run of some test files says nothing about the whole suite
+             and not r.get("only") and not r.get("affected")]  # a run of some tests says nothing about the whole suite
     if fresh and state_fingerprint(root, cfg) == fp:  # a run that changed the files proves nothing about them
         runs = {g["name"]: g["run"] for g in gates}
         entry = passed.get(fp) or {"gates": {}}
@@ -733,6 +781,8 @@ def format_results(results):
             continue
         m = ", ".join(f"{k}={v}" for k, v in (r.get("metrics") or {}).items())
         again = f", reused: it passed at {r['reused'][11:16]} on exactly these files" if r.get("reused") else ""
+        if r.get("affected"):
+            again += ", only the tests this change affects (the whole gate runs at the merge)"
         if r.get("only"):
             again += (f", only {len(r['only'])} of its {r['of']} test files: the ones for "
                       f"{' and '.join(r.get('milestones') or [])}")
@@ -920,6 +970,29 @@ def detached_verdict(code, out):
     return None, values or {}
 
 
+def ratchet_baseline(gate, metrics, baseline):
+    """For a gate with "ratchet": true, the new baseline after a passing run that is as good as the baseline or
+    better on every metric, or None when nothing would change. A number that improved by less than its
+    tolerance keeps the old value, so a lucky run within the noise doesn't tighten the gate. A run that is
+    worse on any number moves nothing (it passed only within the tolerance): that stays the user's call."""
+    old = (baseline.get(gate["name"]) or {}).get("metrics") or {}
+    new = dict(old)
+    for name, rule in (gate.get("metrics") or {}).items():
+        v, base = metrics.get(name), old.get(name)
+        if not isinstance(v, (int, float)):
+            return None
+        better = rule.get("better") or ("lower" if "max" in rule else "higher" if "min" in rule else None)
+        if not isinstance(base, (int, float)) or not better:
+            new[name] = v
+            continue
+        gain = (base - v) if better == "lower" else (v - base)
+        if gain < 0:
+            return None
+        if gain > rule.get("tolerance", 0) or gain == 0 and not rule.get("tolerance"):
+            new[name] = v
+    return new if new != old else None
+
+
 def detached_collect(root, cfg, names=None, accept=False, budget=None):
     """Ask each running long check for its result and record the ones that finished. Returns lines. With
     `budget` (seconds, for session start), stops asking when it runs out."""
@@ -968,6 +1041,12 @@ def detached_collect(root, cfg, names=None, accept=False, budget=None):
         if not fails and accept and metrics:
             baseline[r["gate"]] = {"metrics": metrics, "date": r["collected"], "commit": r["sha"][:7]}
             save_json(baseline_path(root), baseline)
+        elif not fails and metrics and g.get("ratchet") and r["sha"] == git(root, "rev-parse", "HEAD"):
+            moved = ratchet_baseline(g, metrics, baseline)
+            if moved:
+                baseline[r["gate"]] = {"metrics": moved, "date": r["collected"], "commit": r["sha"][:7]}
+                save_json(baseline_path(root), baseline)
+                lines.append("    · its baseline moved to this run, which is as good or better on every number")
     if finished:
         done = {(x["gate"], x["label"]): x for x in finished}
         runs = [done.get((x.get("gate"), x.get("label")), x) for x in runs]
@@ -1071,6 +1150,101 @@ def harness_only(root, cfg, files):
     return True
 
 
+# Command-line parts that change how fast a gate runs, not what it checks. Before the test runner: the wrappers
+# that cap memory and priority. In pytest's own arguments: parallel workers, stopping at the first failure, the
+# run order, timings, output and the cache. Elsewhere (grep -v, test -x) the same letters change what passes.
+WRAPPER_WORDS = re.compile(r"^(systemd-run|--user|--scope|-q|nice|MemoryMax=\w+|MemorySwapMax=\w+|CPUQuota=\w+%?)$")
+WRAPPER_PAIRS = re.compile(r"^(-n|-p)$")
+PYTEST_WORDS = re.compile(r"^(-q+|-x|--exitfirst|--maxfail=\d+|--durations=\d+|--durations-min=[\d.]+|-n\d+|"
+                          r"--numprocesses=\w+|--dist=\w+|--ff|--failed-first|--nf|--new-first|--no-header|"
+                          r"--tb=\w+)$")
+PYTEST_PAIRS = re.compile(r"^(-n|--maxfail|--durations|--numprocesses|--dist|--tb)$")
+PYTEST_PLUGINS_OFF = re.compile(r"^no:(cacheprovider|randomly)$")
+SHELL_BREAKS = ("&&", "||", ";", "|")
+
+
+def speed_words(cmd):
+    """The command's words without the parts that only change its speed, or None when it can't be split."""
+    import shlex
+    try:
+        words = shlex.split(cmd)
+    except ValueError:
+        return None
+    runner = next((k for k, w in enumerate(words) if w == "pytest" or w.endswith("/pytest")), None)
+    out, k = [], 0
+    while k < len(words):
+        w, nxt = words[k], words[k + 1] if k + 1 < len(words) else ""
+        before = runner is not None and k < runner
+        after = runner is not None and k > runner and not any(b in SHELL_BREAKS for b in words[runner:k])
+        if before and WRAPPER_WORDS.match(w):
+            k += 1
+            continue
+        if before and WRAPPER_PAIRS.match(w) and (w == "-n" or re.match(r"^\w+=\w+%?$", nxt)):
+            k += 2
+            continue
+        if after and (PYTEST_WORDS.match(w)):
+            k += 1
+            continue
+        if after and PYTEST_PAIRS.match(w):
+            k += 2
+            continue
+        if after and ((w == "-p" and PYTEST_PLUGINS_OFF.match(nxt)) or
+                      (w == "-o" and nxt.startswith("faulthandler_timeout="))):
+            k += 2
+            continue
+        out.append(w)
+        k += 1
+    return out
+
+
+def gate_change_loosens(old, new):
+    """What a change to one gate loosens, [] when it only makes the gate faster or stricter, or None when that
+    can't be told (a new command, other than speed flags; a long check's start or status; anything unknown).
+    Stricter or faster: a timeout or a budget changed, more events or paths that start it, more test files,
+    tighter metrics, and in its command only parallel workers, stopping at the first failure, the run order,
+    timings, output and the memory and priority caps."""
+    out = []
+    known = {"name", "run", "when", "when_changed", "paths", "timeout", "budget_seconds", "tests", "metrics",
+             "evidence"}
+    if any(old.get(k) != new.get(k) for k in set(old) | set(new) if k not in known):
+        return None
+    if old.get("run") != new.get("run"):
+        a, b = speed_words(old.get("run") or ""), speed_words(new.get("run") or "")
+        if a is None or b is None or a != b:
+            return None
+    if old.get("evidence") != new.get("evidence"):
+        return None
+
+    def as_list(x):
+        return [x] if isinstance(x, str) else list(x or [])
+    gone = [e for e in as_list(old.get("when", ["commit"])) if e not in as_list(new.get("when", ["commit"]))]
+    if gone:
+        out.append(f"it no longer runs at {', '.join(gone)}")
+    po, pn = gate_paths(old), gate_paths(new)
+    if pn and (not po or any(x not in pn for x in po)):
+        out.append("it runs for fewer changed files")
+    lost = [t for t in as_list(old.get("tests")) if t not in as_list(new.get("tests"))]
+    if lost:
+        out.append(f"it no longer counts {', '.join(lost[:5])}")
+    om, nm = old.get("metrics") or {}, new.get("metrics") or {}
+    for name, rule in om.items():
+        r2 = nm.get(name)
+        if r2 is None:
+            out.append(f"the metric {name} is no longer checked")
+            continue
+        if r2.get("better", rule.get("better")) != rule.get("better") and rule.get("better"):
+            out.append(f"the metric {name} changed direction")
+        if r2.get("tolerance", 0) > rule.get("tolerance", 0):
+            out.append(f"the metric {name} tolerates more")
+        if "max" in rule and ("max" not in r2 or r2["max"] > rule["max"]):
+            out.append(f"the metric {name} allows more")
+        if "min" in rule and ("min" not in r2 or r2["min"] < rule["min"]):
+            out.append(f"the metric {name} allows less")
+        if rule.get("no_worse", True) and not r2.get("no_worse", True):
+            out.append(f"the metric {name} may now get worse")
+    return out
+
+
 def config_loosened(root, cfg):
     """What the working config loosens compared with the last commit's (plain-language list). Adding a
     gate or a protected path is fine; removing or changing one, or switching a check off, isn't. During a
@@ -1084,7 +1258,10 @@ def config_loosened(root, cfg):
         if g.get("name") not in new_gates:
             out.append(f"the gate '{g.get('name')}' was removed")
         elif new_gates[g.get("name")] != g:
-            out.append(f"the gate '{g.get('name')}' was changed")
+            why = gate_change_loosens(g, new_gates[g.get("name")]) if cfg.get("speedups_without_asking") else None
+            if why is None:
+                out.append(f"the gate '{g.get('name')}' was changed")
+            out += [f"the gate '{g.get('name')}': {x}" for x in why or []]
     olds = {g.get("name") for g in old["gates"]}
     for g in cfg["gates"]:  # a gate's test files are guarded like tests: the test writer may change them
         lits = [re.split(r"[*?\[]", str(x), 1)[0] for x in g.get("tests") or []] if g.get("name") not in olds else []
@@ -1113,6 +1290,8 @@ def config_loosened(root, cfg):
         out.append("the main session may now edit code itself (solo mode)")
     if (old.get("deploy") or {}).get("ref") == "tag" and (cfg.get("deploy") or {}).get("ref") != "tag":
         out.append("deploys no longer need a release tag")
+    if cfg.get("speedups_without_asking") and not old.get("speedups_without_asking"):
+        out.append("changes that only make a gate faster now go through without the user's OK")
     order = {"block": 0, "ask": 1, "allow": 2}
     if order.get(cfg["push"], 2) > order.get(old["push"], 2):
         out.append(f"pushing went from '{old['push']}' to '{cfg['push']}'")
@@ -1552,7 +1731,8 @@ def record_requirements(root, cfg, results):
     status = {r["name"]: r["status"] for r in results}
     commit_gates_ok = all(r["status"] != "fail" for r in results)
     e2e_names = {g["name"] for g in e2e_gates(cfg)}
-    tests_ran = any(r["name"] not in e2e_names and r["status"] in ("pass", "fail") for r in results)
+    tests_ran = any(r["name"] not in e2e_names and r["status"] in ("pass", "fail") and not r.get("affected")
+                    for r in results)
     only = {r["name"]: r["only"] for r in results if r.get("only")}  # gates that ran some of their test files
     marks = test_markers(root, sorted({f for fs in only.values() for f in fs}))
     before = load_json(requirements_path(root), {})
@@ -3450,9 +3630,9 @@ def wait_until_idle(w, seconds):
         time.sleep(min(2.0, max(0.1, deadline - time.time())))
 
 
-def fleet_merge(root, cfg, name, force=False, wait=None):
+def fleet_merge(root, cfg, name, force=False, wait=None, gates_run=True):
     """Merge a worker's branch into the project: one merge commit, made only when the commit gates
-    pass on the merged code. The overseer's status and board stay as they are. A busy worker gets `wait`
+    pass on the merged code (with `gates_run` False, fleet_merge_many runs them once on the last merge). The overseer's status and board stay as they are. A busy worker gets `wait`
     seconds (fleet.merge_wait, 60 by default) to finish its turn. Returns (ok, lines)."""
     if worker_info(root):
         return False, [f"{DISPLAY_NAME}: only the overseer merges. Tell it your work is ready (SendMessage)."]
@@ -3509,7 +3689,7 @@ def fleet_merge(root, cfg, name, force=False, wait=None):
     if not ok:
         abort_merge(root, moved)
         return False, ["Not merged."] + installed
-    gates = [] if harness_only(root, cfg, files) else select_gates(cfg, event="commit", files=files)
+    gates = [] if harness_only(root, cfg, files) or not gates_run else select_gates(cfg, event="commit", files=files)
     results = run_gates(root, cfg, gates) if gates else []
     failed = [r for r in results if r["status"] == "fail"]
     if failed:
@@ -3547,6 +3727,62 @@ def fleet_merge(root, cfg, name, force=False, wait=None):
                      "to bring this work into its branch with `regista.py fleet sync`.")
     return True, lines
 
+
+def fleet_merge_many(root, cfg, names, force=False, wait=None):
+    """Merge several workers' branches one after another and run the commit gates once, on the last merge,
+    which holds all of them: each merge's own run would test code the next merge replaces. When a merge or
+    the gates fail, the project goes back to where it was, with every worker unmerged. Returns (ok, lines)."""
+    if len(names) < 2:
+        return fleet_merge(root, cfg, names[0] if names else "", force, wait=wait)
+    if worker_info(root):
+        return False, [f"{DISPLAY_NAME}: only the overseer merges. Tell it your work is ready (SendMessage)."]
+    if len(set(names)) != len(names):
+        return False, ["Name each worker once."]
+    workers = load_workers(root)
+    missing = [n for n in names if not workers.get(n) or workers[n].get("state") == "removed"]
+    if missing:
+        return False, [f"There's no worker {', '.join(missing)}. `regista.py fleet` lists them."]
+    empty = [n for n in names if git(root, "rev-list", "--count", f"HEAD..{workers[n]['branch']}") in ("", "0")]
+    names = [n for n in names if n not in empty]
+    lines = [f"Nothing to merge from {', '.join(empty)}: no commits that aren't in the project yet."] if empty else []
+    if len(names) < 2:
+        if not names:
+            return True, lines
+        ok, out = fleet_merge(root, cfg, names[0], force, wait=wait)
+        return ok, lines + out
+    problem, saved = commit_harness_records(root, cfg, f"Save the harness's records before merging {', '.join(names)}")
+    if problem:
+        return False, lines + [f"Not merged: {problem[0]}"]
+    start = git(root, "rev-parse", "HEAD")
+    for k, name in enumerate(names):
+        ok, out = fleet_merge(root, cfg, name, force, wait=wait, gates_run=k == len(names) - 1)
+        lines += out
+        if not ok:
+            if git(root, "rev-parse", "HEAD") != start:
+                kept = keep_uncommitted(root)
+                call(["git", "-C", root, "reset", "-q", "--hard", start])
+                if kept:
+                    lines.append(f"Files that changed while the merges ran ({', '.join(kept['files'][:5])}) are copied "
+                                 f"to {kept['folder']} before going back; compare and bring back what you need.")
+            save_workers(root, workers)
+            done = names[:k]
+            return False, lines + ["Not merged: the project is back where it was" +
+                                   (f", so {', '.join(done)} {'is' if len(done) == 1 else 'are'} not merged either."
+                                    if done else ".")]
+    return True, lines + [f"The gates ran once, on the code of all {len(names)} merges."]
+
+
+def keep_uncommitted(root):
+    """Copies of the tracked files with uncommitted changes (a hook's log lines, say) in a folder under the
+    harness folder, before a hard reset would lose them. Returns {"folder", "files"} or None."""
+    files = [f for f in git(root, "diff", "--name-only", "HEAD").splitlines() if f and os.path.isfile(p(root, f))]
+    if not files:
+        return None
+    folder = harness_rel("kept", dt.datetime.now().strftime("%Y%m%d-%H%M%S"), root=root)
+    for f in files:
+        os.makedirs(os.path.dirname(p(root, folder + "/" + f)), exist_ok=True)
+        shutil.copy2(p(root, f), p(root, folder + "/" + f))
+    return {"folder": folder, "files": files}
 
 def fleet_sync(root, cfg):
     """A worker brings the project's newer work (the overseer's branch) into its own branch. The harness's
@@ -8102,7 +8338,8 @@ def commit_check(root, cfg, data=None):
     gates = [] if harness_only(root, cfg, files) else select_gates(cfg, event="commit", files=files)
     results = []
     if gates:
-        results = run_gates(root, cfg, scope_e2e_gates(root, cfg, gates, files), budget=HOOK_GATE_BUDGET)
+        results = run_gates(root, cfg, scope_affected_gates(root, cfg, scope_e2e_gates(root, cfg, gates, files), files),
+                            budget=HOOK_GATE_BUDGET)
         over = budget_note(cfg, gates, results)
         if over:
             HOOK_CTX.setdefault("notes", []).append(f"{DISPLAY_NAME}: {over}")
@@ -10280,7 +10517,8 @@ def main():
                                       "show its screen, or read their news; pass on the user's OK to one; in a worker, sync brings in the project's work")
     fl.add_argument("action", nargs="?", default="status",
                     choices=["status", "spawn", "merge", "stop", "resume", "remove", "show", "news", "sync", "allow"])
-    fl.add_argument("target", nargs="?", default="", help="(spawn) a milestone, e.g. M3; (others) the worker's name")
+    fl.add_argument("target", nargs="?", default="", help="(spawn) a milestone, e.g. M3; (merge) a worker's name, or several separated by commas (m2,m3) "
+                                                    "to run the gates once on all of them; (others) the worker's name")
     fl.add_argument("once", nargs="?", choices=["once"], help="(allow) the user's OK covers that one action, once")
     fl.add_argument("--name", default="", help="(spawn) the worker's name (default: the milestone)")
     fl.add_argument("--task", default="", help="(spawn) a task in words, instead of or on top of a milestone")
@@ -10558,7 +10796,9 @@ def main():
             ok, lines = fleet_spawn(root, cfg, milestone=a.target if is_m else "",
                                     name=a.name or ("" if is_m else a.target), task=a.task, force=a.force)
         elif a.action == "merge":
-            ok, lines = fleet_merge(root, cfg, a.target, a.force, wait=a.when_idle)
+            names = [x.strip() for x in a.target.split(",") if x.strip()]
+            ok, lines = (fleet_merge_many(root, cfg, names, a.force, wait=a.when_idle) if len(names) > 1
+                         else fleet_merge(root, cfg, a.target, a.force, wait=a.when_idle))
         elif a.action == "stop":
             ok, lines = fleet_stop(root, cfg, a.target)
         elif a.action == "resume":
