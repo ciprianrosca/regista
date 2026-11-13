@@ -170,7 +170,8 @@ context says so).
      harness records when each agent starts and finishes, doesn't count that stop as stalling, and their
      completion notices wake you.
    - **Deploying** (when `config.json` has a `deploy` section): deploy only with `regista.py deploy`, which runs
-     the live checks after it; never run the deploy command yourself. Deploy after a milestone that
+     the live checks after it, then the after-deploy checks, rolling back if one fails; never run the deploy
+     command yourself, and use `--no-checks` only when the user asks for it in an emergency. Deploy after a milestone that
      changes what's live, and before the final report. When the project deploys tagged releases only
      (`deploy.ref: "tag"`), deploy with `regista.py release` (a patch, unless the user asked for more).
    - **Never push.** Pushing stays the user's call (the hook asks anyway).

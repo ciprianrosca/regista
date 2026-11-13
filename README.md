@@ -637,7 +637,8 @@ The same `regista.py` runs Codex's hooks with `--host codex` (`hooks/codex-hooks
 - **Checks after the deploy.** `"after_deploy": true` on a release gate: the release goes live without waiting
   for it. A gate that runs here runs right after the deploy, and a long check starts on the release; when one
   fails, the last good release goes back live with the project's deploy command (once, and only while the
-  failing release is still the one live). Use it for slow checks of a test server that people can live without
+  failing release is still the one live). A release tagged with `--no-push` and deployed later with
+  `regista.py deploy` gets the same checks and the same rollback. Use it for slow checks of a test server that people can live without
   for an hour, never for a production site whose users would see the failure.
 - **Speed-ups without asking.** With `"speedups_without_asking": true` (switching it on needs the user's
   OK), a change to a gate goes through without asking when it only makes the gate faster or stricter: a new
@@ -737,7 +738,10 @@ old code), so a project that deploys says how, and how to check the result where
 `regista.py deploy` deploys the last commit (it refuses uncommitted work), then runs the `deploy` gates and
 records which commit is live and whether its checks passed (`.regista/gates/deployed.json`), committing
 that record and the requirement results on their own. A deploy gate with
-`when_changed` runs when those paths changed since the last deploy whose checks passed.
+`when_changed` runs when those paths changed since the last deploy whose checks passed. Then the release
+gates marked `"after_deploy": true` run against what's live, chosen as `release` chooses them, and a failure
+puts the previous good deploy back live. `regista.py deploy --no-checks` skips those (not the `deploy` gates)
+and with them the rollback: it's for emergencies, and an agent needs your OK to use it.
 
 `"ref": "tag"` makes the server run tagged releases only: `regista.py deploy` deploys the release tag of the
 current code (`regista.py release` makes one, and deploys it), and refuses when there's none. The deploy
@@ -777,7 +781,7 @@ requirement proven by a live test (`covers: LIVE-1`) passes only through a deplo
 A release above a patch is your decision: when an agent runs `release minor` or `release major` (or the
 files carry a bigger version), the hook asks you first; in Codex it's refused and the agent asks you in the
 chat. `regista.py release --check` shows what a release would do and what's missing, and `--no-push` stops
-after the tag. Only the main session releases; workers and agents are refused.
+after the tag; a later `regista.py deploy` then runs the after-deploy checks and rolls back if one fails. Only the main session releases; workers and agents are refused.
 
 **Merging through pull requests.** Regista's workers merge with `fleet merge`, locally. A project whose
 builders open pull requests on GitHub can use these pieces around them today:

@@ -1879,15 +1879,19 @@ def long_check_reasons(root, cfg, event):
 # The gates check the repository; a deploy can still serve something else (cached assets, data built
 # by the old code). With a `deploy` section in the config, `regista.py deploy` ships a commit and then
 # runs the gates marked `"when": ["deploy"]` against the live system, and records which commit is
-# live and whether those checks passed (the harness folder's gates/deployed.json, committed). Agents deploy only
-# through it: the deploy command itself is refused, so the live checks can't be skipped.
+# live and whether those checks passed (the harness folder's gates/deployed.json, committed). Then the release
+# gates marked "after_deploy" run against it, exactly as `release` runs them, and a failure puts the previous
+# release back live (`deploy --no-checks` skips them, for emergencies only). Agents deploy only through it: the
+# deploy command itself is refused, so the live checks can't be skipped.
 
 def deployed_path(root):
     return harness_path(root, "gates", "deployed.json")
 
 
-def deploy(root, cfg):
-    """Deploy HEAD and check the live result. Returns (ok, lines)."""
+def deploy(root, cfg, after_checks=True, after_gates=None):
+    """Deploy HEAD and check the live result. Then, unless `after_checks` is False, run the release's "after_deploy"
+    gates against it and roll back when one fails; `after_gates` is the list `release` already chose (None: choose
+    them here, the same way). Returns (ok, lines)."""
     if fast_mode(root):
         return False, [f"{DISPLAY_NAME}: this is a prototype (a fast-forward worker), so it doesn't deploy. "
                        f"`{PY} \"{DD}\" ff try` shows it; `{PY} \"{DD}\" ff land` brings it in for a real release."]
@@ -1906,6 +1910,7 @@ def deploy(root, cfg):
             return False, ["This project deploys tagged releases only (deploy.ref is \"tag\"), and the last commit "
                            "isn't a release. Make one with `regista.py release`, which deploys it."]
         head = tagged
+    name = tag or release_tag_for(root, cfg)[0]  # the release being deployed, if HEAD's code is one
     whole = [g for g in select_gates(cfg, event="commit") if g.get("run_some") and not g.get("_skip")]
     if whole:  # commits may have run only some of these tests: the whole suite passes before anything goes live
         results = run_gates(root, cfg, whole)
@@ -1945,7 +1950,19 @@ def deploy(root, cfg):
                           f"Record the deploy of {head}: {state}" + (f"; {changed}" if changed else ""))
     if note:
         lines.append(note)
-    return rec["ok"], lines
+    if not rec["ok"]:
+        return False, lines
+    if after_gates is None:
+        after_gates = deploy_after_gates(root, cfg, name)
+    if not after_gates:
+        return True, lines
+    if not after_checks:
+        lines += ["", "Skipped the checks that run after a deploy (" + ", ".join(g["name"] for g in after_gates) +
+                  "), as asked: nothing rolls this deploy back if it's broken. Run them with `regista.py deploy` "
+                  "once the emergency is over."]
+        return True, lines
+    ok, alines = after_deploy_checks(root, cfg, after_gates, last, name or head)
+    return ok, lines + ["", *alines]
 
 
 def live_text(root, cfg):
@@ -2286,6 +2303,23 @@ def release_gates(root, cfg, plan):
     return select_gates(cfg, event="release", files=since)
 
 
+def after_deploy_gates(gates):
+    """The gates marked "after_deploy" among a release's gates: they run once it's live, and roll it back if
+    they fail."""
+    return [g for g in gates if g.get("after_deploy") and not g.get("_skip")]
+
+
+def deploy_after_gates(root, cfg, tag=""):
+    """The "after_deploy" gates for a deploy of release `tag` (or, without one, of the code after the last
+    release), chosen as `release` chooses them: judged against what changed since the release before it."""
+    rx = tag_regex(release_settings(cfg)["tag"])
+    m = rx.fullmatch(tag) if tag else None
+    versions = released_versions(root, cfg)
+    if m:
+        versions = [v for v in versions if version_key(v) < version_key(m.group(1))]
+    return after_deploy_gates(release_gates(root, cfg, {"previous": versions[-1] if versions else ""}))
+
+
 def release(root, cfg, level=None, check=False, push=True):
     """Make a release. Returns (ok, lines), in plain language."""
     if fast_mode(root):
@@ -2302,7 +2336,7 @@ def release(root, cfg, level=None, check=False, push=True):
     kind = ("the first release" if plan["level"] == "first" else f"a {plan['level']} release after {prev}")
     gates = release_gates(root, cfg, plan)
     deploys = bool(rs["deploy"] and (cfg.get("deploy") or {}).get("run"))
-    after_gates = [g for g in gates if g.get("after_deploy") and not g.get("_skip")] if deploys else []
+    after_gates = after_deploy_gates(gates) if deploys else []
     gates = [g for g in gates if g not in after_gates]  # those run once the release is live, and roll it back if they fail
     ignore = [f for f, _, _ in plan["bump"]] + ([cl] if cl else [])  # the release's own edits don't void a long check
     longs = [detached_result(root, cfg, g, ignore) for g in gates if detached(g) and not g.get("_skip")]
@@ -2376,7 +2410,10 @@ def release(root, cfg, level=None, check=False, push=True):
     later = ([f"push the tag: `git push {rs['remote']} {tag}`"] +
              ([f"publish its release page: `gh release create {tag} --verify-tag --title \"{title}\" --notes-file -` "
                f"with the changelog's {new} section as the notes"] if rs["github_release"] else []) +
-             (["deploy it: `regista.py deploy`"] if rs["deploy"] and (cfg.get("deploy") or {}).get("run") else []))
+             (["deploy it: `regista.py deploy`" +
+               (", which then runs the checks that wait for the live release (" +
+                ", ".join(g["name"] for g in after_gates) + ") and puts the previous release back live if one fails"
+                if after_gates else "")] if deploys else []))
     if not push or cfg["push"] == "block":
         why = "You asked for no push" if not push else "Pushing is off for this project"
         lines.append(f"{why}, so the rest is yours to do:\n" + "\n".join(f"- {x}" for x in later))
@@ -2410,15 +2447,9 @@ def release(root, cfg, level=None, check=False, push=True):
                     code, out = 1, str(e)
                 lines.append(f"- Published the release page on GitHub from the changelog's {new} section." if code == 0
                              else f"- The GitHub release page failed ({out.strip()[-300:]}). Create it with: {later[1]}.")
-    if deploys:
-        before = load_json(deployed_path(root), {})
-        ok, dlines = deploy(root, cfg)
-        lines += ["", *dlines]
-        if ok and after_gates:
-            ok2, alines = after_deploy_checks(root, cfg, after_gates, before, tag)
-            lines += ["", *alines]
-            ok = ok and ok2
-        return ok, lines
+    if deploys:  # the deploy runs the after-deploy checks this release chose, and rolls back if one fails
+        ok, dlines = deploy(root, cfg, after_gates=after_gates)
+        return ok, lines + ["", *dlines]
     return True, lines
 
 
@@ -2487,8 +2518,13 @@ def gh_publishes(eff):
 
 def release_guard(root, cfg, data):
     """`regista.py release` from an agent: a release above a patch is the user's call, and so are the pushes
-    it makes when the project's push policy is "ask". Only the main session releases."""
+    it makes when the project's push policy is "ask". Only the main session releases. A deploy that skips the
+    after-deploy checks (`deploy --no-checks`) is the user's call too."""
     eff = effects_of(root, data)
+    if eff and runs_cli(eff, "deploy", "--no-checks"):
+        ask(f"{DISPLAY_NAME}: `deploy --no-checks` skips the checks that run after a deploy, and with them the "
+            "automatic rollback. It's for emergencies, and it needs the user's go-ahead.", "deploy_no_checks")
+        return
     if not eff or not runs_cli(eff, "release"):
         return
     words = next((w for w in eff["runs"] if "release" in w and any(x.endswith(("regista.py", "scripts/regista"))
@@ -10910,7 +10946,10 @@ def main():
     rn = sub.add_parser("run", help="the build-all run: start it, end it, or show the milestones left")
     rn.add_argument("action", nargs="?", choices=["status", "start", "end"], default="status")
     rn.add_argument("--reason", default="", help="(end) why the run ends: all done, or what waits on the user")
-    sub.add_parser("deploy", help="deploy HEAD with config deploy.run, then run the live checks (gates when: deploy)")
+    dp = sub.add_parser("deploy", help="deploy HEAD with config deploy.run, run the live checks (gates when: deploy), "
+                                       "then the release's after_deploy gates, putting the previous release back if one fails")
+    dp.add_argument("--no-checks", action="store_true", help="emergencies only: skip the after_deploy gates and with "
+                                                             "them the automatic rollback (the live checks still run)")
     sub.add_parser("preview", help="in a prototype's worktree (a fast-forward worker): run fast_forward.preview.run, "
                                    "so the user can look at it")
     ff = sub.add_parser("ff", help="fast-forward branches: build a feature on ff/<name> with the light rules and try "
@@ -10922,7 +10961,8 @@ def main():
                                         "(with the user's OK), publish the notes and deploy")
     rl.add_argument("level", nargs="?", choices=LEVELS, help="which number to raise (default patch); above patch: the user only")
     rl.add_argument("--check", action="store_true", help="say what the release would do and what's missing; change nothing")
-    rl.add_argument("--no-push", action="store_true", help="commit and tag here only: no push, no release page, no deploy")
+    rl.add_argument("--no-push", action="store_true", help="commit and tag here only: no push, no release page, no "
+                                                           "deploy (a later `deploy` runs the after-deploy checks)")
     chg = sub.add_parser("change", help="changes to what gets built: list them, add one (the user), or mark one planned")
     chg.add_argument("action", nargs="?", choices=["list", "add", "done", "from-transcript"], default="list")
     chg.add_argument("what", nargs="*", help="(add) the change, in words; (done) its number; (from-transcript) the "
@@ -11163,7 +11203,7 @@ def main():
         print("\n".join(lines))
         sys.exit(0 if ok else 1)
     elif a.cmd == "deploy":
-        ok, lines = deploy(root, cfg)
+        ok, lines = deploy(root, cfg, after_checks=not a.no_checks)
         print("\n".join(lines))
         sys.exit(0 if ok else 1)
     elif a.cmd == "release":

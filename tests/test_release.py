@@ -437,6 +437,74 @@ class Releases(unittest.TestCase):
         self.assertEqual(text(self.deployed).strip(), "v0.5.3")
         self.assertNotIn("live again", cli(self.p, "gate", "--collect").stdout)
 
+    def after_deploy_gates(self, flag, count=None):
+        status = os.path.join(self.box, "status")
+        heavy = f"test ! -f {flag}" if count is None else f"echo run >> {count} && test ! -f {flag}"
+        set_config(self.p, gates=[{"name": "tests", "run": "echo ok"},
+                                  {"name": "heavy", "run": heavy, "when": ["release"], "after_deploy": True},
+                                  {"name": "real", "kind": "detached", "when": ["release"], "after_deploy": True,
+                                   "start": f"echo running > {status}", "status": f"cat {status}"}])
+        return status
+
+    def test_a_later_deploy_runs_the_after_deploy_checks_and_rolls_back(self):
+        # Tag now with `release --no-push`, deploy later with `deploy`: the deploy runs the same checks the release
+        # would have run once live, and puts the previous release back when one fails.
+        flag = os.path.join(self.box, "heavy-fails")
+        status = self.after_deploy_gates(flag)
+        self.changelog("0.5.3")
+        r = cli(self.p, "release", "--no-push", env=self.env)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("which then runs the checks that wait for the live release (heavy, real) and puts the previous "
+                      "release back live if one fails", r.stdout)
+        self.assertNotIn("heavy: PASS", r.stdout)
+        self.assertFalse(os.path.exists(self.deployed))
+        r = cli(self.p, "deploy")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(text(self.deployed).strip(), "v0.5.3")
+        self.assertIn("heavy: PASS", r.stdout)
+        self.assertIn("Started the long check 'real'", r.stdout)
+        with open(status, "w") as f:
+            f.write("pass")
+        cli(self.p, "gate", "--collect")
+        open(flag, "w").close()
+        self.p.commit("src/b.py", "y = 1\n")
+        self.changelog("0.5.4")
+        self.assertEqual(cli(self.p, "release", "--no-push", env=self.env).returncode, 0)
+        r = cli(self.p, "deploy")
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("heavy failed on v0.5.4, so v0.5.3 is live again", r.stdout)
+        self.assertEqual(text(self.deployed).strip(), "v0.5.3")
+        self.assertIn("Live: v0.5.3", cli(self.p, "status").stdout)
+
+    def test_deploy_no_checks_skips_them_and_needs_the_user(self):
+        flag = os.path.join(self.box, "heavy-fails")
+        self.after_deploy_gates(flag)
+        open(flag, "w").close()
+        self.changelog("0.5.3")
+        self.assertEqual(cli(self.p, "release", "--no-push", env=self.env).returncode, 0)
+        cmd = f'python "{TOOL}" deploy'
+        self.assertIsNone(decision(self.p.hook("pre-tool", as_agent(None, "Bash", command=cmd))))
+        out = self.p.hook("pre-tool", as_agent(None, "Bash", command=cmd + " --no-checks"))
+        self.assertEqual(decision(out), "ask")
+        self.assertIn("automatic rollback", out["hookSpecificOutput"]["permissionDecisionReason"])
+        r = cli(self.p, "deploy", "--no-checks")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("Skipped the checks that run after a deploy (heavy, real)", r.stdout)
+        self.assertNotIn("heavy:", r.stdout)
+        self.assertNotIn("Started the long check", r.stdout)
+        self.assertEqual(text(self.deployed).strip(), "v0.5.3")
+
+    def test_release_runs_the_after_deploy_checks_once(self):
+        count = os.path.join(self.box, "heavy-runs")
+        status = self.after_deploy_gates(os.path.join(self.box, "never"), count=count)
+        self.changelog("0.5.3")
+        r = cli(self.p, "release", env=self.env)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(text(count).split(), ["run"])
+        self.assertEqual(r.stdout.count("heavy: PASS"), 1)
+        self.assertEqual(r.stdout.count("Started the long check 'real'"), 1)
+        self.assertEqual(text(status).strip(), "running")
+
     def test_release_waits_for_a_long_check_on_this_code(self):
         status = os.path.join(self.box, "status")
         set_config(self.p, gates=[{"name": "real", "kind": "detached", "when": ["release"],
