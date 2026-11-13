@@ -29,8 +29,9 @@ Only when the user wants to keep the feature:
 
 1. `regista.py ff land` in the branch's folder: the branch becomes one uncommitted change on `land/<name>`,
    from the project's current code, in the same folder, and the full rules apply again.
-2. Bring it up to standard the normal way (`/regista:build`'s loop): the requirements as a spec, the test
-   writer, the builder, the review, the gates. Drop what was only there for the demo. Commit.
+2. Bring it up to standard the normal way, as `/regista:build`'s section on a landed fast-forward change says:
+   the requirements as a spec, the test writer, the builder, the review, the gates. The prototype's code is kept
+   and fixed where the tests or the review fail it, not rewritten. Drop what was only there for the demo. Commit.
 3. `cd` back to the project folder, then `regista.py ff merge <name>`: the commit gates run on the merged code,
    and the branch's folder and branches are cleared.
 

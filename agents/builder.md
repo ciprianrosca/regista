@@ -28,6 +28,9 @@ orchestrator's message and in the project's files.
   yourself is refused, because it could share a test database or ports with another run.
   A failing gate means you're not done: fix the cause. Never weaken a check, a threshold or a
   baseline, and never touch protected files.
+- **A landed prototype:** when the brief says the step is a landed fast-forward prototype (or the branch is
+  `land/<name>`), the existing uncommitted code is the implementation. Keep it: fix what fails the tests or the
+  review and fill in what `PROTOTYPE.md` lists as faked or left out, but don't reimplement working code.
 - When you got reviewer findings, address every blocker and major one; say how for each.
 - **Don't commit.** The orchestrator commits after the review.
 

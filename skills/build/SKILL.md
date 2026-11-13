@@ -99,6 +99,22 @@ start hook tells each one the project root, the CLI path and its own rules.
 For `build M<n>`, repeat steps 3–9 until the milestone's gate is met or a step is blocked, then save
 and report: steps done, gate numbers, review rounds, and what's blocking, if anything.
 
+## Building on a landed fast-forward change
+
+After `/regista:ff land`, the session is on a `land/<name>` branch, with the prototype as one uncommitted
+change. That code already works and is the starting point: don't rewrite it. Run steps 3–9 above, with these
+differences:
+- **Spec (step 3):** write the requirements from what the prototype does plus what the task asks. Read
+  `PROTOTYPE.md` for what was faked or left out; those gaps become requirements too.
+- **Tests (step 5):** as usual. The test writer works from the spec and still doesn't read the implementation.
+- **Build (step 6):** tell the builder the step is a landed prototype on `land/<name>`, so the uncommitted code
+  is the implementation to keep. It changes only what fails the tests or the review, plus what `PROTOTYPE.md`
+  lists as faked or left out, then deletes `PROTOTYPE.md`. Code that was only there for the demo goes too.
+- **Review (step 7):** the reviewer reviews the whole uncommitted change, the prototype's code included, not
+  only what the builder changed.
+
+Then commit, and bring it into the project with `/regista:ff merge <name>`.
+
 ## `/regista:build all`
 
 Build the whole plan, milestone after milestone, without stopping in between. It's for the user who

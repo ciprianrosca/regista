@@ -4035,7 +4035,9 @@ def ff_land(root, cfg, name=""):
              os.path.isfile(p(wt, "PROTOTYPE.md")) else "")
     return True, [f"{info['branch']} is now one uncommitted change on {land}, from the project's current code, in the "
                   f"same folder ({wt}). The full rules apply here again: the requirements as a spec, the test writer, "
-                  f"the builder, the review, and every commit gate.{notes} Drop what was only there for the demo.",
+                  f"the builder, the review, and every commit gate. The prototype's code is the starting point: keep it and "
+                  f"fix what the tests or the review fail, don't rewrite it.{notes} Drop what was only there for the "
+                  f"demo.",
                   f"When it's committed, bring it into the project from the project folder: `{PY} \"{DD}\" ff merge "
                   f"{info['name']}` (the commit gates run on the merged code)."]
 
