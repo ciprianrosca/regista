@@ -716,6 +716,14 @@ def _run_gates(root, cfg, gates, accept, budget, started, reuse):
             if not (g.get("metrics") and check_metrics(g, prev.get("metrics") or {}, baseline)):
                 results.append({**prev["result"], "reused": prev["at"]})
                 continue
+        why = unmet_needs(root, g)
+        if why:  # not run, and never a pass: whatever needs it waits for a run on a machine that has it
+            needs = ", ".join(gate_needs(g))
+            results.append({"name": g["name"], "status": "fail", "seconds": 0, "waiting": WAITING,
+                            "fails": [f"'{g['name']}' can't run on this machine: {why}. It counts as failed here "
+                                      f"until it runs on a machine that provides {needs} "
+                                      f"(`regista.py gate {g['name']}` there)."]})
+            continue
         timeout = g.get("timeout", 600)
         if budget is not None:
             left = budget - (time.time() - started)
@@ -782,8 +790,9 @@ def format_results(results):
         if r["status"] == "skipped":
             lines.append(f"- {r['name']}: skipped ({r['why']})")
             continue
-        if r.get("elsewhere"):
-            lines.append(f"- {r['name']}: {r['status'].upper()}, run elsewhere ({r['elsewhere']})")
+        if r.get("elsewhere") or r.get("waiting"):
+            where = f"run elsewhere ({r['elsewhere']})" if r.get("elsewhere") else f"not run ({r['waiting']})"
+            lines.append(f"- {r['name']}: {r['status'].upper()}, {where}")
             lines += [f"    · {fl}" for fl in r.get("fails", [])]
             continue
         m = ", ".join(f"{k}={v}" for k, v in (r.get("metrics") or {}).items())
@@ -833,12 +842,13 @@ def budget_note(cfg, gates, results):
 # pass on the same code. The records live in the harness folder's gates/detached.json (local), which only
 # the harness writes.
 #
-# Some checks can only run from a machine that has something (photos kept on one server, a production host):
-# the gate's "needs" names it, for the messages. A start command that can't reach it from here exits 75
-# (EX_TEMPFAIL, "try again later") or ends with a line "unavailable: <why>"; a status command can answer
-# "unavailable" too.
-# The run is then recorded as waiting: never a pass, so whatever needs the gate stays blocked until a start
-# from a machine that can run it replaces it.
+# Some checks can only run on a machine that has something (a GPU, a device lab, a licence server): the gate's
+# "needs" names it. A machine may say what it provides (REGISTA_PROVIDES, or the harness folder's local
+# machine.json); when it does and that doesn't cover the needs, the start command isn't run at all. Otherwise
+# the start command decides: it exits 75 (EX_TEMPFAIL, "try again later") or ends with a line
+# "unavailable: <why>"; a status command can answer "unavailable" too. The run is then recorded as waiting:
+# never a pass, so whatever needs the gate stays blocked until a start from a machine that can run it
+# replaces it.
 
 DETACHED_TIMEOUT = 6 * 3600  # seconds a long check may take before it counts as failed (the gate's "timeout")
 DETACHED_RUNNING = ("running", "active", "activating", "queued", "pending", "waiting", "started", "busy")
@@ -861,6 +871,46 @@ def gate_needs(g):
     """What a gate needs from the machine that runs it (its "needs"), as a list of short names."""
     needs = g.get("needs") or []
     return [str(x).strip() for x in ([needs] if isinstance(needs, str) else needs) if str(x).strip()]
+
+
+MACHINE_FILE = "machine.json"  # in the harness folder, local: what this machine provides, {"provides": [...]}
+PROVIDES_VAR = ENV_PREFIX + "PROVIDES"  # the same, comma-separated, for one shell or one service
+
+
+def machine_provides(root):
+    """What this machine says it provides, from PROVIDES_VAR and the harness folder's MACHINE_FILE together (a
+    worker reads its overseer's file too), or None when neither says anything: then only a gate's own commands
+    can tell whether it runs here. Saying it can't loosen anything: a need it doesn't cover keeps the gate from
+    running and from passing; a need it claims wrongly just lets the gate's command run and fail as before."""
+    have, said = [], False
+    env = os.environ.get(PROVIDES_VAR)
+    if env is not None:
+        said, have = True, [x.strip() for x in env.split(",") if x.strip()]
+    homes = [root] + [h for h in [overseer_root(root)] if h and h != root]
+    for home in homes:
+        data = load_json(harness_path(home, MACHINE_FILE), None)
+        items = data.get("provides") if isinstance(data, dict) else None
+        if isinstance(items, str):
+            items = items.split(",")
+        if isinstance(items, list):
+            said = True
+            have += [str(x).strip() for x in items if str(x).strip()]
+            break
+    seen = set()
+    return [x for x in have if not (x.lower() in seen or seen.add(x.lower()))] if said else None
+
+
+def unmet_needs(root, g):
+    """Why this machine can't run the gate ("this machine doesn't provide gpu (it provides: x, y)"), from what it
+    says it provides; None when the gate needs nothing, the machine says nothing, or it covers every need."""
+    needs, have = gate_needs(g), machine_provides(root)
+    if not needs or have is None:
+        return None
+    missing = [n for n in needs if n.lower() not in {x.lower() for x in have}]
+    if not missing:
+        return None
+    return (f"this machine doesn't provide {', '.join(missing)} "
+            f"(it provides: {', '.join(have) if have else 'nothing'})")
 
 
 def unavailable_reason(last, values=None):
@@ -964,8 +1014,9 @@ def detached_result(root, cfg, g, ignore=()):
 
 def detached_start(root, cfg, g, ref="HEAD", fresh=False):
     """Start a long check on a commit, elsewhere. Returns (ok, lines): ok is True (started, or already running or
-    passed), False (it didn't start), or "waiting" (its start command says it can't run from this machine: exit
-    75 or a last line "unavailable: <why>"; recorded as a waiting run, which never counts as a pass)."""
+    passed), False (it didn't start), or "waiting" (this machine says it doesn't provide what the gate needs, so
+    the start command isn't run, or the start command says it can't run from here: exit 75 or a last line
+    "unavailable: <why>"; recorded as a waiting run, which never counts as a pass)."""
     name = g["name"]
     if not (g.get("start") and g.get("status")):
         return False, [f"The long check '{name}' needs a \"start\" command and a \"status\" command in "
@@ -984,9 +1035,12 @@ def detached_start(root, cfg, g, ref="HEAD", fresh=False):
     label = f"{name}-{sha[:7]}-{dt.datetime.now():%m%d-%H%M%S}"
     values = {"sha": sha, "short": sha[:7], "label": label, "name": name}
     env = {**gate_env(root), ENV_PREFIX + "SHA": sha, ENV_PREFIX + "LABEL": label}
-    code, out = run_shell(fill(g["start"], **values), root, g.get("start_timeout", 300), env=env)
+    why = unmet_needs(root, g)  # this machine says it lacks something the gate needs: don't even try
+    code, out = (DETACHED_TEMPFAIL, "") if why else \
+        run_shell(fill(g["start"], **values), root, g.get("start_timeout", 300), env=env)
     lines = [x.strip() for x in out.strip().splitlines() if x.strip()]
-    why = unavailable_reason(lines[-1] if lines else "")
+    if why is None:
+        why = unavailable_reason(lines[-1] if lines else "")
     if why is None and code == DETACHED_TEMPFAIL:
         why = (lines[-1][:200] if lines else f"its start command exited {code} (try again later)")
     runs = [r for r in runs if not (r.get("gate") == name and r.get("sha") == sha and r.get("state") == "waiting")]
@@ -1838,11 +1892,13 @@ def record_requirements(root, cfg, results):
     tests the next) keeps the entry as it is, so the file doesn't churn with every run."""
     specs, _ = load_specs(root)
     cov = coverage(root, cfg, specs)
-    status = {r["name"]: r["status"] for r in results}
+    # A gate this machine couldn't run ("waiting") proves nothing either way: its requirements keep their last
+    # verdict, and so do the unit-tested ones, since the commit gates' verdict isn't known without it.
+    status = {r["name"]: r["status"] for r in results if not r.get("waiting")}
     commit_gates_ok = all(r["status"] != "fail" for r in results)
     e2e_names = {g["name"] for g in e2e_gates(cfg)}
     tests_ran = any(r["name"] not in e2e_names and r["status"] in ("pass", "fail") and not r.get("affected")
-                    for r in results)
+                    for r in results) and not any(r.get("waiting") for r in results)
     only = {r["name"]: r["only"] for r in results if r.get("only")}  # gates that ran some of their test files
     marks = test_markers(root, sorted({f for fs in only.values() for f in fs}))
     before = load_json(requirements_path(root), {})
@@ -9876,6 +9932,9 @@ def doctor(root, cfg):
     if not cfg["gates"]:
         bad.append(f"no checks configured → run setup again, or add a gate to {harness_rel('config.json', root=root)}")
     for g in cfg["gates"]:
+        why = unmet_needs(root, g)
+        if why:
+            info.append(f"check '{g['name']}' can't run on this machine: {why}")
         if detached(g):
             if not (g.get("start") and g.get("status")):
                 bad.append(f"long check '{g['name']}' needs a \"start\" and a \"status\" command")
@@ -9942,7 +10001,7 @@ def doctor(root, cfg):
 
 
 LOCAL_STATE = ["gates/last.json", "gates/history.jsonl", "gates/passed.json", "gates/.lock", "gates/detached.json",
-               "context.json",
+               "context.json", MACHINE_FILE,
                "compactions.jsonl", "hosts.json", "approvals.json", "hooks.log", "agents/", "reviews/draft.json",
                "run.json", "typed.json", "worker.json", "fleet/", "worktrees/", "usage.jsonl"]
 

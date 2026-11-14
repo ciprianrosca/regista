@@ -693,17 +693,29 @@ later:
 - Commits never wait for a long check: the commit hook leaves it out. A milestone with it in `when` isn't
   done (`regista.py milestone`) and a release with it isn't made until a pass on the current code is
   collected. `regista.py gate real` shows where it stands.
-- Some checks can only run from a machine that has something: photos kept on one server, the production host.
-  Name it in `"needs": ["brand-photos"]` (short names, shown in the messages). When the start command can't
-  reach that place from here (a cloud session whose ssh is refused, say), it exits 75 (`EX_TEMPFAIL`, "try
-  again later") or ends with a line `unavailable: <why>`; any other failure still reads as "didn't start". The
-  run is then recorded as **waiting for a machine that can run it**: `'real' can't run from this machine: ssh
-  refused. It needs brand-photos. It stays open until it runs from a machine that can`, and `gate --start`
-  exits 75 too. A status command can answer `unavailable` the same way (or a JSON line with `"status":
-  "unavailable"` and a `"reason"`). A waiting run is never a pass: a milestone or a release that needs the
-  gate stays blocked. Nothing runs, so `--collect` doesn't ask about it and its time limit doesn't apply; it
-  and session start only mention it. A later `gate real --start` from a machine that can run it replaces it
-  (no `--fresh` needed).
+- **Checks only some machines can run.** A gate that needs something not every machine has names it in
+  `"needs"`: `{"name": "hardware", "kind": "detached", "needs": ["gpu"], ...}` (short names of your choice:
+  `gpu`, `device-lab`, `licence-server`, `production-host`). A machine says what it provides in
+  `REGISTA_PROVIDES=gpu,device-lab` or in the harness folder's `machine.json`, `{"provides": ["gpu"]}`
+  (local: it's in the harness folder's `.gitignore` and never committed; both count when both are there).
+  - When the machine says what it provides and that doesn't cover the gate's needs, `gate hardware --start`
+    doesn't run the start command: the run is recorded as **waiting for a machine that can run it**
+    (`'hardware' can't run from this machine: this machine doesn't provide gpu (it provides: device-lab)`)
+    and the command exits 75.
+  - When it says nothing, the start command decides, as before. It exits 75 (`EX_TEMPFAIL`, "try again
+    later") or ends with a line `unavailable: <why>` to say it can't run from here; any other failure still
+    reads as "didn't start". A status command can answer `unavailable: <why>` too (or a JSON line with
+    `"status": "unavailable"` and a `"reason"`), which turns a running check into a waiting one.
+  - A waiting run is never a pass: a milestone or a release that needs the gate stays blocked. Nothing runs,
+    so `--collect` doesn't ask about it and its time limit doesn't apply; it and session start only mention
+    it. A later `--start` from a machine that can run it replaces it (no `--fresh` needed).
+  - An ordinary gate (`run`) with `needs` that this machine says it can't cover isn't run: it's reported as
+    failed, `not run (waiting for a machine that can run it)`, so whatever needs it (a commit, a milestone, a
+    release, a deploy's checks) waits for a pass from a machine that can. A requirement it checks keeps its
+    last result. For a check that only some machines can run, a long check (`"kind": "detached"`) usually fits
+    better, since commits don't wait for it.
+  - Saying what a machine provides never loosens anything: a missing need only stops a gate from running and
+    from passing, and a need claimed by mistake just lets the gate's own command run, and fail, as before.
 
 ### Cleaning up the tests
 
