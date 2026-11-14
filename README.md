@@ -675,13 +675,13 @@ hardware, would hold every commit. A gate with `"kind": "detached"` starts it th
 later:
 
 ```json
-{"name": "real", "kind": "detached", "when": ["milestone", "release"], "when_changed": ["src/ruler/**"],
- "start": "python tools/real_detached.py {sha} origin/main {label}",
+{"name": "soak", "kind": "detached", "when": ["milestone", "release"], "when_changed": ["src/engine/**"],
+ "start": "python tools/soak_start.py {sha} origin/main {label}",
  "status": "ssh staging 'cat ~/ci/out/{label}.result 2>/dev/null || echo running'", "timeout": 7200}
 ```
 
-- `regista.py gate real --start` runs `start` with `{sha}` (the commit), `{short}` and `{label}` (a name for
-  this run, like `real-1a2b3c4-1028-153000`) filled in, also given as `REGISTA_SHA` and `REGISTA_LABEL`. The
+- `regista.py gate soak --start` runs `start` with `{sha}` (the commit), `{short}` and `{label}` (a name for
+  this run, like `soak-1a2b3c4-1028-153000`) filled in, also given as `REGISTA_SHA` and `REGISTA_LABEL`. The
   command launches the run elsewhere (under its own name, so a closed ssh session can't kill it) and returns.
   The run is recorded against that commit; `--ref <commit>` checks another one, a pull request's head say.
 - `regista.py gate --collect` runs each open run's `status` command. Its last line says how it went: `pass`,
@@ -692,7 +692,62 @@ later:
   records changed, or, with `when_changed`, where none of those paths changed. Changing `start` voids it.
 - Commits never wait for a long check: the commit hook leaves it out. A milestone with it in `when` isn't
   done (`regista.py milestone`) and a release with it isn't made until a pass on the current code is
-  collected. `regista.py gate real` shows where it stands.
+  collected. `regista.py gate soak` shows where it stands.
+- **Checks only some machines can run.** A gate that needs something not every machine has names it in
+  `"needs"`: `{"name": "hardware", "kind": "detached", "needs": ["gpu"], ...}` (short names of your choice:
+  `gpu`, `device-lab`, `licence-server`, `production-host`). A machine says what it provides in
+  `REGISTA_PROVIDES=gpu,device-lab` or in the harness folder's `machine.json`, `{"provides": ["gpu"]}`
+  (local: it's in the harness folder's `.gitignore` and never committed; both count when both are there).
+  - When the machine says what it provides and that doesn't cover the gate's needs, `gate hardware --start`
+    doesn't run the start command: the run is recorded as **waiting for a machine that can run it**
+    (`'hardware' can't run from this machine: this machine doesn't provide gpu (it provides: device-lab)`)
+    and the command exits 75.
+  - When it says nothing, the start command decides, as before. It exits 75 (`EX_TEMPFAIL`, "try again
+    later") or ends with a line `unavailable: <why>` to say it can't run from here; any other failure still
+    reads as "didn't start". A status command can answer `unavailable: <why>` too (or a JSON line with
+    `"status": "unavailable"` and a `"reason"`), which turns a running check into a waiting one.
+  - A waiting run is never a pass: a milestone or a release that needs the gate stays blocked. Nothing runs,
+    so `--collect` doesn't ask about it and its time limit doesn't apply; it and session start only mention
+    it. A later `--start` from a machine that can run it replaces it (no `--fresh` needed).
+  - An ordinary gate (`run`) with `needs` that this machine says it can't cover isn't run: it's reported as
+    failed, `not run (waiting for a machine that can run it)`, so whatever needs it (a commit, a milestone, a
+    release) waits for a pass from a machine that can. A requirement it checks keeps its last result. For a
+    check that only some machines can run, a long check (`"kind": "detached"`) usually fits better, since
+    commits don't wait for it.
+  - **Sending it elsewhere.** An optional top-level `"elsewhere"` entry tells Regista how to send a gate to a
+    machine that can run it, best effort. It has a `start` and a `status` command, with the long checks'
+    protocol and placeholders (`{name}`, `{sha}`, `{short}`, `{label}`, and `{needs}`, the gate's needs
+    comma-separated; also in `REGISTA_SHA`, `REGISTA_LABEL` and `REGISTA_NEEDS`), and optional
+    `start_timeout`, `status_timeout` and `timeout` (seconds):
+
+    ```json
+    "elsewhere": {"start": "sh tools/send-to-runner.sh {name} {sha} {label} {needs}",
+                  "status": "sh tools/runner-status.sh {label}"}
+    ```
+
+    Here `send-to-runner.sh` might queue the gate on a GPU runner and return at once, and `runner-status.sh`
+    print `running`, `pass`, `fail` or `unavailable: <why>` on its last line. When a gate can't run on this
+    machine (its needs aren't covered, or a long check's own start exits 75 or says `unavailable:`), Regista
+    calls the redirect's `start` for that gate and that commit. A run it starts is recorded like a long check
+    (`running elsewhere via the redirect`) and collected the same ways: `gate --collect`, session start, and the
+    milestone and release checks. Its collected pass counts exactly like the gate's own, and only for the code
+    it ran on (or, for a gate with `when_changed`, code whose changes since don't touch those paths); a failure
+    on that code is a real failure (`gate <name> --fresh` sends it again). The redirect runs commits, so an
+    ordinary gate is sent from a clean tree (`regista.py gate <name>`), not from the commit hook, which only
+    counts a pass already collected. A collected pass of an end-to-end gate on the current code records its
+    requirements, as a long check's does. When there's no `"elsewhere"` entry, or its start exits 75 or says
+    `unavailable: <why>` (no machine reachable), the gate waits as above; any other failure of its start is
+    reported, and the gate stays failed. Running elsewhere is never a pass until its pass is collected.
+  - **After a deploy.** An after-deploy gate this machine can't run is not a failure: it doesn't roll the release
+    back. When it's sent elsewhere, it carries the rollback a long check started by the deploy carries: if it
+    later fails on the deployed release and that release is still live, collecting it puts the previous release
+    back. When nothing can run it, it waits. Either way the output says plainly that nothing has checked the
+    release yet and nothing rolls it back until the check runs, and `regista.py status` marks what's live as
+    `Not checked yet after the deploy: <gate> (...)` until it reports. It still never counts as a pass: a commit,
+    milestone or release that needs the gate stays blocked until a real pass exists for that code.
+  - Saying what a machine provides never loosens anything: a missing need only stops a gate from running and
+    from passing, and a need claimed by mistake just lets the gate's own command run, and fail, as before.
+    `regista.py doctor` names the gates this machine can't run and whether the redirect would take them.
 
 ### Cleaning up the tests
 
@@ -787,7 +842,7 @@ after the tag; a later `regista.py deploy` then runs the after-deploy checks and
 builders open pull requests on GitHub can use these pieces around them today:
 
 - Start the long checks on the pull request's head before merging: `git fetch origin pull/77/head`, then
-  `regista.py gate real --start --ref FETCH_HEAD`, and `--collect` it later.
+  `regista.py gate soak --start --ref FETCH_HEAD`, and `--collect` it later.
 - Merge on GitHub, then `git pull`. If the merge commit has the same code as the head the long check ran on,
   its pass still counts.
 - Release with `regista.py release`: if the pull request set the version and wrote the changelog entry, the
