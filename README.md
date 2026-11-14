@@ -675,13 +675,13 @@ hardware, would hold every commit. A gate with `"kind": "detached"` starts it th
 later:
 
 ```json
-{"name": "real", "kind": "detached", "when": ["milestone", "release"], "when_changed": ["src/ruler/**"],
- "start": "python tools/real_detached.py {sha} origin/main {label}",
+{"name": "soak", "kind": "detached", "when": ["milestone", "release"], "when_changed": ["src/engine/**"],
+ "start": "python tools/soak_start.py {sha} origin/main {label}",
  "status": "ssh staging 'cat ~/ci/out/{label}.result 2>/dev/null || echo running'", "timeout": 7200}
 ```
 
-- `regista.py gate real --start` runs `start` with `{sha}` (the commit), `{short}` and `{label}` (a name for
-  this run, like `real-1a2b3c4-1028-153000`) filled in, also given as `REGISTA_SHA` and `REGISTA_LABEL`. The
+- `regista.py gate soak --start` runs `start` with `{sha}` (the commit), `{short}` and `{label}` (a name for
+  this run, like `soak-1a2b3c4-1028-153000`) filled in, also given as `REGISTA_SHA` and `REGISTA_LABEL`. The
   command launches the run elsewhere (under its own name, so a closed ssh session can't kill it) and returns.
   The run is recorded against that commit; `--ref <commit>` checks another one, a pull request's head say.
 - `regista.py gate --collect` runs each open run's `status` command. Its last line says how it went: `pass`,
@@ -692,7 +692,7 @@ later:
   records changed, or, with `when_changed`, where none of those paths changed. Changing `start` voids it.
 - Commits never wait for a long check: the commit hook leaves it out. A milestone with it in `when` isn't
   done (`regista.py milestone`) and a release with it isn't made until a pass on the current code is
-  collected. `regista.py gate real` shows where it stands.
+  collected. `regista.py gate soak` shows where it stands.
 - **Checks only some machines can run.** A gate that needs something not every machine has names it in
   `"needs"`: `{"name": "hardware", "kind": "detached", "needs": ["gpu"], ...}` (short names of your choice:
   `gpu`, `device-lab`, `licence-server`, `production-host`). A machine says what it provides in
@@ -842,7 +842,7 @@ after the tag; a later `regista.py deploy` then runs the after-deploy checks and
 builders open pull requests on GitHub can use these pieces around them today:
 
 - Start the long checks on the pull request's head before merging: `git fetch origin pull/77/head`, then
-  `regista.py gate real --start --ref FETCH_HEAD`, and `--collect` it later.
+  `regista.py gate soak --start --ref FETCH_HEAD`, and `--collect` it later.
 - Merge on GitHub, then `git pull`. If the merge commit has the same code as the head the long check ran on,
   its pass still counts.
 - Release with `regista.py release`: if the pull request set the version and wrote the changelog entry, the
