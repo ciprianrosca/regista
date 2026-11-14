@@ -717,12 +717,8 @@ def _run_gates(root, cfg, gates, accept, budget, started, reuse):
                 results.append({**prev["result"], "reused": prev["at"]})
                 continue
         why = unmet_needs(root, g)
-        if why:  # not run, and never a pass: whatever needs it waits for a run on a machine that has it
-            needs = ", ".join(gate_needs(g))
-            results.append({"name": g["name"], "status": "fail", "seconds": 0, "waiting": WAITING,
-                            "fails": [f"'{g['name']}' can't run on this machine: {why}. It counts as failed here "
-                                      f"until it runs on a machine that provides {needs} "
-                                      f"(`regista.py gate {g['name']}` there)."]})
+        if why:  # not run here, and never a pass unless a run elsewhere passed on this code
+            results.append(away_result(root, cfg, g, why, send=budget is None, again=not reuse))
             continue
         timeout = g.get("timeout", 600)
         if budget is not None:
@@ -755,6 +751,11 @@ def _run_gates(root, cfg, gates, accept, budget, started, reuse):
             res["fails"] = fails
             res["tail"] = "\n".join(out.strip().splitlines()[-25:])
         results.append(res)
+        if gate_needs(g):  # it ran here: a run of it that was waiting for a machine that can isn't waiting any more
+            runs = detached_runs(root)
+            keep = [x for x in runs if not (x.get("gate") == g["name"] and x.get("state") == "waiting")]
+            if len(keep) != len(runs):
+                save_detached_runs(root, keep)
     record = {"date": dt.datetime.now().isoformat(timespec="seconds"),
               "commit": git(root, "rev-parse", "--short", "HEAD"), "results": results}
     over = budget_note(cfg, gates, results)
@@ -933,6 +934,77 @@ def waiting_text(g, reason):
             "--start`).")
 
 
+# A gate this machine can't run (its "needs" aren't covered, or a long check's own start says it's unavailable
+# from here) can be sent elsewhere, best effort: the config's optional "elsewhere" entry has a `start` and a
+# `status` command, with the long checks' protocol ({name}, {sha}, {short}, {label} and {needs}, the gate's needs
+# comma-separated; start returns at once, exit 75 or a last line "unavailable: <why>" when no machine is
+# reachable; status ends with pass, fail, running, unavailable or the gate's JSON line). A run it starts is
+# recorded like a long check's ("via": "elsewhere") and collected the same way; its collected pass counts as the
+# gate's own pass only for the code it ran on (or, with when_changed, code whose changes since don't touch those
+# paths). Without the entry, or when its start finds no machine either, the gate waits as before.
+
+REDIRECT = "elsewhere"  # the config entry, and a run's "via"
+REDIRECTED = "running elsewhere via the redirect"
+
+
+def redirect_cfg(cfg):
+    """The config's "elsewhere" entry when it has both commands, else None."""
+    r = cfg.get(REDIRECT)
+    return r if isinstance(r, dict) and r.get("start") and r.get("status") else None
+
+
+def redirected(r):
+    return r.get("via") == REDIRECT
+
+
+def same_command(r, g):
+    """Was run `r` a run of gate `g` as it's configured now (its start command, or for an ordinary gate sent
+    elsewhere, its run command)?"""
+    return r.get("start") == g.get("start") if detached(g) else (redirected(r) and r.get("run") == g.get("run"))
+
+
+def run_hint(g):
+    """How to run a gate from a machine that can."""
+    return f"`regista.py gate {g['name']}" + (" --start`" if detached(g) else "`")
+
+
+def redirect_start(root, cfg, g, sha, label=None):
+    """Send gate `g` on commit `sha` elsewhere with the "elsewhere" entry's start command. Returns (ok, info):
+    ok None (no redirect configured), True (started: info is the run record, not saved yet), "waiting" (its start
+    found no machine that can run it: info is the reason) or False (it failed: info says how)."""
+    rd = redirect_cfg(cfg)
+    if not rd:
+        return None, ""
+    name = g["name"]
+    label = label or f"{name}-{sha[:7]}-{dt.datetime.now():%m%d-%H%M%S}"
+    needs = ",".join(gate_needs(g))
+    values = {"sha": sha, "short": sha[:7], "label": label, "name": name, "needs": needs}
+    env = {**gate_env(root), ENV_PREFIX + "SHA": sha, ENV_PREFIX + "LABEL": label, ENV_PREFIX + "NEEDS": needs}
+    code, out = run_shell(fill(rd["start"], **values), root, rd.get("start_timeout", 300), env=env)
+    lines = [x.strip() for x in out.strip().splitlines() if x.strip()]
+    why = unavailable_reason(lines[-1] if lines else "")
+    if why is None and code == DETACHED_TEMPFAIL:
+        why = lines[-1][:200] if lines else f"its start command exited {code} (try again later)"
+    if why is not None:
+        return "waiting", why
+    if code != 0:
+        return False, (f"the redirect's start command exited {code}" +
+                       (": " + " / ".join(lines[-3:])[:400] if lines else ""))
+    run = {"gate": name, "sha": sha, "label": label, "via": REDIRECT, "state": "running",
+           "started": dt.datetime.now().isoformat(timespec="seconds")}
+    run.update({"start": g["start"]} if detached(g) else {"run": g.get("run")})
+    return True, run
+
+
+def redirect_note(sent, info):
+    """A plain sentence on a redirect that didn't start the gate, or ""."""
+    if sent == "waiting":
+        return f"The redirect found no machine that can run it either: {info}."
+    if sent is False:
+        return f"It couldn't be sent elsewhere: {info}."
+    return ""
+
+
 def fill(cmd, **values):
     """A command with its {name} placeholders filled in; other braces (awk, ${VAR}, git's ^{commit}) stay."""
     for k, v in values.items():
@@ -972,12 +1044,12 @@ def save_detached_runs(root, runs):
 
 
 def detached_cover(root, cfg, g, ignore=()):
-    """The collected pass of a long check that holds for the current code, or None: a pass, with today's
-    start command, on a commit with the same code (only the harness's records differ), or, for a gate with
-    when_changed, on a commit whose differences don't touch those paths."""
+    """The collected pass of a long check (or of a gate sent elsewhere via the redirect) that holds for the current
+    code, or None: a pass, with today's command, on a commit with the same code (only the harness's records
+    differ), or, for a gate with when_changed, on a commit whose differences don't touch those paths."""
     paths = gate_paths(g)
     for r in reversed(detached_runs(root)):
-        if r.get("gate") != g["name"] or r.get("state") != "pass" or r.get("start") != g.get("start"):
+        if r.get("gate") != g["name"] or r.get("state") != "pass" or not same_command(r, g):
             continue
         changed = changes_since(root, cfg, r["sha"], ignore)
         if changed is not None and (not changed or (paths and not any(matches(f, paths) for f in changed))):
@@ -1001,7 +1073,8 @@ def detached_result(root, cfg, g, ignore=()):
     if last and last.get("state") == "waiting":  # never a pass: it hasn't run at all
         why, elsewhere = waiting_text(g, last.get("reason") or "no reason given"), WAITING
     elif last and last.get("state") == "running":
-        why = (f"it's still running elsewhere (started {at(last)} on {head[:7]}): collect it with "
+        why = (f"it's still running elsewhere{' via the redirect' if redirected(last) else ''} (started {at(last)} "
+               f"on {head[:7]}): collect it with "
                f"`regista.py gate {name} --collect`")
     elif last and last.get("state") == "fail":
         why = (f"its run on {head[:7]} failed ({'; '.join(last.get('fails') or ['no reason given'])}): fix the cause, "
@@ -1010,6 +1083,56 @@ def detached_result(root, cfg, g, ignore=()):
         why = (f"it has no passing run on this code: start it with `regista.py gate {name} --start`, then collect "
                f"it with `regista.py gate {name} --collect` once it's done")
     return {"name": name, "status": "fail", "seconds": 0, "fails": [why], "elsewhere": elsewhere}
+
+
+def away_result(root, cfg, g, why, send=True, again=False):
+    """The result of an ordinary gate this machine can't run (`why`): a collected pass of it run elsewhere via the
+    redirect that holds for the current code; else a failure that isn't a verdict on the code ("waiting": it
+    wasn't run), after sending it elsewhere when the redirect is configured, the code is a commit (nothing
+    uncommitted that matters to it) and `send` (the commit hook doesn't wait for a start); or a real failure when
+    its run elsewhere on this very commit failed (`again`, from `gate --fresh`: send it once more instead)."""
+    name, ignore = g["name"], g.get("_ignore") or ()
+    at = lambda r: r.get("collected", r.get("started", "")).replace("T", " ")[:16]  # noqa: E731
+    hit = detached_cover(root, cfg, g, ignore)
+    if hit:
+        return {"name": name, "status": "pass", "seconds": hit.get("seconds", 0), "metrics": hit.get("metrics"),
+                "elsewhere": f"passed on {hit['sha'][:7]} via the redirect, collected {at(hit)}"}
+    base = f"'{name}' can't run on this machine: {why}."
+    wait = (f" It counts as failed here until it passes on a machine that provides {', '.join(gate_needs(g))} "
+            f"({run_hint(g)} there).")
+
+    def waiting(more, state=WAITING, tail=None):
+        res = {"name": name, "status": "fail", "seconds": 0, "waiting": state, "fails": [base + more]}
+        return {**res, "tail": tail} if tail else res
+    head = git(root, "rev-parse", "HEAD")
+    mine = [r for r in detached_runs(root) if r.get("gate") == name and same_command(r, g)  # on this code
+            and r.get("state") in ("running", "fail") and changes_since(root, cfg, r["sha"], ignore) == []]
+    last = mine[-1] if mine else None
+    if last and last.get("state") == "running":
+        return waiting(f" It's {REDIRECTED} (started {at(last)} on {last['sha'][:7]}): collect it with `regista.py gate "
+                       f"--collect`; its pass counts once it's collected.", REDIRECTED)
+    if last and last.get("state") == "fail" and not again:  # it ran, on exactly this commit, and failed: a real failure
+        return {"name": name, "status": "fail", "seconds": 0, "elsewhere": f"failed on {last['sha'][:7]} via the redirect",
+                "fails": [f"its run elsewhere via the redirect on {last['sha'][:7]} failed "
+                          f"({'; '.join(last.get('fails') or ['no reason given'])}): fix the cause and commit, or "
+                          f"send it again with `regista.py gate {name} --fresh`"],
+                **({"tail": last["tail"]} if last.get("tail") else {})}
+    if not redirect_cfg(cfg):
+        return waiting(wait)
+    pending = changes_since(root, cfg, head, ignore)
+    if pending is None or pending:
+        return waiting(wait + f" The redirect runs commits, so it can be sent elsewhere once the change is committed "
+                       f"({run_hint(g)} then).")
+    if not send:
+        return waiting(wait + f" Send it elsewhere with {run_hint(g)}.")
+    sent, info = redirect_start(root, cfg, g, head)
+    if sent is True:
+        runs = detached_runs(root)
+        save_detached_runs(root, [x for x in runs if not (x.get("gate") == name and x.get("state") == "waiting"
+                                                          and x.get("sha") == head)] + [info])
+        return waiting(f" It was sent elsewhere via the redirect, on {head[:7]} (its label: {info['label']}): collect "
+                       "it with `regista.py gate --collect`; its pass counts once it's collected.", REDIRECTED)
+    return waiting(wait + " " + redirect_note(sent, info))
 
 
 def detached_start(root, cfg, g, ref="HEAD", fresh=False):
@@ -1044,11 +1167,19 @@ def detached_start(root, cfg, g, ref="HEAD", fresh=False):
     if why is None and code == DETACHED_TEMPFAIL:
         why = (lines[-1][:200] if lines else f"its start command exited {code} (try again later)")
     runs = [r for r in runs if not (r.get("gate") == name and r.get("sha") == sha and r.get("state") == "waiting")]
-    if why is not None:  # replaces an earlier waiting run on this commit
+    if why is not None:  # can't run from here: send it elsewhere via the redirect, best effort, or wait
+        sent, info = redirect_start(root, cfg, g, sha, label)
+        if sent is True:
+            runs.append(info)
+            save_detached_runs(root, runs)
+            return True, [f"'{name}' can't run from this machine ({why.rstrip('. ')}), so it was sent elsewhere via "
+                          f"the redirect, on {sha[:7]} (its label: {label}). Collect the result with `regista.py gate "
+                          f"{name} --collect` when it's done (session start checks too); until then it's no pass."]
         runs.append({"gate": name, "sha": sha, "label": label, "start": g["start"], "state": "waiting",
                      "reason": why, "started": dt.datetime.now().isoformat(timespec="seconds")})
-        save_detached_runs(root, runs)
-        return "waiting", [waiting_text(g, why)]
+        save_detached_runs(root, runs)  # replaces an earlier waiting run on this commit
+        note = redirect_note(sent, info)
+        return "waiting", [waiting_text(g, why)] + ([note] if note else [])
     if code != 0:
         return False, [f"The long check '{name}' didn't start (its start command exited {code}). Its last lines:",
                        "\n".join(out.strip().splitlines()[-15:])]
@@ -1113,33 +1244,48 @@ def detached_collect(root, cfg, names=None, accept=False, budget=None):
     """Ask each running long check for its result and record the ones that finished. Returns lines. With
     `budget` (seconds, for session start), stops asking when it runs out. A waiting run (it couldn't run from
     this machine) has nothing running to ask: it's only mentioned, and its time limit doesn't apply."""
-    gates = {g["name"]: g for g in cfg["gates"] if detached(g)}
+    gates = {g["name"]: g for g in cfg["gates"]}
     runs, lines, started = detached_runs(root), [], time.time()
     baseline = load_json(baseline_path(root), {})
     finished, waited = [], []
+    rd = redirect_cfg(cfg)
     for r in newest_waiting(runs):
         if r["gate"] in gates and not (names and r["gate"] not in names):
             why = r.get("reason") or "no reason given"
-            lines.append(f"- {r['gate']} on {r['sha'][:7]}: {WAITING} (not run: {why}). Start it there with "
-                         f"`regista.py gate {r['gate']} --start`.")
+            lines.append(f"- {r['gate']} on {r['sha'][:7]}: {WAITING} (not run: {why}). Run it there with "
+                         f"{run_hint(gates[r['gate']])}.")
     for r in runs:
         g = gates.get(r.get("gate"))
         if r.get("state") != "running" or not g or (names and r["gate"] not in names):
+            continue
+        if not (detached(g) or redirected(r)):
+            continue
+        # a run sent elsewhere via the redirect is asked with the redirect's status command, under its limits
+        how = (rd or {}) if redirected(r) else g
+        if not how.get("status"):
+            lines.append(f"- {r['gate']} on {r['sha'][:7]}: {REDIRECTED}, but there's no \"{REDIRECT}\" entry with a "
+                         "status command any more to ask it. It stays open and is no pass.")
             continue
         left = None if budget is None else budget - (time.time() - started)
         if left is not None and left < 3:
             lines.append(f"- {r['gate']} on {r['sha'][:7]}: not checked this time (session start keeps it short).")
             continue
-        values = {"sha": r["sha"], "short": r["sha"][:7], "label": r["label"], "name": r["gate"]}
+        values = {"sha": r["sha"], "short": r["sha"][:7], "label": r["label"], "name": r["gate"],
+                  "needs": ",".join(gate_needs(g))}
         env = {**gate_env(root), ENV_PREFIX + "SHA": r["sha"], ENV_PREFIX + "LABEL": r["label"]}
-        timeout = g.get("status_timeout", 60) if left is None else max(1, min(g.get("status_timeout", 60), int(left)))
-        code, out = run_shell(fill(g["status"], **values), root, timeout, env=env)
+        if redirected(r):
+            env[ENV_PREFIX + "NEEDS"] = values["needs"]
+        else:
+            values.pop("needs")  # a long check's own status command has no {needs}: it stays as written
+        limit = how.get("timeout") or (g.get("timeout") if detached(g) else None) or DETACHED_TIMEOUT
+        timeout = how.get("status_timeout", 60) if left is None else max(1, min(how.get("status_timeout", 60), int(left)))
+        code, out = run_shell(fill(how["status"], **values), root, timeout, env=env)
         state, got = detached_verdict(code, out)
         since = r["started"].replace("T", " ")[:16]
         age = time.time() - dt.datetime.fromisoformat(r["started"]).timestamp()
-        if state in (None, "running") and age > g.get("timeout", DETACHED_TIMEOUT):
+        if state in (None, "running") and age > limit:
             state, got = "fail", {}
-            r["fails"] = [f"it didn't report a result within its time limit of {g.get('timeout', DETACHED_TIMEOUT) // 60} minutes"]
+            r["fails"] = [f"it didn't report a result within its time limit of {limit // 60} minutes"]
         if state is None:
             last = (out.strip().splitlines() or ["(nothing)"])[-1][:200]
             lines.append(f"- {r['gate']} on {r['sha'][:7]}: couldn't tell how it's doing (its status command exited "
@@ -1152,8 +1298,8 @@ def detached_collect(root, cfg, names=None, accept=False, budget=None):
             r.update(state="waiting", reason=got["reason"], waiting=now_iso())
             waited.append(r)
             lines.append(f"- {r['gate']} on {r['sha'][:7]}: {WAITING} (its status says it's unavailable from here: "
-                         f"{got['reason']}). It stays open; start it again from a machine that can "
-                         f"(`regista.py gate {r['gate']} --start`).")
+                         f"{got['reason']}). It stays open; run it again from a machine that can "
+                         f"({run_hint(g)}).")
             continue
         metrics = {k: got.get(k) for k in g.get("metrics") or {}}
         fails = r.get("fails") or ([] if state == "pass" else ["its run reported a failure"])
@@ -1165,13 +1311,15 @@ def detached_collect(root, cfg, names=None, accept=False, budget=None):
         r = {k: v for k, v in r.items() if v is not None}
         finished.append(r)
         m = ", ".join(f"{k}={v}" for k, v in metrics.items())
-        lines.append(f"- {r['gate']} on {r['sha'][:7]}: {'PASSED' if not fails else 'FAILED'}" + (f" ({m})" if m else "")
+        lines.append(f"- {r['gate']} on {r['sha'][:7]}{' (run elsewhere via the redirect)' if redirected(r) else ''}: "
+                     f"{'PASSED' if not fails else 'FAILED'}" + (f" ({m})" if m else "")
                      + "".join(f"\n    · {x}" for x in fails))
         if fails and r.get("deployed") and "rollback_to" in r and not r.get("rolled_back"):
             live = load_json(deployed_path(root), {})
             if (live.get("tag") or live.get("commit")) == r["deployed"]:  # still what's live: put the last good one back
                 lines += ["  " + x for x in rollback(root, cfg, r["rollback_to"],
-                                                     f"the long check {r['gate']} failed on {r['deployed']}")]
+                                                     f"the {'long check' if detached(g) else 'check'} {r['gate']} "
+                                                     f"failed on {r['deployed']}")]
                 r["rolled_back"] = now_iso()
         if not fails and accept and metrics:
             baseline[r["gate"]] = {"metrics": metrics, "date": r["collected"], "commit": r["sha"][:7]}
@@ -1190,7 +1338,8 @@ def detached_collect(root, cfg, names=None, accept=False, budget=None):
         # Requirement results describe committed code: record an end-to-end check that finished on it.
         e2e = {x["name"] for x in e2e_gates(cfg)}
         head = git(root, "rev-parse", "HEAD")
-        results = [{"name": x["gate"], "status": x["state"]} for x in finished if x["gate"] in e2e and x["sha"] == head]
+        results = [{"name": x["gate"], "status": x["state"]} for x in finished if x["gate"] in e2e and
+                   (x["sha"] == head or changes_since(root, cfg, x["sha"]) == [])]  # on this code (records aside)
         if results and not work_changes(root, cfg):
             record_requirements(root, cfg, results)
     return lines
@@ -1212,6 +1361,7 @@ def detached_text(root, cfg, collect=False):
         return ""
     lines = detached_collect(root, cfg, budget=20) if collect else [
         f"- {r['gate']} on {r['sha'][:7]}: running since {r['started'].replace('T', ' ')[:16]}"
+        + (" (sent elsewhere via the redirect)" if redirected(r) else "")
         for r in runs if r.get("state") == "running"] + [
         f"- {r['gate']} on {r['sha'][:7]}: {WAITING} ({r.get('reason') or 'no reason given'})"
         for r in newest_waiting(runs)]
@@ -1452,6 +1602,9 @@ def config_loosened(root, cfg):
             out.append(label)
     if old["mode"] == "orchestrated" and cfg["mode"] != "orchestrated":
         out.append("the main session may now edit code itself (solo mode)")
+    if cfg.get(REDIRECT) and cfg.get(REDIRECT) != old.get(REDIRECT):  # its status decides whether a gate sent there passes
+        out.append(f"where checks this machine can't run are sent (\"{REDIRECT}\") was added or changed, and what it "
+                   "reports counts as their pass")
     if (old.get("deploy") or {}).get("ref") == "tag" and (cfg.get("deploy") or {}).get("ref") != "tag":
         out.append("deploys no longer need a release tag")
     if cfg.get("speedups_without_asking") and not old.get("speedups_without_asking"):
@@ -2113,8 +2266,17 @@ def live_text(root, cfg):
               if not all(bookkeeping(root, cfg, f) for f in git(root, "show", "--name-only", "--format=", c).splitlines())]
     state = ("live checks passed" if rec.get("ok") else
              "the deploy FAILED" if rec.get("deploy", {}).get("exit") else "live checks FAILED")
+    live = rec.get("tag") or rec.get("commit")
+    open_ = {}  # the after-deploy checks of what's live that haven't reported yet: it's unchecked by them
+    for r in detached_runs(root):
+        if r.get("deployed") == live and r.get("state") in ("running", "waiting"):
+            open_[r["gate"]] = REDIRECTED if redirected(r) and r["state"] == "running" else \
+                "running elsewhere" if r["state"] == "running" else WAITING
+    unchecked = (" Not checked yet after the deploy: " + ", ".join(f"{k} ({v})" for k, v in open_.items()) +
+                 "; nothing rolls it back until they report.") if open_ and rec.get("ok") else ""
     return (f"Live: {rec['tag'] + ' (' + rec['commit'] + ')' if rec.get('tag') else rec['commit']}, deployed {rec['at'].replace('T', ' ')[:16]}, {state}"
-            + (f"; {len(behind)} code commit(s) since aren't deployed." if behind else "; it's the latest code."))
+            + (f"; {len(behind)} code commit(s) since aren't deployed." if behind else "; it's the latest code.")
+            + unchecked)
 
 
 def runs_deploy_command(cfg, eff):
@@ -2510,6 +2672,8 @@ def release(root, cfg, level=None, check=False, push=True):
         for path, text in before.items():
             write_exact(p(root, path), text)
     normal = [g for g in gates if not detached(g) or g.get("_skip")]
+    # a gate this machine can't run may count a pass from elsewhere on the code before the release's own edits
+    normal = [{**g, "_ignore": ignore} if gate_needs(g) and not detached(g) else g for g in normal]
     results = run_gates(root, cfg, normal) if normal else []
     failed = [r for r in results if r["status"] == "fail"]
     if failed:
@@ -2614,32 +2778,76 @@ def rollback(root, cfg, to, why):
             "\n".join(out.strip().splitlines()[-15:])]
 
 
+UNCHECKED = "Nothing has checked this release yet, and nothing rolls it back until this check runs."
+
+
 def after_deploy_checks(root, cfg, gates, before, tag):
     """The release's gates marked "after_deploy": the ones that run here run now, and a failure puts the previous
     release back live; long checks start on the release, and the one that fails rolls it back when it's
-    collected. Returns (ok, lines)."""
+    collected. A gate this machine can't run (its "needs") is no failure: it's sent elsewhere via the redirect,
+    carrying the rollback like a long check, or it waits, and the release stays live, unchecked by it. Returns
+    (ok, lines)."""
     lines, to = [], live_ref(before)
-    here = [g for g in gates if not detached(g)]
+    sha = git(root, "rev-parse", (tag or "HEAD") + "^{commit}")
+    deployed = tag or sha[:7]
+    ordinary = [g for g in gates if not detached(g)]
+    away = [g for g in ordinary if unmet_needs(root, g)]
+    here = [g for g in ordinary if g not in away]
     if here:
         results = run_gates(root, cfg, here)
         lines.append("Checks after the deploy:\n" + format_results(results))
-        failed = [r for r in results if r["status"] == "fail"]
+        failed = [r for r in results if r["status"] == "fail" and not r.get("waiting")]
         if failed:
             lines += rollback(root, cfg, to, f"{', '.join(r['name'] for r in failed)} failed on {tag}")
             return False, lines
+    for g in away:
+        lines += send_after_deploy(root, cfg, g, sha, deployed, to)
     for g in [g for g in gates if detached(g)]:
         ok, out = detached_start(root, cfg, g, ref=tag or "HEAD")
         lines += out
-        if ok == "waiting":
-            lines.append("  Until it runs, nothing checks this release and nothing rolls it back.")
         runs = detached_runs(root)
-        sha = git(root, "rev-parse", (tag or "HEAD") + "^{commit}")
+        if ok == "waiting":
+            lines.append("  " + UNCHECKED)
+            mine = [r for r in runs if r.get("gate") == g["name"] and r.get("sha") == sha and r.get("state") == "waiting"]
+            if mine:  # marks the release unchecked by it (`status` says so)
+                mine[-1].update(deployed=deployed)
+                save_detached_runs(root, runs)
         mine = [r for r in runs if r.get("gate") == g["name"] and r.get("sha") == sha and r.get("state") == "running"]
         if ok is True and mine:
-            mine[-1].update(deployed=tag or sha[:7], rollback_to=to)
+            mine[-1].update(deployed=deployed, rollback_to=to)
             save_detached_runs(root, runs)
             lines.append(f"  If it fails, {to or 'nothing (no earlier good deploy)'} goes back live.")
     return True, lines
+
+
+def send_after_deploy(root, cfg, g, sha, deployed, to):
+    """An after-deploy gate this machine can't run: sent elsewhere via the redirect, with the rollback a long
+    check started by the deploy carries, or recorded as waiting (the release stays live, unchecked by it).
+    Returns lines."""
+    name, why = g["name"], unmet_needs(root, g)
+    runs = detached_runs(root)
+    mine = [r for r in runs if r.get("gate") == name and r.get("sha") == sha and r.get("state") == "running"
+            and same_command(r, g)]
+    if mine:  # already sent on this commit: it carries this deploy's rollback
+        mine[-1].update(deployed=deployed, rollback_to=to)
+        save_detached_runs(root, runs)
+        return [f"'{name}' can't run on this machine ({why}); it's already {REDIRECTED} on {sha[:7]}.",
+                f"  If it fails, {to or 'nothing (no earlier good deploy)'} goes back live. Until it's collected, "
+                "nothing has checked this release."]
+    sent, info = redirect_start(root, cfg, g, sha)
+    runs = [r for r in runs if not (r.get("gate") == name and r.get("sha") == sha and r.get("state") == "waiting")]
+    if sent is True:
+        save_detached_runs(root, runs + [{**info, "deployed": deployed, "rollback_to": to}])
+        return [f"'{name}' can't run on this machine ({why}), so it was sent elsewhere via the redirect, on "
+                f"{sha[:7]} (its label: {info['label']}). Collect it with `regista.py gate --collect`.",
+                f"  If it fails, {to or 'nothing (no earlier good deploy)'} goes back live. Until it's collected, "
+                "nothing has checked this release."]
+    note = redirect_note(sent, info)
+    save_detached_runs(root, runs + [{"gate": name, "sha": sha, "label": f"{name}-{sha[:7]}-{dt.datetime.now():%m%d-%H%M%S}",
+                                      "run": g.get("run"), "state": "waiting", "reason": why, "deployed": deployed,
+                                      "started": now_iso()}])
+    return [f"'{name}' can't run on this machine: {why}. It's {WAITING}, not a failure, so the release stays live." +
+            (f" {note}" if note else ""), "  " + UNCHECKED]
 
 
 GH_PUBLISH = (["pr", "merge"], ["release", "create"], ["release", "edit"], ["release", "delete"], ["release", "upload"])
@@ -9931,10 +10139,19 @@ def doctor(root, cfg):
                    "no bash found → install bash")
     if not cfg["gates"]:
         bad.append(f"no checks configured → run setup again, or add a gate to {harness_rel('config.json', root=root)}")
+    rd = cfg.get(REDIRECT)
+    if rd is not None and not redirect_cfg(cfg):
+        bad.append(f"\"{REDIRECT}\" (where checks this machine can't run are sent) needs a \"start\" and a \"status\" "
+                   "command")
+    elif rd is not None:
+        info.append(f"checks this machine can't run are sent elsewhere via the redirect (\"{REDIRECT}\": "
+                    f"{rd['start'][:80]})")
     for g in cfg["gates"]:
         why = unmet_needs(root, g)
         if why:
-            info.append(f"check '{g['name']}' can't run on this machine: {why}")
+            info.append(f"check '{g['name']}' can't run on this machine: {why}" +
+                        ("; it would be sent elsewhere via the redirect" if redirect_cfg(cfg) else
+                         "; it waits for a machine that can (or add an \"elsewhere\" entry to send it to one)"))
         if detached(g):
             if not (g.get("start") and g.get("status")):
                 bad.append(f"long check '{g['name']}' needs a \"start\" and a \"status\" command")

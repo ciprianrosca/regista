@@ -25,6 +25,9 @@ The CLI path is in the session-start context: `python "${CLAUDE_PLUGIN_ROOT}/scr
   A run "waiting for a machine that can run it" never started: this machine doesn't have what the gate
   `needs`. Don't work around it (don't change `REGISTA_PROVIDES` or the harness folder's `machine.json`) or call
   it a pass; tell the user it has to run on a machine that can. The same holds for a gate reported "not run".
+  When the project has an `"elsewhere"` entry, such a gate is sent to another machine instead ("running
+  elsewhere via the redirect"): collect it with `gate --collect` like a long check. Running elsewhere and
+  waiting are never a pass, and never a reason to skip or weaken the gate; only a collected pass counts.
 - **Releases**: `release --check` says what a release would do and what's missing. `release` makes a patch
   release; `release minor` or `major` only when the user asked for it (the hook asks them anyway). It
   needs the changelog entry for the new version, dated today, in plain words for the people who use it.
