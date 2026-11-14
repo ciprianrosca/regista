@@ -693,6 +693,17 @@ later:
 - Commits never wait for a long check: the commit hook leaves it out. A milestone with it in `when` isn't
   done (`regista.py milestone`) and a release with it isn't made until a pass on the current code is
   collected. `regista.py gate real` shows where it stands.
+- Some checks can only run from a machine that has something: photos kept on one server, the production host.
+  Name it in `"needs": ["brand-photos"]` (short names, shown in the messages). When the start command can't
+  reach that place from here (a cloud session whose ssh is refused, say), it exits 75 (`EX_TEMPFAIL`, "try
+  again later") or ends with a line `unavailable: <why>`; any other failure still reads as "didn't start". The
+  run is then recorded as **waiting for a machine that can run it**: `'real' can't run from this machine: ssh
+  refused. It needs brand-photos. It stays open until it runs from a machine that can`, and `gate --start`
+  exits 75 too. A status command can answer `unavailable` the same way (or a JSON line with `"status":
+  "unavailable"` and a `"reason"`). A waiting run is never a pass: a milestone or a release that needs the
+  gate stays blocked. Nothing runs, so `--collect` doesn't ask about it and its time limit doesn't apply; it
+  and session start only mention it. A later `gate real --start` from a machine that can run it replaces it
+  (no `--fresh` needed).
 
 ### Cleaning up the tests
 

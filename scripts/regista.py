@@ -832,11 +832,21 @@ def budget_note(cfg, gates, results):
 # never wait for one: a commit skips it, and a milestone or a release that needs it waits for a collected
 # pass on the same code. The records live in the harness folder's gates/detached.json (local), which only
 # the harness writes.
+#
+# Some checks can only run from a machine that has something (photos kept on one server, a production host):
+# the gate's "needs" names it, for the messages. A start command that can't reach it from here exits 75
+# (EX_TEMPFAIL, "try again later") or ends with a line "unavailable: <why>"; a status command can answer
+# "unavailable" too.
+# The run is then recorded as waiting: never a pass, so whatever needs the gate stays blocked until a start
+# from a machine that can run it replaces it.
 
 DETACHED_TIMEOUT = 6 * 3600  # seconds a long check may take before it counts as failed (the gate's "timeout")
 DETACHED_RUNNING = ("running", "active", "activating", "queued", "pending", "waiting", "started", "busy")
 DETACHED_PASS = ("pass", "passed", "ok", "success", "succeeded")
 DETACHED_FAIL = ("fail", "failed", "failure", "error")
+DETACHED_UNAVAILABLE = ("unavailable",)  # a status answer: this machine can't reach the run (state "waiting")
+DETACHED_TEMPFAIL = 75  # a start command's exit code for "can't run from this machine, try again later"
+WAITING = "waiting for a machine that can run it"
 
 
 def detached(g):
@@ -845,6 +855,32 @@ def detached(g):
 
 def detached_path(root):
     return harness_path(root, "gates", "detached.json")
+
+
+def gate_needs(g):
+    """What a gate needs from the machine that runs it (its "needs"), as a list of short names."""
+    needs = g.get("needs") or []
+    return [str(x).strip() for x in ([needs] if isinstance(needs, str) else needs) if str(x).strip()]
+
+
+def unavailable_reason(last, values=None):
+    """The reason in a last line that says the check can't run from here ("unavailable: <why>", or a JSON line
+    with "status": "unavailable" and a "reason"), or None when it says something else."""
+    if values is not None:
+        if str(values.get("status", "")).lower().strip(" .!:") not in DETACHED_UNAVAILABLE:
+            return None
+        return str(values.get("reason") or "").strip() or "no reason given"
+    m = re.match(r"(?:%s)(?:\s*[.!]?|\s*:(.*))$" % "|".join(DETACHED_UNAVAILABLE), last.strip(), re.I | re.S)
+    return ((m.group(1) or "").strip() or "no reason given") if m else None
+
+
+def waiting_text(g, reason):
+    """Why a long check that can't run from this machine stays open, and where to start it."""
+    name, needs = g["name"], gate_needs(g)
+    return (f"'{name}' can't run from this machine: {reason.rstrip('. ')}." +
+            (f" It needs {', '.join(needs)}." if needs else "") +
+            f" It stays open until it runs from a machine that can (start it there with `regista.py gate {name} "
+            "--start`).")
 
 
 def fill(cmd, **values):
@@ -911,7 +947,10 @@ def detached_result(root, cfg, g, ignore=()):
     head = git(root, "rev-parse", "HEAD")
     mine = [r for r in runs if r.get("sha") == head]
     last = (mine or [None])[-1]
-    if last and last.get("state") == "running":
+    elsewhere = "no result for this code"
+    if last and last.get("state") == "waiting":  # never a pass: it hasn't run at all
+        why, elsewhere = waiting_text(g, last.get("reason") or "no reason given"), WAITING
+    elif last and last.get("state") == "running":
         why = (f"it's still running elsewhere (started {at(last)} on {head[:7]}): collect it with "
                f"`regista.py gate {name} --collect`")
     elif last and last.get("state") == "fail":
@@ -920,11 +959,13 @@ def detached_result(root, cfg, g, ignore=()):
     else:
         why = (f"it has no passing run on this code: start it with `regista.py gate {name} --start`, then collect "
                f"it with `regista.py gate {name} --collect` once it's done")
-    return {"name": name, "status": "fail", "seconds": 0, "fails": [why], "elsewhere": "no result for this code"}
+    return {"name": name, "status": "fail", "seconds": 0, "fails": [why], "elsewhere": elsewhere}
 
 
 def detached_start(root, cfg, g, ref="HEAD", fresh=False):
-    """Start a long check on a commit, elsewhere. Returns (ok, lines)."""
+    """Start a long check on a commit, elsewhere. Returns (ok, lines): ok is True (started, or already running or
+    passed), False (it didn't start), or "waiting" (its start command says it can't run from this machine: exit
+    75 or a last line "unavailable: <why>"; recorded as a waiting run, which never counts as a pass)."""
     name = g["name"]
     if not (g.get("start") and g.get("status")):
         return False, [f"The long check '{name}' needs a \"start\" command and a \"status\" command in "
@@ -944,6 +985,16 @@ def detached_start(root, cfg, g, ref="HEAD", fresh=False):
     values = {"sha": sha, "short": sha[:7], "label": label, "name": name}
     env = {**gate_env(root), ENV_PREFIX + "SHA": sha, ENV_PREFIX + "LABEL": label}
     code, out = run_shell(fill(g["start"], **values), root, g.get("start_timeout", 300), env=env)
+    lines = [x.strip() for x in out.strip().splitlines() if x.strip()]
+    why = unavailable_reason(lines[-1] if lines else "")
+    if why is None and code == DETACHED_TEMPFAIL:
+        why = (lines[-1][:200] if lines else f"its start command exited {code} (try again later)")
+    runs = [r for r in runs if not (r.get("gate") == name and r.get("sha") == sha and r.get("state") == "waiting")]
+    if why is not None:  # replaces an earlier waiting run on this commit
+        runs.append({"gate": name, "sha": sha, "label": label, "start": g["start"], "state": "waiting",
+                     "reason": why, "started": dt.datetime.now().isoformat(timespec="seconds")})
+        save_detached_runs(root, runs)
+        return "waiting", [waiting_text(g, why)]
     if code != 0:
         return False, [f"The long check '{name}' didn't start (its start command exited {code}). Its last lines:",
                        "\n".join(out.strip().splitlines()[-15:])]
@@ -960,11 +1011,15 @@ def detached_start(root, cfg, g, ref="HEAD", fresh=False):
 
 
 def detached_verdict(code, out):
-    """What a status command's output says: ("pass" | "fail" | "running" | None, values). Its last line is a
-    word (pass, fail, running) or the gate's JSON line, with or without a "status"; None: it couldn't tell."""
+    """What a status command's output says: ("pass" | "fail" | "running" | "waiting" | None, values). Its last
+    line is a word (pass, fail, running, or "unavailable: <why>" when this machine can't reach the run: "waiting",
+    with the why as values["reason"]) or the gate's JSON line, with or without a "status"; None: it couldn't tell."""
     lines = [x.strip() for x in out.strip().splitlines() if x.strip()]
     last = lines[-1] if lines else ""
     values = last_json(last) if last.startswith("{") else None
+    why = unavailable_reason(last, values) if values is not None or not last.startswith("{") else None
+    if why is not None:
+        return "waiting", {"reason": why}
     if values is not None and "status" not in values:  # the result line itself: the command finished
         return ("pass" if code == 0 else "fail"), values
     word = str((values or {}).get("status", last)).lower().strip(" .!:")
@@ -1002,11 +1057,17 @@ def ratchet_baseline(gate, metrics, baseline):
 
 def detached_collect(root, cfg, names=None, accept=False, budget=None):
     """Ask each running long check for its result and record the ones that finished. Returns lines. With
-    `budget` (seconds, for session start), stops asking when it runs out."""
+    `budget` (seconds, for session start), stops asking when it runs out. A waiting run (it couldn't run from
+    this machine) has nothing running to ask: it's only mentioned, and its time limit doesn't apply."""
     gates = {g["name"]: g for g in cfg["gates"] if detached(g)}
     runs, lines, started = detached_runs(root), [], time.time()
     baseline = load_json(baseline_path(root), {})
-    finished = []
+    finished, waited = [], []
+    for r in newest_waiting(runs):
+        if r["gate"] in gates and not (names and r["gate"] not in names):
+            why = r.get("reason") or "no reason given"
+            lines.append(f"- {r['gate']} on {r['sha'][:7]}: {WAITING} (not run: {why}). Start it there with "
+                         f"`regista.py gate {r['gate']} --start`.")
     for r in runs:
         g = gates.get(r.get("gate"))
         if r.get("state") != "running" or not g or (names and r["gate"] not in names):
@@ -1032,6 +1093,13 @@ def detached_collect(root, cfg, names=None, accept=False, budget=None):
             continue
         if state == "running":
             lines.append(f"- {r['gate']} on {r['sha'][:7]}: still running (started {since}).")
+            continue
+        if state == "waiting":  # this machine can't reach it: open, never a pass, and no time limit from now on
+            r.update(state="waiting", reason=got["reason"], waiting=now_iso())
+            waited.append(r)
+            lines.append(f"- {r['gate']} on {r['sha'][:7]}: {WAITING} (its status says it's unavailable from here: "
+                         f"{got['reason']}). It stays open; start it again from a machine that can "
+                         f"(`regista.py gate {r['gate']} --start`).")
             continue
         metrics = {k: got.get(k) for k in g.get("metrics") or {}}
         fails = r.get("fails") or ([] if state == "pass" else ["its run reported a failure"])
@@ -1060,10 +1128,11 @@ def detached_collect(root, cfg, names=None, accept=False, budget=None):
                 baseline[r["gate"]] = {"metrics": moved, "date": r["collected"], "commit": r["sha"][:7]}
                 save_json(baseline_path(root), baseline)
                 lines.append("    · its baseline moved to this run, which is as good or better on every number")
-    if finished:
+    if finished or waited:
         done = {(x["gate"], x["label"]): x for x in finished}
         runs = [done.get((x.get("gate"), x.get("label")), x) for x in runs]
         save_detached_runs(root, runs)
+    if finished:
         # Requirement results describe committed code: record an end-to-end check that finished on it.
         e2e = {x["name"] for x in e2e_gates(cfg)}
         head = git(root, "rev-parse", "HEAD")
@@ -1073,13 +1142,25 @@ def detached_collect(root, cfg, names=None, accept=False, budget=None):
     return lines
 
 
+def newest_waiting(runs):
+    """The waiting runs that are their gate's newest run (an older one was replaced by a later start)."""
+    newest = {}
+    for r in runs:
+        newest[r.get("gate")] = r
+    return [r for r in newest.values() if r.get("state") == "waiting"]
+
+
 def detached_text(root, cfg, collect=False):
-    """For session start: the long checks still running, asked once more (briefly) when `collect`."""
-    if not any(r.get("state") == "running" for r in detached_runs(root)):
+    """For session start: the long checks still running, asked once more (briefly) when `collect`, and the
+    ones waiting for a machine that can run them."""
+    runs = detached_runs(root)
+    if not any(r.get("state") == "running" for r in runs) and not newest_waiting(runs):
         return ""
     lines = detached_collect(root, cfg, budget=20) if collect else [
         f"- {r['gate']} on {r['sha'][:7]}: running since {r['started'].replace('T', ' ')[:16]}"
-        for r in detached_runs(root) if r.get("state") == "running"]
+        for r in runs if r.get("state") == "running"] + [
+        f"- {r['gate']} on {r['sha'][:7]}: {WAITING} ({r.get('reason') or 'no reason given'})"
+        for r in newest_waiting(runs)]
     return "## Long checks run elsewhere\n" + "\n".join(lines) if lines else ""
 
 
@@ -2493,10 +2574,12 @@ def after_deploy_checks(root, cfg, gates, before, tag):
     for g in [g for g in gates if detached(g)]:
         ok, out = detached_start(root, cfg, g, ref=tag or "HEAD")
         lines += out
+        if ok == "waiting":
+            lines.append("  Until it runs, nothing checks this release and nothing rolls it back.")
         runs = detached_runs(root)
         sha = git(root, "rev-parse", (tag or "HEAD") + "^{commit}")
         mine = [r for r in runs if r.get("gate") == g["name"] and r.get("sha") == sha and r.get("state") == "running"]
-        if ok and mine:
+        if ok is True and mine:
             mine[-1].update(deployed=tag or sha[:7], rollback_to=to)
             save_detached_runs(root, runs)
             lines.append(f"  If it fails, {to or 'nothing (no earlier good deploy)'} goes back live.")
@@ -11114,7 +11197,7 @@ def main():
                          "there are none (a gate with \"kind\": \"detached\")") + ".")
             ok, lines = detached_start(root, cfg, longs[a.names[0]], a.ref, a.fresh)
             print("\n".join(lines))
-            sys.exit(0 if ok else 1)
+            sys.exit(DETACHED_TEMPFAIL if ok == "waiting" else 0 if ok else 1)
         lines = detached_collect(root, cfg, a.names or None, accept=a.accept)
         print("Long checks run elsewhere:\n" + "\n".join(lines) if lines else "No long check is running elsewhere.")
     elif a.cmd == "gate":

@@ -22,6 +22,8 @@ The CLI path is in the session-start context: `python "${CLAUDE_PLUGIN_ROOT}/scr
   (`--ref <commit>` for another) and returns at once; `gate --collect` asks for the results; `gate <name>`
   says whether a pass holds for the current code. Never wait for one in a loop: start it, carry on, and
   collect it later (session start checks too). A milestone or a release that needs it waits for its pass.
+  A run "waiting for a machine that can run it" never started: this machine can't reach what the gate
+  `needs`. Don't work around it or call it a pass; tell the user it has to be started from a machine that can.
 - **Releases**: `release --check` says what a release would do and what's missing. `release` makes a patch
   release; `release minor` or `major` only when the user asked for it (the hook asks them anyway). It
   needs the changelog entry for the new version, dated today, in plain words for the people who use it.
