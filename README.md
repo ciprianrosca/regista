@@ -105,7 +105,8 @@ In a project's repo root (in Codex, `$regista:<name>` instead of `/regista:<name
 /regista:gate          run the gates (--all includes manual ones; --accept sets a new baseline)
 /regista:shards [ref]  (you) split the test suite over several cloud sessions and report how it went
 /regista:decide <item> options and a recommendation for an open decision
-/regista:save          gates, status, commit, handoff, board, learnings
+/regista:save          gates, status, commit, handoff, board, learnings, GitHub Project
+/regista:track         keep the GitHub Project in step: setup, sync (runs at every save), off
 /regista:pause         stop for the day: save everything and hand over
 /regista:status · /regista:todo · /regista:learn
 ```
@@ -914,6 +915,20 @@ locally, waiting for GitHub's checks and merging with `gh` under the push policy
 each pull request's head as it opens; a pull request's own branch merged with the project first when the
 project moved on; and a watch on GitHub (new pull requests, finished checks, comments) that reports to the
 overseer.
+
+### GitHub Project
+
+When the repository is on GitHub, Regista keeps a GitHub Project in step with the plan, so the work can be
+followed from GitHub on any device. `/regista:init` runs `/regista:track setup`: it finds the Project
+linked to the repository (or one named after it) and copies the way that Project already works (its
+status columns, labels, milestones, epics with sub-issues, how comments read), written down in
+`.regista/memory/reference_github_project.md`. When there's none, it asks before creating one. Every
+`/regista:save` then moves the issues the session worked on, comments what changed, and opens issues for
+new work, in that format. Issues that are the user's own tasks or decisions get comments, never a close.
+
+It is best effort: without the GitHub command-line tool, a login or the `project` permission
+(`gh auth refresh -h github.com -s project`, in your own terminal), the save says so in one line and goes
+on. The setting is `"tracker"` in `.regista/config.json`; `/regista:track off` turns it off.
 
 ## Develop
 

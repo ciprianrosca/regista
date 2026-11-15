@@ -23,8 +23,12 @@ clear it properly. The CLI path is in the session-start context: `python "${CLAU
    with the template below. One file per save. Keep it to one screen; history lives in git.
    Write it **after** the session's last commit: the harness compares their times.
 5. **Board.** Update `.regista/TODO.md`: new decisions, human tasks, the `_Last updated_` line.
-6. **Learn.** Run `/regista:learn` for anything learned this session.
-7. Reply with the resume point in one or two lines and the commit hash (or why there isn't one).
+6. **GitHub Project.** Unless `.regista/config.json` has `"tracker": "off"`, run `/regista:track sync`:
+   move the issues this session worked on, comment what changed, and open issues for new work, in the
+   Project's own format. Best effort: when GitHub can't be reached, say so in one line of the handoff
+   and carry on.
+7. **Learn.** Run `/regista:learn` for anything learned this session.
+8. Reply with the resume point in one or two lines and the commit hash (or why there isn't one).
 
 ## Handoff template
 
@@ -45,6 +49,9 @@ clear it properly. The CLI path is in the session-start context: `python "${CLAU
 
 ## Blocked on
 - <decision or human task, and who>
+
+## GitHub Project
+- <moved, closed and opened issues, or "skipped (<reason>)", or "off">
 
 ## Repo state
 - <branch> @ <hash>, <clean | uncommitted: files>, <N commits not pushed>
