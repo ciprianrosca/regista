@@ -1,0 +1,4 @@
+# Codex: only the user starts this skill ($regista:shards). Codex has no cloud-session tools to start the shards,
+# so there it only explains that the run needs a Claude Code cloud session (claude --cloud "/regista:shards <ref>").
+policy:
+  allow_implicit_invocation: false

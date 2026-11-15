@@ -2,7 +2,7 @@
 templates (DOC-3).
 
 .claude-plugin/plugin.json, .claude-plugin/marketplace.json and .codex-plugin/plugin.json must name the
-plugin "regista" at version "0.13.0" with the address https://github.com/ciprianrosca/regista, say nothing
+plugin "regista" at version "0.14.0" with the address https://github.com/ciprianrosca/regista, say nothing
 about "daedalus" in any case, and keep their CRLF line endings on every line, including the last.
 
 Everything under skills/, agents/ and templates/ uses the new names (Regista, /regista:<skill>,
@@ -23,7 +23,7 @@ CODEX_PLUGIN = os.path.join(REPO, ".codex-plugin", "plugin.json")
 MANIFESTS = [CLAUDE_PLUGIN, MARKETPLACE, CODEX_PLUGIN]
 
 NAME = "regista"
-VERSION = "0.13.0"
+VERSION = "0.14.0"
 URL = "https://github.com/ciprianrosca/regista"
 
 
@@ -116,7 +116,7 @@ class AllManifests(unittest.TestCase):
 
 # --- DOC-3: skills, agents and templates use the new names ----------------------------------------
 
-SKILLS = ["build", "change", "gate", "init", "learn", "oversee", "pause", "save", "start", "try", "verify"]
+SKILLS = ["build", "change", "gate", "init", "learn", "oversee", "pause", "save", "shards", "start", "try", "verify"]
 AGENTS = ["builder", "researcher", "reviewer", "test-writer"]
 RENAMED_DIRS = ["skills", "agents", "templates"]
 
