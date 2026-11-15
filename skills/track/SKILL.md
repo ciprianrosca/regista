@@ -52,6 +52,10 @@ Run by `/regista:init` on a GitHub repository, and by `sync` when `"tracker"` is
    - Several, or one only matched by title: ask which one, naming each with its title and link.
    - A title match that isn't linked: once the user confirms it, link it
      (`gh project link <number> --owner <owner> --repo <owner>/<repo>`).
+   **A project already under way** (set up before this skill existed) has no `"tracker"` yet: its first
+   save runs this setup. Unattended (`/regista:build all`, a worker, a paused session), never wait for an
+   answer: add the question below to the board's open decisions, skip tracking for this save (one line in
+   the handoff), and ask again only when the user is back.
 2. **None found: ask, don't create.** "This repository has no GitHub Project. Should I create one so you
    can follow the plan's milestones and steps on GitHub? It would get a status column (Backlog, Todo,
    In Progress, In Review, Done), one issue per milestone, and an issue for each bug or task that comes
@@ -62,7 +66,9 @@ Run by `/regista:init` on a GitHub repository, and by `sync` when `"tracker"` is
      `updateProjectV2Field` with `singleSelectOptions`; the field ID comes from
      `gh project field-list <number> --owner <owner> --format json`).
    - One repository milestone per plan milestone, and one issue per milestone with its goal and gate in
-     plain words, added to the Project with its status.
+     plain words, added to the Project with its status. In a project already under way, milestones whose
+     gate passed go in as Done and closed, the current one as In Progress, and the board's open decisions,
+     tasks and known bugs get their own issues, so the Project starts out showing where things stand.
    - Tell the user the one step the API can't do: add a Board view ("+ New view", Board), which groups
      by Status.
 3. **Write the setting** into `.regista/config.json` and learn the format (below).
