@@ -103,6 +103,7 @@ In a project's repo root (in Codex, `$regista:<name>` instead of `/regista:<name
 /regista:verify UI-3 ok    record a check only you can make (or: fail <what happened>; all ok; M3 ok)
 /regista:change <what you want>   change what gets built, at any time, also during a run
 /regista:gate          run the gates (--all includes manual ones; --accept sets a new baseline)
+/regista:shards [ref]  (you) split the test suite over several cloud sessions and report how it went
 /regista:decide <item> options and a recommendation for an open decision
 /regista:save          gates, status, commit, handoff, board, learnings
 /regista:pause         stop for the day: save everything and hand over
@@ -748,6 +749,65 @@ later:
   - Saying what a machine provides never loosens anything: a missing need only stops a gate from running and
     from passing, and a need claimed by mistake just lets the gate's own command run, and fail, as before.
     `regista.py doctor` names the gates this machine can't run and whether the redirect would take them.
+
+### Running the suite on cloud shards
+
+A long test suite can be split over several Claude Code cloud sessions that run side by side:
+`/regista:shards [ref] [--suite S] [--shards N]`, typed by a person in a Claude Code cloud session (from a
+terminal: `claude --cloud "/regista:shards main"`). Only a person starts it, because every shard is a paid
+session: the skill has `disable-model-invocation: true`, and the hooks refuse `regista.py shards start` from
+agents and workers. It needs the cloud-session tools (`create_session`, `send_later`); in a local session or in
+Codex the skill only says so and starts nothing.
+
+How the suite is split, and what each session runs, is the project's business, behind an optional top-level
+`"shards"` entry:
+
+```json
+"shards": {"start": "tools/shard.sh start {sha} {label} {suite} {n}",
+           "status": "tools/shard.sh status {label}",
+           "max_sessions": 6, "timeout": 3600}
+```
+
+- `start` gets `{sha}` (the full commit), `{short}`, `{label}` (`shards-<short>-<UTC yyyymmdd-HHMMSS>`),
+  `{suite}` (empty for the project's default suite) and `{n}` (the number of shards), also as `REGISTA_SHA`,
+  `REGISTA_LABEL`, `REGISTA_SUITE` and `REGISTA_SHARDS`. It records the run wherever the project keeps
+  results, writes one standalone session prompt per shard (what to install, which tests to run, where to put
+  the result), and starts nothing. Its last line is `{"prompts": ["path", ...]}`, paths relative to the
+  repository or absolute, at most `{n}` of them. Exit 75, or a last line `unavailable: <why>`, means it can't
+  be done now (the commit isn't where the sessions can fetch it, a cap is reached): nothing starts. Any other
+  failure is reported.
+- `status` gets `{label}`, `{sha}` and `{short}` and answers like a long check's: a last line `pass`, `fail`,
+  `running`, `unavailable: <why>`, or the result's JSON line (with or without a `"status"`; its other values,
+  such as counts and timings, are shown and kept).
+- `max_sessions` (default 6) caps the sessions a run starts: `--shards 10` becomes 6. Without `--shards`, a
+  run uses `max_sessions`. `timeout` (default 3600 seconds) is how long a run may take to report before it
+  counts as timed out. Optional: `model` (the sessions' model; otherwise the agent picks the smallest capable
+  one), `source_url` (the https address the sessions check out, when `origin` isn't one), `start_timeout` and
+  `status_timeout`.
+
+`regista.py shards start <ref>` resolves the commit and refuses one that no remote-tracking branch contains
+(the sessions check out from the remote, and the harness never pushes), runs `start`, and records the run in
+the harness folder's `gates/shards.json` (local). It prints the prompt files and the exact `create_session`
+arguments: each file's text as the prompt, the repository's https address and the full sha, the current
+environment, and a title `<project> shards <label> K/N`. The skill starts all the sessions in one turn, then
+checks `regista.py shards status <label>` with `send_later` (after about 5 minutes, then every 3) until it
+says PASSED, FAILED or TIMED OUT, and reports the wall time, the counts and the failures, dated. It never
+edits code, commits, pushes or opens pull requests. `regista.py shards list` lists the runs; session start
+mentions the ones not reported yet.
+
+**Costs and caps.** Each shard is a full cloud session on your plan, so a run of 6 costs roughly six sessions'
+worth of usage for its duration. Keep `max_sessions` at what you're willing to spend per run; the project's
+`start` can refuse (`unavailable: ...`) when its own caps are reached.
+
+**Whether it counts for a gate.** By default a sharded run is only a result to report: no gate counts it. A
+gate opts in with `"accept_shards": {"suite": "<suite>"}` (or `true` for the default suite). Then a collected
+sharded pass of that suite counts as the gate's pass, for an ordinary gate or a long check, on the same code
+only, by the long checks' rules: the same commit, a later one where only the harness's records changed, or,
+with `when_changed`, one where none of those paths changed; changing the `start` command voids it. It shows
+as `PASS, run on cloud shards (passed on 1a2b3c4 as shards-..., collected ...)` and is never written to the
+record of local passes. A running, waiting, failed or timed-out run never counts, and a gate with `metrics`
+never accepts one. Adding or changing `"shards"`, or a gate's `accept_shards`, loosens how gates may pass, so
+it needs your OK. `regista.py doctor` says whether `"shards"` is configured and which gates accept it.
 
 ### Cleaning up the tests
 

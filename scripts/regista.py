@@ -35,6 +35,9 @@ CLI (run from anywhere inside the project):
   python regista.py change from-transcript "Q" (the orchestrator) record a change the user typed in this session
   python regista.py plan add-milestone "TITLE" [--after M3] [--files GLOBS] [--gate T] [--step T]
   python regista.py plan tick M3 STEP          tick a step (its number or its text); not in a worker
+  python regista.py shards start [REF] [--suite S] [--shards N] | shards status LABEL | shards list
+                                          the suite on cloud shards: prepare the session prompts (starts
+                                          nothing), ask how a run went (exit 0 pass, 1 fail, 3 running), list
   python regista.py verify-manual ID --note T [--forced]  (the user only) record a manual check; --forced
                                              says it wasn't checked one by one
   python regista.py try [M1|ID] [--ask]        what to try yourself; --ask (the user, in a terminal) records it
@@ -716,6 +719,10 @@ def _run_gates(root, cfg, gates, accept, budget, started, reuse):
             if not (g.get("metrics") and check_metrics(g, prev.get("metrics") or {}, baseline)):
                 results.append({**prev["result"], "reused": prev["at"]})
                 continue
+        sharded = shards_result(root, cfg, g, g.get("_ignore") or ())  # only a gate that opts in ("accept_shards")
+        if sharded and not accept:  # never written to passed.json: it didn't run here
+            results.append(sharded)
+            continue
         why = unmet_needs(root, g)
         if why:  # not run here, and never a pass unless a run elsewhere passed on this code
             results.append(away_result(root, cfg, g, why, send=budget is None, again=not reuse))
@@ -792,7 +799,8 @@ def format_results(results):
             lines.append(f"- {r['name']}: skipped ({r['why']})")
             continue
         if r.get("elsewhere") or r.get("waiting"):
-            where = f"run elsewhere ({r['elsewhere']})" if r.get("elsewhere") else f"not run ({r['waiting']})"
+            where = (f"run on cloud shards ({r['elsewhere']})" if r.get("via") == SHARDS else
+                     f"run elsewhere ({r['elsewhere']})" if r.get("elsewhere") else f"not run ({r['waiting']})")
             lines.append(f"- {r['name']}: {r['status'].upper()}, {where}")
             lines += [f"    · {fl}" for fl in r.get("fails", [])]
             continue
@@ -1065,6 +1073,9 @@ def detached_result(root, cfg, g, ignore=()):
     if hit:
         return {"name": name, "status": "pass", "seconds": hit.get("seconds", 0), "metrics": hit.get("metrics"),
                 "elsewhere": f"passed on {hit['sha'][:7]}, collected {at(hit)}"}
+    sharded = shards_result(root, cfg, g, ignore)  # only a gate that opts in ("accept_shards")
+    if sharded:
+        return sharded
     runs = [r for r in detached_runs(root) if r.get("gate") == name]
     head = git(root, "rev-parse", "HEAD")
     mine = [r for r in runs if r.get("sha") == head]
@@ -1368,6 +1379,290 @@ def detached_text(root, cfg, collect=False):
     return "## Long checks run elsewhere\n" + "\n".join(lines) if lines else ""
 
 
+# --- the suite on cloud shards ---------------------------------------------------------------
+#
+# A project's test suite can be split over several cloud sessions (Claude Code's create_session), started by a
+# person with /<SLUG>:shards. The project's part sits behind the config's optional "shards" entry:
+#   "shards": {"start": "<cmd>", "status": "<cmd>", "max_sessions": 6, "timeout": 3600, "model": "<optional>"}
+# `start` ({sha}, {short}, {label}, {suite}, possibly empty for the project's default, and {n}, the shard count)
+# records the run and writes one standalone session prompt per shard, starting nothing; its last line is
+# {"prompts": ["path", ...]} (at most {n}). Exit 75 or a last line "unavailable: <why>": it can't be done now.
+# `status` ({label}, {sha}, {short}) answers like a long check's: pass, fail, running, unavailable, or the JSON
+# result line. `regista.py shards start` checks that the commit is on a remote (the sessions check out from
+# there; the harness never pushes), runs `start` and records the run in the harness folder's gates/shards.json
+# (local); `shards status` asks and records the verdict. A gate counts a collected sharded pass as its own only
+# when it opts in ("accept_shards": {"suite": "<suite>"}), for the same code, as a long check's pass would.
+
+SHARDS = "shards"                  # the config entry, and a result's "via"
+SHARDS_MAX_SESSIONS = 6            # default cap on the sessions one run starts
+SHARDS_TIMEOUT = 3600              # default seconds before a run that hasn't reported counts as timed out
+SHARDS_FINAL = ("pass", "fail", "timeout")
+SHARDS_EXIT = {"pass": 0, "fail": 1, "timeout": 1, "running": 3, "unknown": 3, "waiting": DETACHED_TEMPFAIL}
+
+
+def shards_cfg(cfg):
+    """The config's "shards" entry when it has both commands, else None."""
+    s = cfg.get(SHARDS)
+    return s if isinstance(s, dict) and s.get("start") and s.get("status") else None
+
+
+def shards_limits(s):
+    """(max_sessions, timeout) of a "shards" entry, with the defaults for missing or unusable values."""
+    def num(x, default):
+        return x if isinstance(x, int) and not isinstance(x, bool) and x > 0 else default
+    return num(s.get("max_sessions"), SHARDS_MAX_SESSIONS), num(s.get("timeout"), SHARDS_TIMEOUT)
+
+
+def shards_path(root):
+    return harness_path(root, "gates", "shards.json")
+
+
+def shards_runs(root):
+    return load_json(shards_path(root), {}).get("runs", [])
+
+
+def save_shards_runs(root, runs):
+    save_json(shards_path(root), {"runs": runs[-40:]})
+
+
+SHARDS_HOWTO = (f"There's no \"{SHARDS}\" entry (with a \"start\" and a \"status\" command) in the harness config, so "
+                "the suite can't be split over cloud sessions here. Add one, for example:\n"
+                f"  \"{SHARDS}\": {{\"start\": \"tools/shard.sh start {{sha}} {{label}} {{suite}} {{n}}\", "
+                "\"status\": \"tools/shard.sh status {label}\", \"max_sessions\": 6, \"timeout\": 3600}\n"
+                "`start` records the run and writes one standalone session prompt per shard, starting nothing; its last "
+                "line is {\"prompts\": [\"path\", ...]}. `status` ends with pass, fail, running, unavailable, or the "
+                "result's JSON line. See the README, \"Running the suite on cloud shards\". Adding it changes how gates "
+                "may pass, so it needs the user's OK.")
+
+
+def https_url(url):
+    """A remote's address as an https URL a cloud session can check out (git@host:o/r.git, ssh://git@host/o/r,
+    https://user@host/o/r.git → https://host/o/r), or "" when it isn't one of those."""
+    url = (url or "").strip()
+    m = re.match(r"^(?:ssh://)?[\w.-]+@([\w.-]+)[:/](?!/)(.+?)(?:\.git)?/?$", url)
+    if m and not url.startswith(("http://", "https://")):
+        return f"https://{m.group(1)}/{m.group(2).lstrip('/')}"
+    m = re.match(r"^https?://(?:[^@/]+@)?([^/]+)/(.+?)(?:\.git)?/?$", url)
+    return f"https://{m.group(1)}/{m.group(2)}" if m else ""
+
+
+def remotes_with(root, sha):
+    """The remote-tracking branches that contain commit `sha` ([] when none: it isn't on any remote git knows of)."""
+    out = git(root, "branch", "-r", "--contains", sha, "--format=%(refname:short)")
+    return [x.strip() for x in (out or "").splitlines() if x.strip() and not x.strip().endswith("/HEAD")]
+
+
+def shards_start(root, cfg, ref="HEAD", suite="", n=None, fresh=False):
+    """Prepare a sharded run of the suite on commit `ref`: the project's start command records it and writes one
+    session prompt per shard. Starts no session. Returns (state, lines): "started", "running" or "passed" (one is
+    already going or passed on this commit and suite), "unavailable" or "failed"."""
+    s = shards_cfg(cfg)
+    if not s:
+        return "failed", [SHARDS_HOWTO]
+    cap, timeout = shards_limits(s)
+    sha = git(root, "rev-parse", "--verify", "--quiet", (ref or "HEAD") + "^{commit}")
+    if not sha:
+        return "failed", [f"There's no commit '{ref}' here."]
+    suite = (suite or "").strip()
+    on = remotes_with(root, sha)
+    if not on:
+        return "failed", [f"Commit {sha[:7]} isn't on any remote branch git knows of, so the cloud sessions couldn't check "
+                          "it out (they check out from the remote). Nothing was started. Ask the user to push it (the "
+                          f"harness never pushes), then `git fetch` and run this again."]
+    asked = cap if n is None else n
+    if asked < 1:
+        return "failed", ["The number of shards must be at least 1."]
+    n = min(asked, cap)
+    runs = shards_runs(root)
+    same = [r for r in runs if r.get("sha") == sha and r.get("suite", "") == suite and r.get("start") == s["start"]]
+    if same and same[-1].get("state") in ("running", "pass") and not fresh:
+        r = same[-1]
+        return ("running" if r["state"] == "running" else "passed"), [
+            f"A sharded run of {'the suite ' + repr(suite) if suite else 'the default suite'} on {sha[:7]} already "
+            + ("runs" if r["state"] == "running" else "passed") + f" (its label: {r['label']}, started "
+            f"{r['started'].replace('T', ' ')[:16]} UTC). Ask it with `regista.py shards status {r['label']}`, or add "
+            "--fresh to prepare another run (it starts new paid sessions)."]
+    label = f"shards-{sha[:7]}-{dt.datetime.now(dt.timezone.utc):%Y%m%d-%H%M%S}"
+    values = {"sha": sha, "short": sha[:7], "label": label, "suite": suite, "n": str(n)}
+    env = {**gate_env(root), ENV_PREFIX + "SHA": sha, ENV_PREFIX + "LABEL": label, ENV_PREFIX + "SUITE": suite,
+           ENV_PREFIX + "SHARDS": str(n)}
+    code, out = run_shell(fill(s["start"], **values), root, s.get("start_timeout", 300), env=env)
+    lines = [x.strip() for x in out.strip().splitlines() if x.strip()]
+    last = lines[-1] if lines else ""
+    why = unavailable_reason(last)
+    if why is None and code == DETACHED_TEMPFAIL:
+        why = last[:200] or f"its start command exited {code} (try again later)"
+    if why is not None:
+        return "unavailable", [f"The project can't prepare a sharded run now: {why.rstrip('. ')}. Nothing was started."]
+    if code != 0:
+        return "failed", [f"The project's shards start command exited {code}; nothing was started. Its last lines:",
+                          "\n".join(out.strip().splitlines()[-15:])]
+    data = last_json(last) if last.startswith("{") else None
+    prompts = (data or {}).get("prompts")
+    if not isinstance(prompts, list) or not prompts or not all(isinstance(x, str) and x.strip() for x in prompts):
+        return "failed", ["The project's shards start command didn't end with a line {\"prompts\": [\"path\", ...]} "
+                          f"naming at least one prompt file (its last line: {last[:200] or '(nothing)'}). Nothing was "
+                          "started."]
+    if len(prompts) > n:
+        return "failed", [f"The project's shards start command wrote {len(prompts)} prompts for {n} shards; nothing was "
+                          "started (it may write fewer, never more)."]
+    missing = [x for x in prompts if not os.path.isfile(x if os.path.isabs(x) else os.path.join(root, x))]
+    if missing:
+        return "failed", [f"The prompt file(s) {', '.join(missing[:5])} don't exist; nothing was started."]
+    started = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+    run = {"label": label, "sha": sha, "suite": suite, "n": len(prompts), "asked": asked, "prompts": prompts,
+           "start": s["start"], "state": "running", "started": started}
+    save_shards_runs(root, [r for r in runs if r.get("label") != label] + [run])
+    origin = git(root, "remote", "get-url", "origin") or ""
+    source = s.get("source_url") or https_url(origin) or origin or "(the repository's https address)"
+    project = cfg.get("project") or os.path.basename(root)
+    total = len(prompts)
+    out_lines = [f"Prepared the sharded run {label} on {sha[:7]} ({'suite ' + suite if suite else 'the default suite'}, "
+                 f"{plural(total, 'shard')}). Nothing has started yet."]
+    if asked > cap:
+        out_lines.append(f"{asked} shards were asked; this project starts at most {cap} sessions per run "
+                         f"(\"max_sessions\"), so it's {n}.")
+    if on:
+        out_lines.append(f"The commit is on {', '.join(on[:3])}.")
+    out_lines += ["Prompt files:"] + [f"  {k}/{total}: {x}" for k, x in enumerate(prompts, 1)]
+    out_lines += [
+        "Next steps (the /regista:shards skill):",
+        "  1. Note the time now (UTC).",
+        f"  2. In ONE turn, call create_session once per prompt file, with: prompt = the file's exact text; "
+        f"source_url = {source}; source_revision = {sha}; no environment_id (inherit this one); "
+        + (f"model = {s['model']}; " if s.get("model") else "model = the smallest capable current model; ")
+        + f"title = \"{project} shards {label} K/{total}\" (K = the file's number above).",
+        f"  3. Wait with send_later (first in about 5 minutes, then every 3), each time running "
+        f"`regista.py shards status {label}`, until it says PASSED, FAILED or TIMED OUT "
+        f"(the run counts as timed out after {timeout // 60} minutes).",
+        "  4. Report the wall time, the counts and the failures, dated. Don't edit code, commit, push or open PRs."]
+    return "started", out_lines
+
+
+def shards_status(root, cfg, label):
+    """Ask the project's status command how sharded run `label` went and record the verdict. Returns (state,
+    lines): "pass", "fail", "timeout", "running", "waiting" (it can't be reached from here) or "unknown"."""
+    runs = shards_runs(root)
+    hit = [r for r in runs if r.get("label") == label]
+    if not hit:
+        return "unknown", [f"There's no sharded run '{label}' here (`regista.py shards list` lists them)."]
+    r = hit[-1]
+    if r.get("state") in SHARDS_FINAL:
+        return r["state"], [shards_line(r)] + shards_takers(cfg, r)
+    s = shards_cfg(cfg)
+    if not s:
+        return "unknown", [SHARDS_HOWTO]
+    _, limit = shards_limits(s)
+    values = {"sha": r["sha"], "short": r["sha"][:7], "label": label}
+    env = {**gate_env(root), ENV_PREFIX + "SHA": r["sha"], ENV_PREFIX + "LABEL": label}
+    code, out = run_shell(fill(s["status"], **values), root, s.get("status_timeout", 60), env=env)
+    state, got = detached_verdict(code, out)
+    age = (dt.datetime.now(dt.timezone.utc) - dt.datetime.fromisoformat(r["started"])).total_seconds()
+    now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+    r["asked"] = now
+    if state in (None, "running", "waiting") and age > limit:
+        state = "timeout"
+        r["fails"] = [f"it didn't report a result within its time limit of {limit // 60} minutes"]
+    if state is None:
+        save_shards_runs(root, runs)
+        tail = (out.strip().splitlines() or ["(nothing)"])[-1][:200]
+        return "unknown", [f"{label}: couldn't tell how it's doing (the status command exited {code} and said: {tail}). "
+                           "It stays open; ask again later."]
+    if state == "waiting":
+        r.update(state="waiting", reason=got.get("reason") or "no reason given")
+        save_shards_runs(root, runs)
+        return "waiting", [shards_line(r)]
+    if state == "running":
+        r["state"] = "running"
+        r.pop("reason", None)
+        if got:
+            r["progress"] = got
+        save_shards_runs(root, runs)
+        return "running", [shards_line(r)]
+    r.update(state=state, collected=now, seconds=round(age))
+    if got:
+        r["result"] = got
+    if state == "fail" and not r.get("fails"):
+        r["fails"] = ["its run reported a failure"]
+        r["tail"] = "\n".join(out.strip().splitlines()[-25:])
+    save_shards_runs(root, runs)
+    return state, [shards_line(r)] + shards_takers(cfg, r)
+
+
+def shards_takers(cfg, r):
+    """For a passed run: which gates accept it as their pass (for the code it ran on), as a line."""
+    if r.get("state") != "pass":
+        return []
+    takers = [g["name"] for g in cfg["gates"] if shards_accepts(g, r) and not g.get("metrics")]
+    if takers:
+        return [f"Gates that accept it as their pass, for the code it ran on: {', '.join(takers)}."]
+    return ["No gate accepts a sharded pass of this suite (\"accept_shards\"), so it counts for none; it's a result "
+            "to report."]
+
+
+def shards_line(r):
+    """One plain line on a sharded run."""
+    word = {"pass": "PASSED", "fail": "FAILED", "timeout": "TIMED OUT", "running": "still running",
+            "waiting": "can't be reached from here"}.get(r.get("state"), r.get("state", "?"))
+    what = f"{r['label']} on {r['sha'][:7]} ({'suite ' + r['suite'] if r.get('suite') else 'default suite'}, " \
+           f"{plural(r.get('n', 0), 'shard')}, started {r['started'].replace('T', ' ')[:16]} UTC)"
+    extra = ""
+    if r.get("state") in SHARDS_FINAL and r.get("seconds") is not None:
+        extra += f", reported after {round(r['seconds'] / 60, 1):g} minutes"
+    vals = r.get("result") or r.get("progress") or {}
+    shown = ", ".join(f"{k}={v}" for k, v in vals.items() if k != "status" and not isinstance(v, (dict, list)))
+    if shown:
+        extra += f" ({shown})"
+    if r.get("state") == "waiting":
+        extra += f": {r.get('reason')}"
+    return f"{what}: {word}{extra}" + "".join(f"\n    · {x}" for x in r.get("fails") or [])
+
+
+def shards_accepts(g, r):
+    """Does gate `g` accept sharded run `r`'s suite ("accept_shards": true for the default suite, or
+    {"suite": "<suite>"})? Off unless the gate says so."""
+    acc = g.get("accept_shards")
+    if not acc:
+        return False
+    want = (acc.get("suite") or "") if isinstance(acc, dict) else ""
+    return str(want).strip() == (r.get("suite") or "")
+
+
+def shards_cover(root, cfg, g, ignore=()):
+    """The collected sharded pass that holds as gate `g`'s pass for the current code, or None: only when the gate
+    opts in (accept_shards), for its suite, with today's start command, on a commit with the same code (only the
+    harness's records differ) or, for a gate with when_changed, one whose differences don't touch those paths.
+    A running, waiting, failed or timed-out run never counts."""
+    s = shards_cfg(cfg)
+    if not g.get("accept_shards") or not s or g.get("metrics"):  # a sharded pass carries no metrics to check
+        return None
+    paths = gate_paths(g)
+    for r in reversed(shards_runs(root)):
+        if r.get("state") != "pass" or r.get("start") != s["start"] or not shards_accepts(g, r):
+            continue
+        changed = changes_since(root, cfg, r["sha"], ignore)
+        if changed is not None and (not changed or (paths and not any(matches(f, paths) for f in changed))):
+            return r
+    return None
+
+
+def shards_result(root, cfg, g, ignore=()):
+    """Gate `g`'s pass from a collected sharded run on this code (see shards_cover), as a gate result, or None."""
+    hit = shards_cover(root, cfg, g, ignore)
+    if not hit:
+        return None
+    return {"name": g["name"], "status": "pass", "seconds": hit.get("seconds", 0), "via": SHARDS,
+            "elsewhere": f"passed on {hit['sha'][:7]} as {hit['label']}, collected "
+                         f"{hit.get('collected', hit['started']).replace('T', ' ')[:16]} UTC"}
+
+
+def shards_list(root):
+    runs = shards_runs(root)
+    if not runs:
+        return ["No sharded run yet."]
+    return [shards_line(r) for r in reversed(runs)]
+
+
 # --- state ----------------------------------------------------------------------------------
 
 def handoffs(root, cfg):
@@ -1568,6 +1863,7 @@ def config_loosened(root, cfg):
         return []
     out = []
     new_gates = {g.get("name"): g for g in cfg["gates"]}
+    old_gates = {g.get("name"): g for g in old["gates"]}
     for g in old["gates"]:
         if g.get("name") not in new_gates:
             out.append(f"the gate '{g.get('name')}' was removed")
@@ -1605,6 +1901,14 @@ def config_loosened(root, cfg):
     if cfg.get(REDIRECT) and cfg.get(REDIRECT) != old.get(REDIRECT):  # its status decides whether a gate sent there passes
         out.append(f"where checks this machine can't run are sent (\"{REDIRECT}\") was added or changed, and what it "
                    "reports counts as their pass")
+    if cfg.get(SHARDS) and cfg.get(SHARDS) != old.get(SHARDS):  # its status decides whether a sharded run passed
+        out.append(f"how the suite runs on cloud shards (\"{SHARDS}\") was added or changed, and what it reports can "
+                   "count as a gate's pass")
+    for g in cfg["gates"]:
+        before = old_gates.get(g.get("name"))
+        if g.get("accept_shards") and (before is None or before.get("accept_shards") != g.get("accept_shards")):
+            out.append(f"the gate '{g.get('name')}' now accepts a pass of the suite on cloud shards as its own "
+                       "(\"accept_shards\")")
     if (old.get("deploy") or {}).get("ref") == "tag" and (cfg.get("deploy") or {}).get("ref") != "tag":
         out.append("deploys no longer need a release tag")
     if cfg.get("speedups_without_asking") and not old.get("speedups_without_asking"):
@@ -8988,6 +9292,10 @@ def fleet_guard(root, cfg, data):
             why = allow_refusal(root, data, eff)
             if why:
                 deny(why, "fleet_allow")
+    if (w or role != "main") and runs_cli(eff, "shards", "start"):
+        deny(f"{DISPLAY_NAME}: a run on cloud shards starts paid sessions, so only a person starts it (/{SLUG}:shards "
+             "in the main session)." + (" Tell the overseer if you need one." if w else
+                                         " Report to the orchestrator that you'd need one."), "shards_by_agent")
     if w and (runs_cli(eff, "deploy") or runs_cli(eff, "release") or any(g["sub"] == "push" for g in eff["git"])):
         deny(f"{DISPLAY_NAME}: a worker doesn't push, deploy or release: the overseer does, after merging your branch. Tell it when "
              "your work is ready.", "worker_push")
@@ -9360,6 +9668,10 @@ def hook_session_start(root, cfg, data):
     longs = detached_text(root, cfg, collect=True)
     if longs:
         text += "\n\n" + longs
+    open_shards = [r for r in shards_runs(root) if r.get("state") in ("running", "waiting")]
+    if open_shards:  # not asked here: a person follows a sharded run with /<SLUG>:shards
+        text += "\n\n## Runs on cloud shards not reported yet\n" + "\n".join(
+            f"- {shards_line(r)} (ask: `regista.py shards status {r['label']}`)" for r in open_shards[-5:])
     src = data.get("source", "startup")
     if src == "compact":
         lead = (f"{DISPLAY_NAME}: the context was compacted to stay under {cfg['context']['limit_pct']}% of the window. "
@@ -10146,6 +10458,28 @@ def doctor(root, cfg):
     elif rd is not None:
         info.append(f"checks this machine can't run are sent elsewhere via the redirect (\"{REDIRECT}\": "
                     f"{rd['start'][:80]})")
+    sh_entry, takers = cfg.get(SHARDS), [g for g in cfg["gates"] if g.get("accept_shards")]
+    if sh_entry is not None and not shards_cfg(cfg):
+        bad.append(f"\"{SHARDS}\" (the suite on cloud shards) needs a \"start\" and a \"status\" command")
+    elif sh_entry is not None:
+        cap, limit = shards_limits(sh_entry)
+        info.append(f"the suite can run on cloud shards (\"{SHARDS}\": {sh_entry['start'][:80]}; at most {cap} "
+                    f"sessions a run, {limit // 60} minutes to report); a person starts it with `/{SLUG}:shards`")
+    else:
+        info.append(f"no \"{SHARDS}\" entry: the suite can't be split over cloud sessions (`/{SLUG}:shards`; see the "
+                    "README, \"Running the suite on cloud shards\")")
+    if takers:
+        names = ", ".join(f"{g['name']} (suite {(g['accept_shards'].get('suite') if isinstance(g['accept_shards'], dict) else '') or 'default'})"
+                          for g in takers)
+        (info if shards_cfg(cfg) else bad).append(
+            f"gates that accept a pass on cloud shards as their own: {names}" +
+            ("" if shards_cfg(cfg) else f", but there's no usable \"{SHARDS}\" entry, so none ever will"))
+        for g in takers:
+            if g.get("metrics"):
+                info.append(f"gate '{g['name']}' checks metrics, so a pass on cloud shards never counts for it")
+    elif sh_entry is not None:
+        info.append("no gate accepts a pass on cloud shards as its own (\"accept_shards\"), so sharded runs are only "
+                    "reported")
     for g in cfg["gates"]:
         why = unmet_needs(root, g)
         if why:
@@ -10218,7 +10552,7 @@ def doctor(root, cfg):
 
 
 LOCAL_STATE = ["gates/last.json", "gates/history.jsonl", "gates/passed.json", "gates/.lock", "gates/detached.json",
-               "context.json", MACHINE_FILE,
+               "gates/shards.json", "context.json", MACHINE_FILE,
                "compactions.jsonl", "hosts.json", "approvals.json", "hooks.log", "agents/", "reviews/draft.json",
                "run.json", "typed.json", "worker.json", "fleet/", "worktrees/", "usage.jsonl"]
 
@@ -11355,6 +11689,13 @@ def main():
     fl.add_argument("--when-idle", type=float, nargs="?", const=600, default=None, metavar="SECONDS",
                     help="(merge) wait up to SECONDS (600 if not given) for a busy worker to finish its turn; "
                          "by default the merge waits fleet.merge_wait (60)")
+    shp = sub.add_parser("shards", help="the suite on cloud shards (/regista:shards): prepare a run's session "
+                                        "prompts, ask how a run went, or list the runs")
+    shp.add_argument("action", nargs="?", default="list", choices=["start", "status", "list"])
+    shp.add_argument("target", nargs="?", default="", help="(start) the commit, default HEAD; (status) the run's label")
+    shp.add_argument("--suite", default="", help="(start) which suite, as the project names it (default: its own)")
+    shp.add_argument("--shards", type=int, default=None, help="(start) how many sessions (capped by max_sessions)")
+    shp.add_argument("--fresh", action="store_true", help="(start) prepare another run even if one runs or passed")
     vm = sub.add_parser("verify-manual", help="(the user only) mark a manual requirement as verified")
     vm.add_argument("id")
     vm.add_argument("--note", required=True, help="what you checked, and how")
@@ -11655,6 +11996,18 @@ def main():
             ok, lines = fleet_remove(root, cfg, a.target, a.force)
         print("\n".join(lines))
         sys.exit(0 if ok else 1)
+    elif a.cmd == "shards":
+        if a.action == "start":
+            state, lines = shards_start(root, cfg, a.target or "HEAD", a.suite, a.shards, a.fresh)
+            print("\n".join(lines))
+            sys.exit(DETACHED_TEMPFAIL if state == "unavailable" else 1 if state == "failed" else 0)
+        if a.action == "status":
+            if not a.target:
+                sys.exit("Name the run: `regista.py shards status <label>` (`regista.py shards list` lists them).")
+            state, lines = shards_status(root, cfg, a.target)
+            print("\n".join(lines))
+            sys.exit(SHARDS_EXIT.get(state, 3))
+        print("\n".join(shards_list(root)))
     elif a.cmd == "verify-manual":
         specs, _ = load_specs(root)
         req = next((r for s in specs for r in s.get("requirements") or [] if r.get("id") == a.id), None)
