@@ -55,6 +55,9 @@ you can, choose the defaults, and ask only what only they know. Plain words thro
    Install a missing tool only after the user says yes. If gates exist, run
    `python "${CLAUDE_PLUGIN_ROOT}/scripts/regista.py" gate --all`; for metric gates, `gate <name> --accept`
    once to record the starting numbers. If M0 is planned, failing or missing checks are expected: say so.
+   **GitHub Project.** If the repository is on GitHub, run `/regista:track setup`: it uses the Project
+   already linked to the repository and its format, or asks before creating one. Best effort: if gh,
+   the login or the `project` permission is missing, note it in one line and go on.
 9. **Commit** what setup wrote: `.regista/`, `.claude/settings.json`, and `.codex/` and `AGENTS.md`
    if they were created (`git add` only the ones that exist), with `git commit -m "chore: set up Regista"`.
    A commit of only these setup files skips the gates (there's no code yet for them to check), so it
@@ -73,6 +76,7 @@ you can, choose the defaults, and ask only what only they know. Plain words thro
      and the work carries on from the saved state: nothing to clear or restart)
    - how they'll try things themselves (`/regista:try`, then `/regista:verify <ID> ok`; in Codex
      `$regista:try` and `$regista:verify <ID> ok`)
+   - where the work is tracked on GitHub (the Project's link), or why it isn't
    - what to say next: `/regista:build M0` (or `M1`)
    - one line: "Everything lives in `.regista/config.json`; ask me to change any of it."
 
